@@ -3985,75 +3985,105 @@ async function orphanCloseExpiredPositions(
   }
 }
 
+/**
+ * ── CANONICAL LIVE SYNC & RECONCILE ─────────────────────────────────────────
+ * Single entry-point for ALL live-position + exchange sync work.
+ *
+ * Called by:
+ *   • startRealtimeProcessor  (engine-manager.ts, 200 ms self-scheduling loop)
+ *   • maybeRunLiveSync        (realtime-processor.ts, legacy throttle gate — delegates here)
+ *   • /api/cron/sync-live-positions (Vercel cron, ~30 s)
+ *   • syncWithExchange        (legacy shim, redirects here)
+ *
+ * Responsibilities (in one Redis-locked pass):
+ *   1. Always-run simulated-position sweep (paper-mode close path) — runs
+ *      even when connector is absent or global pause is set.
+ *   2. Exchange position fetch + normalized (symbol|direction) → exchangePos map.
+ *   3. Exchange-orphan adoption (exchange positions not yet tracked in Redis).
+ *   4. Per-position loop (open/placed statuses):
+ *       a. Mark-price / liq-price / unrealizedPnL refresh from exchange.
+ *       b. Externally-closed detection (absent from exchange map).
+ *       c. SL/TP protection-order healing via updateProtectionOrders.
+ *       d. SL/TP cross-check → force-close on market hit.
+ *       e. Max-hold-time safety close.
+ *       f. savePosition (persist refreshed state).
+ *   5. Redis single-flight lock + cross-caller dedup via moved-marker key.
+ *
+ * Options:
+ *   • skipSimulatedSweep     — skip step 1 (caller already ran processSimulatedPositions)
+ *   • skipOrphanAdoption     — skip step 3 (orphan run is a no-op when connector is absent)
+ *   • reconcileMode          — true = cron (does not return early on no connector;
+ *                              false = engine tick (early-return is fine)).
+ */
 export async function reconcileLivePositions(
   connectionId: string,
   exchangeConnector: any,
+  options: {
+    skipSimulatedSweep?: boolean
+    skipOrphanAdoption?: boolean
+    reconcileMode?: boolean
+  } = {},
 ): Promise<{
   reconciled: number
   updated: number
   closed: number
   errors: number
-  // ── Protection-leg activity counters ───────────────────────────────
-  // Surfaced on every reconcile tick so functional-overview / engine-stats
-  // dashboards can render the SL/TP control-order workload accurately:
-  //   • protectionRearmed: positions where updateProtectionOrders made a
-  //     net change this tick (place, replace, or liveness-clear). Counts
-  //     POSITIONS, not legs — a single tick that re-armed both SL and TP
-  //     on one position increments this by 1.
-  //   • orphansSwept: total reduce-only orders the post-close sweep
-  //     cancelled this tick. Aggregates the `orphanCloseExpiredPositions`
-  //     path; per-position sweeps that run inside `closeLivePosition`
-  //     are recorded in each position's `orphan_sweep` audit step
-  //     (the position is the source of truth for those, so we don't
-  //     double-count them here). 0 in the steady state; > 0 means real
-  //     chaos was prevented.
   protectionRearmed: number
   orphansSwept: number
 }> {
   await initRedis()
   const client = getRedisClient()
-
+  const { skipSimulatedSweep, skipOrphanAdoption, reconcileMode = false } = options
   const summary = {
-    reconciled: 0,
-    updated: 0,
-    closed: 0,
-    errors: 0,
-    protectionRearmed: 0,
-    orphansSwept: 0,
+    reconciled: 0, updated: 0, closed: 0, errors: 0, protectionRearmed: 0, orphansSwept: 0,
   }
 
-  // ── Simulated-position sweep (always runs, even without a connector) ──
-  // Simulated positions don't touch the exchange — their close path is
-  // Redis-driven (SL/TP cross + max-hold). Running this BEFORE the
-  // connector gate guarantees they always get a chance to close on
-  // every reconcile tick regardless of whether the operator has API
-  // keys configured. Failures are absorbed into `summary` so a single
-  // bad simulated position can't abort the rest of reconcile.
-  try {
-    const simSummary = await processSimulatedPositions(connectionId)
-    summary.reconciled += simSummary.processed
-    summary.closed     += simSummary.closed
-    summary.errors     += simSummary.errors
-  } catch { /* helper is already defensive — never propagate */ }
-
-  if (!exchangeConnector || typeof exchangeConnector.getPositions !== "function") {
-    // No connector — we cannot reach the exchange to confirm position state.
-    // Run the orphan-close sweep so positions that have been sitting open
-    // past the max hold time are at least marked closed in Redis. The
-    // close reason "orphan_no_connector" distinguishes them from normal
-    // closes in the audit trail.
-    await orphanCloseExpiredPositions(connectionId, null, summary)
-    return summary
+  // ── Cross-caller single-flight lock ───────────────────────────────────────
+  // Multiple callers (engine tick + cron + resume) can hit this function in
+  // parallel. The Redis lock prevents concurrent mutations of per-position
+  // state. TTL 30 s is the safety net for process death mid-sync.
+  const LIVE_SYNC_LOCK_KEY = `live_sync_lock:${connectionId}`
+  const LIVE_SYNC_LOCK_TTL = 30
+  const syncStartMs = Date.now()
+  let lockAcquired = false
+  if (client) {
+    try {
+      lockAcquired = await (client.set(LIVE_SYNC_LOCK_KEY, String(syncStartMs), { NX: true, EX: LIVE_SYNC_LOCK_TTL }) as any) === "OK"
+    } catch { /* Redis unreachable → fail open */ }
+    if (!lockAcquired) {
+      console.log(`${LOG_PREFIX} [reconcile] skip — lock held for conn=${connectionId}`)
+      return summary
+    }
   }
 
   try {
-    // One index scan instead of four — see identical fix in syncWithExchange().
+    // ── Step 1: Simulated-position sweep (always runs unless caller opts out) ─
+    if (!skipSimulatedSweep) {
+      try {
+        const simResult = await processSimulatedPositions(connectionId)
+        summary.reconciled += simResult.processed
+        summary.closed     += simResult.closed
+        summary.errors     += simResult.errors
+      } catch { /* processSimulatedPositions is self-defensive */ }
+    }
+
+    // ── Step 4+ from reconcileLivePositions ────────────────────────────────
+    // Nothing to do if connector absent (sim-only is already done above)
+    if (!exchangeConnector || typeof exchangeConnector.getPositions !== "function") {
+      if (!reconcileMode) return summary  // cron always runs full path
+      await orphanCloseExpiredPositions(connectionId, null, summary)
+      return summary
+    }
+
+    // Load live-positions index (single Redis round-trip, filtered in-memory)
     const allOpen = await getLivePositions(connectionId)
     const openPositions = allOpen.filter(
       (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
     )
-
-    if (openPositions.length === 0) return summary
+    if (openPositions.length === 0 && !reconcileMode) {
+      await orphanCloseExpiredPositions(connectionId, exchangeConnector, summary)
+      return summary
+    }
 
     // Single batch fetch of ALL exchange positions rather than per-symbol
     // calls — dramatically fewer API hits when multiple positions are open.
