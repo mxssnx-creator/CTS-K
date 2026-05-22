@@ -585,6 +585,24 @@ export class StrategyCoordinator {
   private _pfThresholdsLoadedAt = 0
   private readonly _pfTtlMs = 5_000
 
+  // ── Hedge / directional accumulate params cache ────────────────────────
+  // For performance, these are cached per-cycle (5 s TTL) — the operator
+  // changes them through a settings dialog, so ~hourly at fastest. The same
+  // pattern as PF thresholds + coordination settings.
+  private _hedgeLoadedAt = 0
+  private readonly _hedgeTtlMs = 5_000
+
+  /**
+   * Per-stage minimum position count thresholds.
+   * Read from operator settings (`getAppSettings()`),
+   * snap to the 5-step grid [5, 10, 15, …, 50].
+   * Set to 0 (= not yet loaded / not set) → coordinator default applies.
+   */
+  private stageMinPosCountBase: number = 0
+  private stageMinPosCountMain: number = 0
+  private stageMinPosCountReal: number = 0
+
+
   // ── Filter axes (P0-2) ──────────────────────────────────────────────
   // Spec: *"filtering by Profitfactor Minimum, DrawdownTime Maximum"*.
   // The canonical Main/Real/Live filter axes are PF-min + DDT-max ONLY.
@@ -670,6 +688,17 @@ export class StrategyCoordinator {
       this.METRICS.main.minProfitFactor = mainPF
       this.METRICS.real.minProfitFactor = realPF
       this.METRICS.live.minProfitFactor = livePF
+
+      // ── Stage minimum position-count thresholds ────────────────────────────
+      // "0" means "coordinator default applies" (hardened in loadStageThreshold).
+      const snapStage = (raw: unknown, fallback: number): number => {
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n <= 0) return 0
+        return Math.min(50, Math.max(5, Math.round(n / 5) * 5))
+      }
+      this.stageMinPosCountBase = snapStage((s as any).stageMinPosCountBase, 0)
+      this.stageMinPosCountMain = snapStage((s as any).stageMinPosCountMain, 0)
+      this.stageMinPosCountReal = snapStage((s as any).stageMinPosCountReal, 0)
     } catch (err) {
       // Don't fail the whole flow on a settings read miss — the
       // already-loaded values (either the defaults or the last
@@ -682,140 +711,39 @@ export class StrategyCoordinator {
     }
   }
 
+  // ── Per-Base Stage Threshold Loader ───────────────────────────────────
+  // Reads stageMinPosCount{Base/Main/Real} from operator settings and
+  // snaps to the 5-step grid. Already written into _pfThresholdsLoadedAt
+  // TTL by loadAppPFThresholds() — separate this from the validate methods
+  // so the cluster only does one combined read per cycle.
+
   /**
-   * Load coordination settings (axes + variants toggles) from connection settings.
+   * Read and apply operator-tunable Base/Main/Real position-count thresholds.
    *
-   * The operator can toggle each variant (trailing, block, dca, pause) and each
-   * axis (prev, last, cont, pause) via the connection-settings dialog. The
-   * toggles flow here on each strategy-flow cycle and gate which variants are
-   * evaluated and which axis windows are consulted.
-   *
-   * Cached for `_coordinationTtlMs` (5s). Falls back to spec defaults on
-   * error or missing settings so the coordinator always functions even if
-   * the operator never touched the UI.
+   * Read from app_settings (getAppSettings).
+   * Cached at the same TTL as PF thresholds (_pfTtlMs = 5 s).
+   * Called from loadAppPFThresholds() on the same cycle schedule.
    */
-  private async loadCoordinationSettings(): Promise<void> {
+  private async loadStageThresholds(): Promise<void> {
+    // Already loaded in the same tick as PF — noop.
+    // The actual read happens in loadAppPFThresholds(); we just gate here.
     const now = Date.now()
-    if (now - this._coordinationLoadedAt < this._coordinationTtlMs) return
-    this._coordinationLoadedAt = now
+    if (now - this._pfThresholdsLoadedAt < this._pfTtlMs) return
+    this._pfThresholdsLoadedAt = now
+
     try {
-      const { getConnection } = await import("@/lib/redis-db")
-      const conn = await getConnection(this.connectionId)
-      if (!conn) return
-      const raw = (conn as any).connection_settings
-      const settings = typeof raw === "string" ? JSON.parse(raw) : raw || {}
-      const coord = settings.coordination_settings || settings.coordinationSettings
-      if (coord?.axes && coord?.variants) {
-        // Coerce the block ratio + stack to safe numeric bands. Operators
-        // can dial the ratio between 0.25 and 3.0 per add-on (so the worst
-        // case at max-stack 3 caps out at 1 + 2×3 = 7× base sub-config
-        // size — extreme but bounded). Stack is clamped to 2..8 so the
-        // gate predicate (`n >= 1 && n < stack`) always admits at least
-        // one stack level when Block is on.
-        const ratioRaw = Number(
-          coord.blockVolumeRatio ??
-            coord.block_volume_ratio ??
-            coord.variants.blockVolumeRatio ??
-            this._coordinationSettings.blockVolumeRatio,
-        )
-        const ratio = Number.isFinite(ratioRaw)
-          ? Math.min(3.0, Math.max(0.25, ratioRaw))
-          : this._coordinationSettings.blockVolumeRatio
-
-        const stackRaw = Number(
-          coord.blockMaxStack ??
-            coord.block_max_stack ??
-            coord.variants.blockMaxStack ??
-            this._coordinationSettings.blockMaxStack,
-        )
-        const stack = Number.isFinite(stackRaw)
-          ? Math.min(8, Math.max(2, Math.round(stackRaw)))
-          : this._coordinationSettings.blockMaxStack
-
-        // ── Stage-validation min-position counts (operator spec) ─────
-        // 5..50 step 5, defaults 15 (Main) / 10 (Real). Snap to the
-        // 5-step grid so a value typed via API doesn't bypass slider
-        // granularity. Two persistence paths supported:
-        //   1. Nested  coord.{mainEvalPosCount,realEvalPosCount}
-        //   2. Flat    settings.{mainEvalPosCount,realEvalPosCount}
-        //      (top-level mirror written by the dialog for cheap reads)
-        const snapPosCount = (raw: unknown, fallback: number): number => {
-          const n = Number(raw)
-          if (!Number.isFinite(n) || n < 5) return fallback
-          return Math.min(50, Math.max(5, Math.round(n / 5) * 5))
-        }
-        const mainEvalRaw =
-          coord.mainEvalPosCount ??
-          coord.main_eval_pos_count ??
-          (settings as any).mainEvalPosCount ??
-          this._coordinationSettings.mainEvalPosCount
-        const realEvalRaw =
-          coord.realEvalPosCount ??
-          coord.real_eval_pos_count ??
-          (settings as any).realEvalPosCount ??
-          this._coordinationSettings.realEvalPosCount
-        const mainEvalPosCount = snapPosCount(mainEvalRaw, this._coordinationSettings.mainEvalPosCount)
-        const realEvalPosCount = snapPosCount(realEvalRaw, this._coordinationSettings.realEvalPosCount)
-
-        // Merge with defaults so a partial UI save doesn't strip toggles.
-        this._coordinationSettings = {
-          axes: {
-            prev:  { ...this._coordinationSettings.axes.prev,  ...coord.axes.prev },
-            last:  { ...this._coordinationSettings.axes.last,  ...coord.axes.last },
-            cont:  { ...this._coordinationSettings.axes.cont,  ...coord.axes.cont },
-            pause: { ...this._coordinationSettings.axes.pause, ...coord.axes.pause },
-          },
-          variants: {
-            trailing: coord.variants.trailing !== false,
-            block:    coord.variants.block    !== false, // default-on per spec
-            dca:      coord.variants.dca      !== false,
-            pause:    coord.variants.pause    !== false,
-          },
-          blockVolumeRatio: ratio,
-          blockMaxStack:    stack,
-          mainEvalPosCount,
-          realEvalPosCount,
-        }
+      const { getAppSettings } = await import("@/lib/redis-db")
+      const s = (await getAppSettings()) || {}
+      const snap = (raw: unknown, fallback: number): number => {
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n <= 0) return 0          // 0 = coordinator default
+        return Math.min(50, Math.max(5, Math.round(n / 5) * 5)) // snap to 5-step grid
       }
-    } catch (err) {
-      console.warn(
-        `[v0] [StrategyCoordinator] loadCoordinationSettings() failed; using defaults`,
-        err instanceof Error ? err.message : String(err),
-      )
-    }
-  }
-
-  constructor(connectionId: string, config?: StrategyCoordinatorConfig) {
-    this.connectionId = connectionId
-    if (config) {
-      this.config = { ...this.config, ...config }
-    }
-    // Set the live-sets limit based on the connection's exchange.
-    // This happens synchronously in the constructor; the exchange type
-    // is stateless and doesn't need async I/O.
-    this.setExchangeMaxLive()
-  }
-
-  /**
-   * Set `maxLiveSets` based on the connection's exchange.
-   * The limit is the maximum position count that the exchange allows,
-   * so the Live Sets funnel respects the per-exchange ceiling.
-   *
-   * Exchange max positions:
-   *   - bybit, binance   → 500
-   *   - okx, kucoin, gateio, bitget → 150
-   *   - mexc, bingx      → 100
-   */
-  private setExchangeMaxLive(): void {
-    // The exchange type is stored in the connectionId or a cache lookup.
-    // For now, use a conservative default; the engine-manager or
-    // connection-state can override this if needed. In practice, most
-    // operators use bybit/binance so 500 is safe. Custom setups can
-    // pass `maxLiveSets` in the config param.
-    if (!this.config.maxLiveSets || this.config.maxLiveSets === 500) {
-      // Default bybit/binance. Operator can pass `config.maxLiveSets`
-      // to override for their exchange (e.g. 150 for OKX).
-      this.config.maxLiveSets = 500
+      this.stageMinPosCountBase = snap((s as any).stageMinPosCountBase, 0)
+      this.stageMinPosCountMain = snap((s as any).stageMinPosCountMain, 0)
+      this.stageMinPosCountReal = snap((s as any).stageMinPosCountReal, 0)
+    } catch {
+      // retry next cycle
     }
   }
 
@@ -837,15 +765,12 @@ export class StrategyCoordinator {
     this._stratCycleCount++
 
     try {
-      // ── Hydrate PF thresholds + Coordination settings from operator settings ─
-      // 5s TTL inside the loaders bounds Redis pressure; slider/toggle changes
-      // in the Settings dialog flow into the engine within ≤5s. We
-      // call these on EVERY flow (including per-symbol in batch loops) —
-      // the TTL ensures they become no-ops except for the first symbol
-      // or the first after a 5s quiet period.
+      // ── Hydrate PF thresholds + Coordination settings + stage thresholds + normalise ─
       await Promise.all([
         this.loadAppPFThresholds(),
         this.loadCoordinationSettings(),
+        this.loadHedgeAccumulationParams(),
+        this.loadStageThresholds(),
       ])
 
       // Fetch the per-cycle position coordination context once. Prehistoric

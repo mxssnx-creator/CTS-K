@@ -930,12 +930,24 @@ export class PseudoPositionManager {
    * Two gates (both must pass):
    *   1. **Per-Set uniqueness** (pre-existing): exactly 1 active pseudo
    *      position per unique config combination (indType:dir:tp:sl:…).
-   *      O(1) via SISMEMBER on `activeConfigKeysSetKey`.
+   *      O(1) via SISMEMBER on `activeConfigKeysSetKey` — backed by a
+   *      5 s `SET NX EX` mutex gate (`gateKey`) so two concurrent
+   *      `createPosition` callers for the same configSetKey can't both
+   *      pass the gate simultaneously.
    *   2. **Per-direction cap** (P0-4): hard cap on concurrent pseudo
    *      positions PER DIRECTION (Long/Short) across ALL config Sets.
    *      Cap comes from the operator-tunable setting
    *      `maxActiveBasePseudoPositionsPerDirection` (default 1, spec).
    *      O(1) via SCARD on `activeByDirectionKey(side)`.
+   *
+   * STALE-LOCK FIX: The SET NX mutex TTL is only 5 s. If a process that
+   * acquired the gate and inserted into `activeConfigKeysSetKey` crashes
+   * without cleaning up, the gateKey expires but the SISMEMBER entry
+   * remains stale — permanently blocking future retries. Gate 1 defends
+   * against this SINK: when `isMember=true` AND the gate mutex is NOT
+   * held (our SET NX already succeeded), we remove the stale entry with
+   * Redis `SREM` before returning false. The next caller (a fresh tick)
+   * will see a clean set and proceed normally.
    *
    * Gate 2 is the new piece — previously only gate 1 existed, which
    * meant N distinct Sets could each hold 1 active long → N×1 longs
@@ -949,8 +961,7 @@ export class PseudoPositionManager {
   ): Promise<boolean> {
     try {
       const client = getRedisClient()
-      // Gate 1: Set-uniqueness. Use SET NX as a mutex so two concurrent
-      // `createPosition` calls for the same configSetKey can't both pass.
+      // Gate 1: SET NX mutex (5 s TTL) + double-check via SISMEMBER.
       // SISMEMBER + SADD was racy: both callers could see `false` before
       // either added to the set, producing duplicate positions.
       const gateKey = `pseudo:gate:${this.connectionId}:${configSetKey}`
@@ -960,7 +971,16 @@ export class PseudoPositionManager {
       // (the gate TTL expired but the Set entry persisted). Double-check.
       const isMember = await client.sismember(this.activeConfigKeysSetKey(), configSetKey)
       if (isMember) {
-        // Release the gate — another caller on a future cycle can retry.
+        // STALE-LOCK REPAIR: The gate mutex expired (5 s TTL) but the
+        // key is still in the active set — this means the prior owner
+        // crashed without cleaning up. Remove the stale entry with SREM
+        // so future ticks are not permanently blocked for this configKey.
+        try {
+          await client.srem(this.activeConfigKeysSetKey(), configSetKey)
+        } catch { /* best-effort sink clearing */ }
+        // Release the gate so another tick on a different configKey
+        // (or the same configKey after the stale entry was removed)
+        // can proceed without waiting 5 s.
         await client.del(gateKey).catch(() => {})
         return false
       }

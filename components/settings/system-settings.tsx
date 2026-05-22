@@ -46,6 +46,15 @@ interface EngineTimings {
   lockExtendIntervalMs: number
   maxPositionHoldMs: number
   progressionBufferFlushMs: number
+  // ── Hedge / Directional Accumulation (read-live, no engine restart) ────────
+  // Read at every cycle from strategy-coordinator and live-stage via getEngineTimings().
+  // Stored as number in Redis (0/1 for boolean). Live-settings contract: hot-path,
+  // changes apply within ~10 s (engine-timings cache TTL), no engine restart needed.
+  normalizeEnabled: number         // 0=off, 1=on
+  normalizeThresholdPct: number    // imbalance % before normalization kicks in
+  normalizeMaxPerDirection: number // per-direction cap for hedge accumulator
+  normalizeVolumeMode: string      // "neutralize" | "rebalance" | "reduce"
+
   // Three-progression loop tunables
   prehistoricIntervalMs: number
   prehistoricCyclePauseMs: number
@@ -68,7 +77,7 @@ const DEFAULT_TIMINGS: EngineTimings = {
   lockExtendIntervalMs:     15_000,
   maxPositionHoldMs:    4 * 60 * 60 * 1000,
   progressionBufferFlushMs:  3_000,
-  // Three-progression defaults. NOTE: per the no-pause refactor, the
+  // ── Three-progression defaults. NOTE: per the no-pause refactor, the
   // Prehistoric loop ignores its interval/pause fields at runtime and
   // always cycles back-to-back via setTimeout(_, 0). The fields are
   // surfaced here so operators see what was historically configured,
@@ -78,6 +87,13 @@ const DEFAULT_TIMINGS: EngineTimings = {
   realtimeIntervalMs:        1_000,
   realtimeCyclePauseMs:         50,
   livePositionsCyclePauseMs:    50,
+  // ── Hedge / Directional Accumulation defaults ──────────────────────────────
+  // Disabled by default to preserve existing behaviour for existing installs.
+  // Operator enables explicitly once the accumulator behaviour is wanted.
+  normalizeEnabled:            0,
+  normalizeThresholdPct:       10,
+  normalizeMaxPerDirection:    20,
+  normalizeVolumeMode:         "neutralize",
 }
 
 // Mirror of `ENGINE_TIMING_BOUNDS`. The API clamps server-side too;
@@ -149,6 +165,23 @@ const TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; max: number; uni
     min: 10, max: 200, unit: "ms", live: true,
     help: "Breath after each LivePositions sync (exchange mark price + SL/TP cross + protection orders). Default 50 ms gives the 200 ms cadence a comfortable margin.",
   },
+  // ── Hedge / Directional Accumulation ────────────────────────────────────
+  normalizeEnabled: {
+    min: 0, max: 1, unit: "bool", live: true,
+    help: "Master on/off for hedge accumulation. When ON, the live-stage and StrategyCoordinator apply net-direction adjustments whenever the long/short imbalance for a Base Set exceeds normalizeThresholdPct%.",
+  },
+  normalizeThresholdPct: {
+    min: 0, max: 50, unit: "%", live: true,
+    help: "Imbalance threshold — |long−short|/(long+short) must exceed this ratio before normalize applies. Range 0–50, default 10.",
+  },
+  normalizeMaxPerDirection: {
+    min: 1, max: 200, unit: "", live: true,
+    help: "Per-direction hard cap for the hedge accumulator. No more than this many concurrent open-sub-sets per direction are allowed before excess causes shedding.",
+  },
+  normalizeVolumeMode: {
+    min: 0, max: 0, unit: "enum", live: true,
+    help: "How accumulated volume is adjusted on normalize trigger: neutralize (net-delta only), rebalance (full vol. toward dominant), reduce (scale by imbalance ratio). Default: neutralize.",
+  },
 }
 
 export function SystemSettings() {
@@ -202,6 +235,29 @@ export function SystemSettings() {
           read("lock_extend_interval_ms",       "lockExtendIntervalMs")
           read("max_position_hold_ms",          "maxPositionHoldMs")
           read("progression_buffer_flush_ms",   "progressionBufferFlushMs")
+
+          // ── Hedge / directional normalize (numeric + string fields) ──────────
+          read("neutralize_enabled",           "normalizeEnabled")
+          read("neutralize_threshold_pct",     "normalizeThresholdPct")
+          read("neutralize_max_per_direction", "normalizeMaxPerDirection")
+          const readNormalizeStr = (snake: string, camel: keyof EngineTimings) => {
+            const raw = sys[snake] ?? (sys as any)[camel]
+            if (typeof raw === "string" && raw.trim() !== "") return raw.trim()
+            return undefined
+          }
+          const normalizedVolumeMode =
+            readNormalizeStr("neutralize_volume_mode", "normalizeVolumeMode") ?? "neutralize"
+          if (["neutralize", "rebalance", "reduce"].includes(normalizedVolumeMode)) {
+            ;(next as any)["normalizeVolumeMode"] = normalizedVolumeMode
+          } else {
+            // Invalid/absent: fall back to the default. 'as any' silences the union-type
+            // mismatch between EngineTimings and the 'any' map cast to it.
+            ;(next as any)["normalizeVolumeMode"] = "neutralize"
+          }
+          read("neutralize_enabled",         "normalizeEnabled")
+          read("neutralize_threshold_pct",   "normalizeThresholdPct")
+          read("neutralize_max_per_direction","normalizeMaxPerDirection")
+
           setTimings(next)
         }
       }
@@ -245,6 +301,12 @@ export function SystemSettings() {
             lock_extend_interval_ms:       timings.lockExtendIntervalMs,
             max_position_hold_ms:          timings.maxPositionHoldMs,
             progression_buffer_flush_ms:   timings.progressionBufferFlushMs,
+            // ── Hedge / Directional Accumulation settings ───────────────────
+            normalize_enabled:             timings.normalizeEnabled,
+            normalize_threshold_pct:       timings.normalizeThresholdPct,
+            normalize_max_per_direction:   timings.normalizeMaxPerDirection,
+            // string — not numeric — included verbatim
+            normalize_volume_mode:         timings.normalizeVolumeMode,
           }),
         }),
       ])
@@ -456,7 +518,141 @@ export function SystemSettings() {
         </CardContent>
       </Card>
 
-      {/* ── Engine Timings & Cron Schedule ─────────────────────────────
+      {/* ── Hedge / Directional Normalisation ──────────────────────────────── */}
+      {/*
+       * Hedge Accumulation controls: when the engine runs per-Base set and a
+       * symbol receives N long + M short signals, the per-direction hedge
+       * count tracks the imbalance. When `normalizeEnabled` is ON the live-
+       * stage and StrategyCoordinator apply these rules:
+       *
+       *   normalizeThresholdPct    — imbalance % (|L−S|/(L+S)) above which
+       *                              normalize kicks in. Default 10%.
+       *   normalizeMaxPerDirection — feeds the coordinator's per-Base sub-set
+       *                              cap; below this cap no shed happens.
+       *   normalizeVolumeMode      — how additional volume is adjusted:
+       *      "neutralize" — add only the net-delta (min exposure)
+       *      "rebalance"  — add full volume but rebalance toward dominant side
+       *      "reduce"     — scale-down by the ratio of net to total
+       *
+       * Persisted in `settings:system` hash under `neutralize_*` key names
+       * (snake_case for canonical Redis schema). `engine-timings.ts` reads and
+       * caches these values; StrategyCoordinator and live-stage read them via
+       * `getEngineTimings()` at cycle start.
+       */}
+      <Card className="border-emerald-200 bg-emerald-50/30">
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <CardTitle>Hedge / Directional Accumulation</CardTitle>
+            <Badge variant="secondary" className="bg-emerald-100 text-emerald-700">LIVE</Badge>
+          </div>
+          <CardDescription>
+            When enabled, imbalances between long and short signals for the same
+            Base Set adjust downstream volume and position counts.
+            The live-stage accumulate path and StrategyCoordinator hedge netter
+            read these values via <code className="font-mono">getEngineTimings()</code>.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid md:grid-cols-2 gap-4">
+            {/* enable / disable */}
+            <div className="flex items-center justify-between p-4 border rounded-lg">
+              <div>
+                <Label className="font-medium text-sm">Enable Hedge Accumulation</Label>
+                <p className="text-xs text-muted-foreground">
+                  Apply net-direction and volume-ratio adjustments during Real→Live.
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                id="hedge-enabled"
+                checked={timings.neutralizeEnabled === 1}
+                onChange={(e) =>
+                  setTimings({
+                    ...timings,
+                    neutralizeEnabled: e.target.checked ? 1 : 0,
+                  })
+                }
+                className="w-5 h-5 rounded cursor-pointer"
+              />
+            </div>
+
+            {/* Imbalance threshold % */}
+            <div className="space-y-2 p-4 border rounded-lg">
+              <Label className="text-sm font-medium">Imbalance Threshold (%)</Label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="range"
+                  min={0}
+                  max={50}
+                  step={1}
+                  value={timings.neutralizeThresholdPct}
+                  onChange={(e) =>
+                    setTimings({ ...timings, neutralizeThresholdPct: Number(e.target.value) })
+                  }
+                  className="flex-1"
+                />
+                <span className="text-sm font-semibold w-12 text-right">
+                  {timings.neutralizeThresholdPct}%
+                </span>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                |long − short| / (long + short) must exceed this % before normalization applies.
+                Spec default 10.
+              </p>
+            </div>
+
+            {/* Max per direction */}
+            <div className="space-y-2 p-4 border rounded-lg">
+              <Label className="text-sm font-medium">Max Open Per Direction</Label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="range"
+                  min={1}
+                  max={200}
+                  step={1}
+                  value={timings.neutralizeMaxPerDirection}
+                  onChange={(e) =>
+                    setTimings({ ...timings, neutralizeMaxPerDirection: Number(e.target.value) })
+                  }
+                  className="flex-1"
+                />
+                <span className="text-sm font-semibold w-12 text-right">
+                  {timings.neutralizeMaxPerDirection}
+                </span>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Hard cap: no more than this many concurrent open-sets per direction
+                per Base Set. Spec default 20.
+              </p>
+            </div>
+
+            {/* Volume mode */}
+            <div className="space-y-2 p-4 border rounded-lg">
+              <Label className="text-sm font-medium">Volume Adjustment Mode</Label>
+              <select
+                value={timings.neutralizeVolumeMode}
+                onChange={(e) =>
+                  setTimings({
+                    ...timings,
+                    neutralizeVolumeMode: e.target.value as "neutralize" | "rebalance" | "reduce",
+                  })
+                }
+                className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+              >
+                <option value="neutralize">Neutralize — net-delta only</option>
+                <option value="rebalance">Rebalance — full vol. toward dominant</option>
+                <option value="reduce">Reduce — scale by imbalance ratio</option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                Strategy for adjusting volume when a directional imbalance triggers
+                normalization. Spec default: neutralize.
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Engine Timings & Cron Schedule */}
             All knobs the operator previously had to redeploy to change.
             Each row shows the field, current value, allowed range, and
             whether the change takes effect Live or requires an engine
