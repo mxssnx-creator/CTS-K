@@ -103,9 +103,29 @@ export interface EngineTimings {
   realtimeIntervalMs: number          // Loop B start-to-start
   realtimeCyclePauseMs: number        // Loop B post-cycle breath
   livePositionsCyclePauseMs: number   // Loop C post-cycle breath
-                                      //   (Loop C uses `liveSyncIntervalMs`
-                                      //    as start-to-start gate — that
-                                      //    field already exists above.)
+                                       //   (Loop C uses `liveSyncIntervalMs`
+                                       //    as start-to-start gate — that
+                                       //    field already exists above.)
+
+  // ── Hedge Accumulation / Directional Neutralisation ───────────────────────
+  // Per spec: instead of blindly stacking long & short sets into exchange
+  // positions, the engine counts per-direction signal volumes during BASE→MAIN
+  // and then bounds the net delta that each Real→Live promotion adds. When
+  // long and short are both present for the same symbol the net Long + net
+  // Short approach parity; excess signals that would push imbalance beyond the
+  // configured threshold are suppressed for that cycle.
+  //
+  // `neutralizeEnabled`  — master on/off (default off for backward compat)
+  // `neutralizeThresholdPct`  — imbalance % (|L−S|/(L+S)) above which to reduce
+  // `neutralizeMaxPerDirection` — hard cap on concurrent sets before excess is shed
+  // `neutralizeVolumeMode` — how to adjust volumes on neutralisation:
+  //    "neutralize" – only add volume equal to the net delta
+  //    "rebalance"  – add full volume but rebalance towards the short side
+  //    "reduce"     – add at reduced scale proportional to net fraction
+  neutralizeEnabled: boolean
+  neutralizeThresholdPct: number
+  neutralizeMaxPerDirection: number
+  neutralizeVolumeMode: "neutralize" | "rebalance" | "reduce"
 }
 
 export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
@@ -129,6 +149,11 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   realtimeIntervalMs:           1_000,
   realtimeCyclePauseMs:            50,
   livePositionsCyclePauseMs:       50,
+  // ── Hedge Accumulation defaults (disabled until opted-in) ────────────────
+  neutralizeEnabled:               false,
+  neutralizeThresholdPct:          10,   // 10 % imbalance before reducing
+  neutralizeMaxPerDirection:       20,   // up to 20 concurrent sets before shedding
+  neutralizeVolumeMode:            "neutralize", // net-delta-only addition
 }
 
 // Hard min/max bounds — UI + API normalise to these to avoid pathological
@@ -157,7 +182,12 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
   prehistoricCyclePauseMs:   { min: 10,          max: 500                 },
   realtimeIntervalMs:        { min: 200,         max: 60_000              },
   realtimeCyclePauseMs:      { min: 10,          max: 500                 },
-  livePositionsCyclePauseMs: { min: 10,          max: 200                 },
+  livePositionsCyclePauseMs:  { min: 10,          max: 200                 },
+  // ── Hedge Accumulation bounds ─────────────────────────────────────────────
+  neutralizeEnabled:           { min: 0,           max: 1  /* boolean */    },
+  neutralizeThresholdPct:      { min: 0,           max: 50                  },
+  neutralizeMaxPerDirection:   { min: 1,           max: 200                 },
+  neutralizeVolumeMode:        { min: 0,           max: 0  /* handled below */ }
 }
 
 // snake_case key in Redis hash → camelCase key in object. Both forms are
