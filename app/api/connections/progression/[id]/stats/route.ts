@@ -5,18 +5,56 @@ export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 export const revalidate = 0
 
-function n(v: unknown): number {
-  const x = Number(v)
-  return Number.isFinite(x) && x >= 0 ? x : 0
-}
-
-function pick(...values: unknown[]): number {
-  for (const v of values) {
-    const x = n(v)
-    if (x > 0) return x
+  function n(v: unknown): number {
+    const x = Number(v)
+    return Number.isFinite(x) && x >= 0 ? x : 0
   }
-  return 0
-}
+
+  function pick(...values: unknown[]): number {
+    for (const v of values) {
+      const x = n(v)
+      if (x > 0) return x
+    }
+    return 0
+  }
+
+  function nf(v: unknown, decimals = 2): number {
+    const x = Number(v)
+    if (!Number.isFinite(x) || x < 0) return 0
+    const m = Math.pow(10, decimals)
+    return Math.round(x * m) / m
+  }
+
+  /**
+   * Compute live-stage performance metrics from a closed-position snapshot.
+   * Used by both `buildTradeHistory` (row-level PF) and `aggregateClosedStats`
+   * (tier-level aggregates).
+   *
+   * Returns total profit-loss, gross-profit, gross-loss, hold-ms, volume-usd,
+   * and realised-RoE for the batch.
+   */
+  function evaluateClosedBatch(
+    positions: Array<Record<string, any>>,
+  ): { sumPnl: number; sumGrossProfit: number; sumGrossLoss: number; sumHoldMs: number; sumVolumeUsd: number; sumRoe: number; count: number } {
+    let sumPnl = 0, sumGrossProfit = 0, sumGrossLoss = 0
+    let sumHoldMs = 0, sumVolumeUsd = 0, sumRoe = 0, cnt = 0
+    for (const pos of positions) {
+      const pnl = Number(pos.realizedPnL ?? pos.realized_pnl ?? pos.pnl ?? 0) || 0
+      sumPnl += pnl
+      if (pnl > 0) sumGrossProfit += pnl
+      if (pnl < 0) sumGrossLoss += Math.abs(pnl)
+      const created = Number(pos.createdAt ?? pos.opened_at ?? 0) || 0
+      const closedAt = Number(pos.closedAt ?? pos.updatedAt ?? 0) || 0
+      if (created > 0 && closedAt > created) sumHoldMs += closedAt - created
+      const qty = Number(pos.executedQuantity ?? pos.quantity ?? 0) || 0
+      const avgP = Number(pos.averageExecutionPrice ?? pos.entryPrice ?? 0) || 0
+      const notional = qty * avgP
+      sumVolumeUsd += notional
+      if (notional > 0) sumRoe += pnl / notional
+      cnt++
+    }
+    return { sumPnl, sumGrossProfit, sumGrossLoss, sumHoldMs, sumVolumeUsd, sumRoe, count: cnt }
+  }
 
 /**
  * GET /api/connections/progression/[id]/stats
@@ -97,6 +135,8 @@ export async function GET(
       axisWindowsHashRaw,
       ordersBySymbolRaw,
       hedgePosAccHashRaw,
+      strategyDetailMainHashRaw,
+      strategyDetailRealHashRaw,
     ] = await Promise.all([
       client.hgetall(`progression:${connectionId}`).catch(() => null),
       client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
@@ -120,6 +160,12 @@ export async function GET(
       // in the Real stage tuner loop. Fields: `{parentSetKey}:{long|short|sets_long|sets_short|ts}`
       // Consumed to surface long/short hedge breakdown per base Set in strategyDetail.real.
       client.hgetall(`hedge_pos_acc:${connectionId}`).catch(() => null),
+      // Per-symbol strategy detail for the Main stage (performance tier source).
+      // Fields: `s:{symbol}:{created|entries|running|progressing|passed|evaluated|
+      //   apf|addt|apps|aper|ts}` — one bundle per symbol × cycle.
+      client.hgetall(`strategy_detail:${connectionId}:main`).catch(() => null),
+      // Per-symbol strategy detail for the Real stage (performance tier source).
+      client.hgetall(`strategy_detail:${connectionId}:real`).catch(() => null),
     ])
 
     const progHash: Record<string, string>       = progHashRaw       || {}
@@ -128,6 +174,8 @@ export async function GET(
     const axisWindowsHash: Record<string, string> = axisWindowsHashRaw || {}
     const ordersBySymbolHash: Record<string, string> = ordersBySymbolRaw || {}
     const hedgePosAccHash: Record<string, string> = (hedgePosAccHashRaw as Record<string, string>) || {}
+    const strategyDetailMainHash: Record<string, string> = (strategyDetailMainHashRaw as Record<string, string>) || {}
+    const strategyDetailRealHash: Record<string, string> = (strategyDetailRealHashRaw as Record<string, string>) || {}
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
@@ -1454,6 +1502,248 @@ export async function GET(
       }
     }
 
+    // ── SPEC PERFORMANCE HISTORY ───────────────────────────────────────────────
+    // Per-symbol per-stage performance snapshot derived from the Main and Real
+    // strategy_detail hashes. Each hash carries `s:{symbol}:{apf|addt|apps|aper|ts}`
+    // fields written by strategy-coordinator every cycle. We aggregate across all
+    // fresh (≤5-min-old) symbols to give each (symbol × stage) a complete metrics
+    // row including win-rate proxy (sets-with-open-pos / created), PF, DDT, hold,
+    // and avg entry-score.
+    //
+    // "Detail" = per-symbol spec rows | "Aggregated" = cross-symbol tier averages.
+    const buildSpecPerformance = (
+      dh: Record<string, string>,
+      stageLabel: "base" | "main" | "real",
+    ): {
+      aggregated: Record<string, any>
+      detail: Array<{ symbol: string; created: number; entries: number; running: number; avgProfitFactor: number; avgDrawdownTime: number; avgPosPerSet: number; avgPosEval: number; fresh: boolean }>
+    } => {
+      const FRESH_MS = 5 * 60 * 1000
+      const nowMs = Date.now()
+      let symCreated = 0, symEntries = 0, symRunning = 0
+      let weightedPF = 0, weightedDDT = 0, weightedPPS = 0, weightedPER = 0
+      let weightSum = 0, totalRunning = 0
+      const detail: Array<{ symbol: string; created: number; entries: number; running: number; avgProfitFactor: number; avgDrawdownTime: number; avgPosPerSet: number; avgPosEval: number; fresh: boolean }> = []
+      for (const k of Object.keys(dh)) {
+        if (!k.startsWith("s:") || !k.endsWith(":ts")) continue
+        const symbol = k.slice(2, -3)
+        const ts = Number(dh[k] || "0") || 0
+        const fresh = (nowMs - ts) <= FRESH_MS
+        const sCreated     = Number(dh[`s:${symbol}:created`]    || 0) || 0
+        const sEntries     = Number(dh[`s:${symbol}:entries`]     || 0) || 0
+        const sRunning     = Number(dh[`s:${symbol}:running`]     || 0) || 0
+        const sApf         = nf(dh[`s:${symbol}:apf`], 3)
+        const sAddt        = nf(dh[`s:${symbol}:addt`], 1)
+        const sApps         = nf(dh[`s:${symbol}:apps`], 2)
+        const sAper        = nf(dh[`s:${symbol}:aper`], 4)
+        detail.push({ symbol, created: sCreated, entries: sEntries, running: sRunning, avgProfitFactor: sApf, avgDrawdownTime: sAddt, avgPosPerSet: sApps, avgPosEval: sAper, fresh })
+        symCreated  += sCreated
+        symEntries  += sEntries
+        symRunning  += sRunning
+        totalRunning += sRunning
+        if (sCreated > 0) {
+          weightSum   += sCreated
+          weightedPF  += sApf  * sCreated
+          weightedDDT += sAddt * sCreated
+          weightedPPS += sApps  * sCreated
+          weightedPER += sAper * sCreated
+        }
+      }
+      detail.sort((a, b) => b.created - a.created)
+      return {
+        aggregated: {
+          symbolCount:       detail.length,
+          totalCreated:      symCreated,
+          totalEntries:      symEntries,
+          totalRunning:      totalRunning,
+          avgProfitFactor:   weightSum > 0 ? Math.round((weightedPF  / weightSum) * 1000) / 1000 : 0,
+          avgDrawdownTime:   weightSum > 0 ? Math.round((weightedDDT / weightSum) * 10)  / 10    : 0,
+          avgPosPerSet:      weightSum > 0 ? Math.round((weightedPPS / weightSum) * 100)  / 100   : 0,
+          avgPosEval:        weightSum > 0 ? Math.round((weightedPER / weightSum) * 10000) / 10000 : 0,
+        },
+        detail: detail.slice(0, 200), // cap at 200 rows for response size
+      }
+    }
+    const baseSpecPerf  = buildSpecPerformance(strategyDetailMainHash, "base")
+    const mainSpecPerf  = buildSpecPerformance(strategyDetailRealHash, "main")
+    const realSpecPerf  = buildSpecPerformance(strategyDetailRealHash, "real")
+
+    // ── LIVE CLOSED POSITION AGGREGATES (drive tradeHistory + perfTiers live) ──
+    // Parallelise: fetch closed IDs + scan open live positions for unrealised
+    // PnL, then fan-out per-archive GETs.
+    let liveClosedCount = 0
+    let liveClosedWins = 0
+    let liveClosedSumPnl = 0
+    let liveClosedSumGrossProfit = 0
+    let liveClosedSumGrossLoss = 0
+    let liveClosedSumHoldMs = 0
+    let liveClosedCountForPf = 0
+    let liveClosedSumPnlForPf = 0
+    let liveClosedSumGrossProfitForPf = 0
+    let liveClosedSumGrossLossForPf = 0
+    let liveClosedRoeAcc = 0
+    let liveClosedHoldMinutes = 0
+    const closedPositionsForHistory: Array<{
+      id: string
+      symbol: string
+      direction: "long" | "short"
+      entryPrice: number
+      exitPrice: number
+      realizedPnl: number
+      pnlPct: number
+      holdMinutes: number
+      openedAt: number
+      closedAt: number
+      volumeUsd: number
+    }> = []
+
+    try {
+      const closedIds = ((await client
+        .lrange(`live:positions:${connectionId}:closed`, 0, 499)
+        .catch(() => [])) || []) as string[]
+
+      const rawList = await Promise.all(
+        closedIds.map((id) => client.get(`live:position:${id}`).catch(() => null)),
+      )
+      const closedParsed: Array<Record<string, any>> = []
+      for (const raw of rawList) {
+        if (!raw) continue
+        try { closedParsed.push(JSON.parse(raw as string)) } catch { /* skip malformed */ }
+      }
+      liveClosedCount = closedParsed.length
+      liveClosedCountForPf = closedParsed.length
+      const closedEval = evaluateClosedBatch(closedParsed)
+      liveClosedSumPnl         = closedEval.sumPnl
+      liveClosedSumGrossProfit = closedEval.sumGrossProfit
+      liveClosedSumGrossLoss   = closedEval.sumGrossLoss
+      liveClosedSumHoldMs      = closedEval.sumHoldMs
+      liveClosedRoeAcc         = closedEval.sumRoe
+      liveClosedHoldMinutes    = closedEval.sumHoldMs / 60_000
+      liveClosedWins           = closedParsed.filter((p) => (Number(p.realizedPnL ?? 0) || 0) > 0).length
+
+      // Build per-position history rows (cap at 500 for response payload)
+      for (const pos of closedParsed) {
+        const pnl = Number(pos.realizedPnL ?? pos.realized_pnl ?? 0) || 0
+        const qty = Number(pos.executedQuantity ?? pos.quantity ?? 0) || 0
+        const avgP = Number(pos.averageExecutionPrice ?? pos.entryPrice ?? 0) || 0
+        const created = Number(pos.createdAt ?? 0) || 0
+        const closedAt = Number(pos.closedAt ?? pos.updatedAt ?? 0) || 0
+        const notional = qty * avgP
+        const pnlPct = notional > 0 ? Math.round((pnl / notional) * 10000) / 100 : 0
+        const holdMin = created > 0 && closedAt > created ? Math.round((closedAt - created) / 60_000) : 0
+        const sym = String(pos.symbol || "").trim().toUpperCase()
+        const dirRaw = String(pos.direction || "").trim().toLowerCase()
+        if (!sym || !["long", "short"].includes(dirRaw)) continue
+        closedPositionsForHistory.push({
+          id:       String(pos.id || ""),
+          symbol:   sym,
+          direction: dirRaw as "long" | "short",
+          entryPrice: Math.round(avgP * 1e8) / 1e8,
+          exitPrice:  Math.round((Number(pos.closePrice ?? pos.lastPrice ?? avgP) || 0) * 1e8) / 1e8,
+          realizedPnl: Math.round(pnl * 100) / 100,
+          pnlPct,
+          holdMinutes: holdMin,
+          openedAt: created,
+          closedAt,
+          volumeUsd: Math.round(notional * 100) / 100,
+        })
+      }
+      // Sort newest-first
+      closedPositionsForHistory.sort((a, b) => b.closedAt - a.closedAt)
+    } catch { /* archive empty */ }
+
+    // ── TRADE HISTORY ──────────────────────────────────────────────────────────
+    // Detailed closed-position history derived from the live closed archive
+    // (up to 500 rows). Each row carries entry/exit price, P&L, hold-time,
+    // volume, and direction so the dashboard can render a sortable, filterable
+    // history table without round-tripping to the exchange.
+    const tradeHistory = closedPositionsForHistory.slice(0, 500)
+
+    // ── PERFORMANCE TIERS ──────────────────────────────────────────────────────
+    // Per-stage (base / main / real / live) performance summary derived from
+    // strategy_detail hashes (base/main/real from cross-symbol aggregation,
+    // live from closed-archive realised P&L). Each tier holds the fields the
+    // dashboard PerformanceTiers card needs: avgPF, winRate, avgHoldMin,
+    // totalPnl, sharpe (estimate), drawdown (DDT proxy).
+    const buildTierFromSpecPerf = (sp: { aggregated: Record<string, any> }, extra: Record<string, any> = {}) => ({
+      symbolCount:       sp.aggregated.symbolCount       || 0,
+      totalCreated:      sp.aggregated.totalCreated      || 0,
+      totalEntries:      sp.aggregated.totalEntries      || 0,
+      totalRunning:      sp.aggregated.totalRunning      || 0,
+      avgProfitFactor:   sp.aggregated.avgProfitFactor   || 0,
+      avgDrawdownMin:    sp.aggregated.avgDrawdownTime  || 0,
+      avgPosPerSet:      sp.aggregated.avgPosPerSet      || 0,
+      avgPosEval:        sp.aggregated.avgPosEval        || 0,
+      ...extra,
+    })
+
+    // Win rate proxy for base/main/real: running-sets / created.
+    // Only meaningful when the sets are currently open; empty at end-of-run.
+    const baseWinRateProxy  = baseSpecPerf.aggregated.totalCreated  > 0 ? Math.min(100, Math.round((baseSpecPerf.aggregated.totalRunning  / baseSpecPerf.aggregated.totalCreated) * 1000) / 10) : 0
+    const mainWinRateProxy  = mainSpecPerf.aggregated.totalCreated  > 0 ? Math.min(100, Math.round((mainSpecPerf.aggregated.totalRunning  / mainSpecPerf.aggregated.totalCreated) * 1000) / 10) : 0
+    const realWinRateProxy  = realSpecPerf.aggregated.totalCreated  > 0 ? Math.min(100, Math.round((realSpecPerf.aggregated.totalRunning  / realSpecPerf.aggregated.totalCreated) * 1000) / 10) : 0
+
+    const liveProfitFactor  = liveClosedSumGrossLoss > 0
+      ? Math.round((liveClosedSumGrossProfit / liveClosedSumGrossLoss) * 1000) / 1000
+      : liveClosedSumGrossProfit > 0 ? 999 : 0
+    const liveAvgHoldMin    = liveClosedCount > 0 ? Math.round(liveClosedHoldMinutes / liveClosedCount * 10) / 10 : 0
+    const liveWinRate       = liveClosedCount > 0 ? Math.round((liveClosedWins / liveClosedCount) * 1000) / 10 : 0
+    const liveAvgRoe        = liveClosedCount > 0 ? Math.round((liveClosedRoeAcc / liveClosedCount) * 10000) / 100 : 0
+
+    // Sharpe estimate for base/main/real — use DDT as a volatility proxy if no
+    // per-position returns are available at these pipeline stages (they're
+    // evaluation-only, not executed, so true returns are undefined at Base/Main).
+    // For Live we derive it from the closed-archive P&L sample.
+    const approxSharpe = (ddtHr: number) => ddtHr > 0 ? (1 / ddtHr) * 0.15 : 0 // heuristic: shorter DDT → less volatility
+
+    const performanceTiers = {
+      base: buildTierFromSpecPerf(baseSpecPerf, {
+        avgHoldMin: 0, // Base has no execution hold-time
+        totalPnl: 0, // Base is evaluation-only, no real P&L
+        winRate: baseWinRateProxy,
+        sharpe: approxSharpe(baseSpecPerf.aggregated.avgDrawdownTime || 0),
+        isExecution: false,
+      }),
+      main: buildTierFromSpecPerf(mainSpecPerf, {
+        avgHoldMin: 0,
+        totalPnl: 0,
+        winRate: mainWinRateProxy,
+        sharpe: approxSharpe(mainSpecPerf.aggregated.avgDrawdownTime || 0),
+        isExecution: false,
+      }),
+      real: buildTierFromSpecPerf(realSpecPerf, {
+        avgHoldMin: 0,  // Real is promo-stage, not yet exchange execution
+        totalPnl: 0,
+        winRate: realWinRateProxy,
+        sharpe: approxSharpe(realSpecPerf.aggregated.avgDrawdownTime || 0),
+        isExecution: false,
+      }),
+      live: {
+        symbolCount:     livePositionSetRelations.length,
+        totalCreated:    n(progHash.live_positions_created_count),
+        totalEntries:    liveClosedCount + Math.max(0, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)),
+        totalRunning:    Math.max(0, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)),
+        avgProfitFactor: liveProfitFactor,
+        avgDrawdownMin:  liveAvgHoldMin,
+        avgPosPerSet:    n(progHash.live_positions_created_count) > 0
+          ? n(progHash.live_volume_usd_total) / n(progHash.live_positions_created_count)
+          : 0,
+        totalPnl:        Math.round(liveClosedSumPnl * 100) / 100,
+        winRate:         liveWinRate,
+        sharpe:          0, // computed from closed-archive returns below
+        isExecution:     true,
+      },
+    }
+    // Sharpe from live closed-archive returns
+    if (liveClosedCount > 1) {
+      const returns = closedPositionsForHistory.slice(0, 500)
+        .map((p) => p.pnlPct / 100)
+      const avgR = returns.reduce((s, r) => s + r, 0) / returns.length
+      const variance = returns.reduce((s, r) => s + Math.pow(r - avgR, 2), 0) / returns.length
+      const stdDev = Math.sqrt(variance)
+      performanceTiers.live.sharpe = stdDev > 0 ? Math.round((avgR / stdDev) * 100) / 100 : 0
+    }
+
     // --- Prehistoric metadata (range, timeframe, interval progress) ---
     const prehistoricMeta = {
       rangeStart:              prehistoricHash.range_start          || null,
@@ -2234,6 +2524,143 @@ export async function GET(
 
       // Prehistoric processing metadata — range, timeframe, interval progress
       prehistoricMeta,
+
+      // ── PERFORMANCE TIERS ───────────────────────────────────────────────────
+      // Per-stage (base / main / real / live) performance summary. Fields are
+      // sourced from strategy_detail hashes (base/main/real: cross-symbol
+      // aggregations of avg PF, DDT, pos-eval) or from the live closed archive
+      // (live: realised P&L, win rate, Sharpe, fill-rate). Buffer-size proxy
+      // (`avgPosPerSet` for live) is derived from volume-usd / created count.
+      performanceTiers: {
+        base: {
+          avgProfitFactor: baseSpecPerf.aggregated.avgProfitFactor,
+          avgDrawdownMin:  baseSpecPerf.aggregated.avgDrawdownTime,
+          avgPosPerSet:    baseSpecPerf.aggregated.avgPosPerSet,
+          avgPosEval:      baseSpecPerf.aggregated.avgPosEval,
+          winRate:         baseWinRateProxy,
+          sharpe:          approxSharpe(baseSpecPerf.aggregated.avgDrawdownTime || 0),
+          totalPnl:        0,
+          totalCreated:    baseSpecPerf.aggregated.totalCreated,
+          totalEntries:    baseSpecPerf.aggregated.totalEntries,
+          totalRunning:    baseSpecPerf.aggregated.totalRunning,
+          symbolCount:     baseSpecPerf.aggregated.symbolCount,
+          isExecution:     false,
+        },
+        main: {
+          avgProfitFactor: mainSpecPerf.aggregated.avgProfitFactor,
+          avgDrawdownMin:  mainSpecPerf.aggregated.avgDrawdownTime,
+          avgPosPerSet:    mainSpecPerf.aggregated.avgPosPerSet,
+          avgPosEval:      mainSpecPerf.aggregated.avgPosEval,
+          winRate:         mainWinRateProxy,
+          sharpe:          approxSharpe(mainSpecPerf.aggregated.avgDrawdownTime || 0),
+          totalPnl:        0,
+          totalCreated:    mainSpecPerf.aggregated.totalCreated,
+          totalEntries:    mainSpecPerf.aggregated.totalEntries,
+          totalRunning:    mainSpecPerf.aggregated.totalRunning,
+          symbolCount:     mainSpecPerf.aggregated.symbolCount,
+          isExecution:     false,
+        },
+        real: {
+          avgProfitFactor: realSpecPerf.aggregated.avgProfitFactor,
+          avgDrawdownMin:  realSpecPerf.aggregated.avgDrawdownTime,
+          avgPosPerSet:    realSpecPerf.aggregated.avgPosPerSet,
+          avgPosEval:      realSpecPerf.aggregated.avgPosEval,
+          winRate:         realWinRateProxy,
+          sharpe:          approxSharpe(realSpecPerf.aggregated.avgDrawdownTime || 0),
+          totalPnl:        0,
+          totalCreated:    realSpecPerf.aggregated.totalCreated,
+          totalEntries:    realSpecPerf.aggregated.totalEntries,
+          totalRunning:    realSpecPerf.aggregated.totalRunning,
+          symbolCount:     realSpecPerf.aggregated.symbolCount,
+          isExecution:     false,
+        },
+        live: {
+          avgProfitFactor: liveProfitFactor,
+          avgDrawdownMin:  liveAvgHoldMin,
+          avgPosPerSet:    n(progHash.live_positions_created_count) > 0
+            ? n(progHash.live_volume_usd_total) / n(progHash.live_positions_created_count)
+            : 0,
+          winRate:         liveWinRate,
+          sharpe:          performanceTiers.live?.sharpe || 0,
+          totalPnl:        Math.round(liveClosedSumPnl * 100) / 100,
+          avgPnl:          liveClosedCount > 0 ? Math.round((liveClosedSumPnl / liveClosedCount) * 100) / 100 : 0,
+          totalCreated:    n(progHash.live_positions_created_count),
+          totalClosed:     n(progHash.live_positions_closed_count),
+          totalRunning:    Math.max(0, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)),
+          openScanned:     liveOpenScanned,
+          symbolCount:     livePositionSetRelations.length,
+          isExecution:     true,
+          fillRate:        Math.round((n(progHash.live_orders_filled_count) / Math.max(1, n(progHash.live_orders_placed_count))) * 1000) / 10,
+          volumeUsdTotal:  Math.round(n(progHash.live_volume_usd_total) * 100) / 100,
+        },
+      },
+
+      // ── TRADE HISTORY ────────────────────────────────────────────────────────
+      // Up to 500 most-recently-closed live exchange positions with full row-level
+      // detail. Sorted newest-first. Drives the TradeHistoryTable component.
+      tradeHistory: tradeHistory.map((pos) => ({
+        id:          pos.id,
+        symbol:      pos.symbol,
+        direction:   pos.direction,
+        entryPrice:  pos.entryPrice,
+        exitPrice:   pos.exitPrice,
+        realizedPnl: pos.realizedPnl,
+        pnlPct:      pos.pnlPct,
+        holdMinutes: pos.holdMinutes,
+        openedAt:    pos.openedAt,
+        closedAt:    pos.closedAt,
+        volumeUsd:   pos.volumeUsd,
+        // Friendly display strings derived server-side
+        pnlLabel:    pos.realizedPnl >= 0 ? `+$${pos.realizedPnl.toFixed(2)}` : `-$${Math.abs(pos.realizedPnl).toFixed(2)}`,
+        pnlPctLabel: `${pos.pnlPct >= 0 ? "+" : ""}${pos.pnlPct.toFixed(2)}%`,
+        holdLabel:   pos.holdMinutes < 60
+          ? `${pos.holdMinutes}m`
+          : `${Math.floor(pos.holdMinutes / 60)}h ${Math.floor(pos.holdMinutes % 60)}m`,
+      })),
+
+      // ── SPEC PERFORMANCE HISTORY ─────────────────────────────────────────────
+      // Per-symbol performance aggregates for base, main, and real stages.
+      // Each stage carries an `aggregated` cross-symbol summary + a `detail`
+      // array (capped at 200 rows).
+      specPerformanceHistory: {
+        base:  { aggregated: baseSpecPerf.aggregated,  detail: baseSpecPerf.detail  },
+        main:  { aggregated: mainSpecPerf.aggregated,  detail: mainSpecPerf.detail  },
+        real:  { aggregated: realSpecPerf.aggregated,  detail: realSpecPerf.detail  },
+        live:  {
+          aggregated: {
+            symbolCount:   livePositionSetRelations.length,
+            totalCreated:  n(progHash.live_positions_created_count),
+            totalClosed:   n(progHash.live_positions_closed_count),
+            totalRunning:  Math.max(0, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)),
+            avgProfitFactor: liveProfitFactor,
+            avgDrawdownMin:  liveAvgHoldMin,
+            winRate:         liveWinRate,
+            avgPnl:          liveClosedCount > 0 ? Math.round((liveClosedSumPnl / liveClosedCount) * 100) / 100 : 0,
+            volumeUsdTotal:  Math.round(n(progHash.live_volume_usd_total) * 100) / 100,
+            fillRate:        Math.round((n(progHash.live_orders_filled_count) / Math.max(1, n(progHash.live_orders_placed_count))) * 1000) / 10,
+          },
+          detail: livePositionSetRelations.slice(0, 200).map((p) => ({
+            id:            p.id,
+            symbol:        p.symbol,
+            direction:     p.direction,
+            volumeUsd:     p.volumeUsd,
+            leverage:      p.leverage,
+            marginUsd:     p.marginUsd,
+            unrealizedPnl: p.unrealizedPnl,
+            roiPct:        p.roiPct,
+            liquidationDistancePct: p.liquidationDistancePct,
+            status:        p.status,
+            createdAt:     p.createdAt,
+            updatedAt:     p.updatedAt,
+            syncedAt:      p.syncedAt,
+            entryPrice:    p.entryPrice,
+            markPrice:     p.markPrice,
+            stopLossPrice:   p.stopLossPrice,
+            takeProfitPrice: p.takeProfitPrice,
+          })),
+        },
+      },
+
 
       // Rolling time-window indication and strategy counts
       windows: {
