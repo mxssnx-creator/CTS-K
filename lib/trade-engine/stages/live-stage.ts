@@ -544,6 +544,27 @@ async function accumulateIntoLivePosition(
   const symbol = realPosition.symbol
   const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
 
+  // ── Accumulation depth guard ─────────────────────────────────────────
+  // Stops runaway DCA / pyramiding from flipping with the live-stage
+  // ── Accumulation depth guard ─────────────────────────────────────────
+  // Hard cap on how many upstream Set signals may merge into a single live
+  // exchange position. DCA / pyramiding strategies can accumulate without
+  // drawdown gating; beyond this limit the operator explicitly re-evaluates
+  // before the engine allows further merges.
+  const currentAccCount = Number(existing.accumulationCount ?? 0)
+  if (currentAccCount >= MAX_ACCUMULATIONS_PER_POSITION) {
+    pushStep(existing, "accumulate_rejected", false,
+      `accumulationCount=${currentAccCount} >= ${MAX_ACCUMULATIONS_PER_POSITION} — hard cap reached; real drawdown check required`)
+    await savePosition(existing)
+    await logProgressionEvent(
+      connectionId, "live_trading", "warning",
+      `Accumulation cap hit for ${symbol} ${existing.direction}: count=${currentAccCount} ≥ ${MAX_ACCUMULATIONS_PER_POSITION}. ` +
+      `Review position drawdown before further accumulation.`,
+      { positionId: existing.id, accumulationCount: currentAccCount }
+    ).catch(() => {})
+    return existing
+  }
+
   try {
     // ── 1. Compute additional volume (always honors min) ───────────────
     //
@@ -785,14 +806,29 @@ async function accumulateIntoLivePosition(
     )
 
     return existing
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err)
-    console.error(`${LOG_PREFIX} accumulateIntoLivePosition error:`, errMsg)
-    pushStep(existing, "accumulate", false, errMsg)
-    await savePosition(existing).catch(() => {})
-    return existing
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      console.error(`${LOG_PREFIX} accumulateIntoLivePosition error:`, errMsg)
+      pushStep(existing, "accumulate", false, errMsg)
+      await savePosition(existing).catch(() => {})
+      return existing
+    }
   }
-}
+
+/**
+ * Hard upper bound on how many times a single live exchange position may absorb
+ * upstream Set signals (accumulateIntoLivePosition) before we stop merging.
+ *
+ * Rationale:
+ *   - DCA / pyramiding strategies can fire continuously on rising price, each
+ *     merge placing a new exchange order and pushing `accumulationCount` up.
+ *   - Without a cap, unlimited merges inflate position size proportionally
+ *     without any drawdown gating — the operator has no visibility and the
+ *     exchange may reject the accumulated notional.
+ *   - 25 gives a generous DCA headroom (1 initial entry + 24 merges ≈ 4× the
+ *     initial allocation at equal-weight increments) while flagging abuse.
+ */
+const MAX_ACCUMULATIONS_PER_POSITION = 25
 
 /**
  * Recognise exchange errors that CANNOT be fixed by retrying. For these
