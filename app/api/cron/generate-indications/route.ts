@@ -36,7 +36,7 @@ async function getMostVolatileSymbol(exchange: string): Promise<string> {
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.symbol
 
   try {
-    const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"
+    const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || `http://localhost:${process.env.PORT || "3002"}`
     const res = await fetch(
       `${baseUrl}/api/exchange/${exchange}/top-symbols?t=${Date.now()}`,
       { signal: AbortSignal.timeout(4000), cache: "no-store" }

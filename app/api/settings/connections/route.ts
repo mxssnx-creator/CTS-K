@@ -150,7 +150,7 @@ export async function POST(request: Request) {
       try {
         console.log("[v0] [API] Auto-testing newly created connection:", connectionId)
         const testResponse = await fetch(
-          new URL(`/api/settings/connections/${connectionId}/test`, process.env.NEXT_PUBLIC_APP_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "http://localhost:3001")).toString(),
+          new URL(`/api/settings/connections/${connectionId}/test`, process.env.NEXT_PUBLIC_APP_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : `http://localhost:${process.env.PORT || "3002"}`)).toString(),
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },

@@ -300,7 +300,7 @@ export async function POST(request: Request) {
     // PRIMARY: fetch most volatile symbol(s) from public exchange API (no auth required)
     if (symbols.length === 0) {
       try {
-        const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"
+        const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || `http://localhost:${process.env.PORT || "3002"}`
         // AbortSignal.timeout() is unreliable on Node.js < V20. Use a plain
         // Promise.race so the timeout actually fires even when the built-in
         // abort-controller integration is absent (Node 18 §fetch).

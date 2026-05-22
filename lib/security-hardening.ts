@@ -43,7 +43,7 @@ export class SecurityManager {
       enableRateLimit: config.enableRateLimit ?? true,
       enableEncryption: config.enableEncryption ?? true,
       enableAuditLog: config.enableAuditLog ?? true,
-      allowedOrigins: config.allowedOrigins ?? ['localhost', 'localhost:3000', 'localhost:3001'],
+      allowedOrigins: config.allowedOrigins ?? ['localhost', 'localhost:3000', 'localhost:3001', 'localhost:3002'],
       maxPayloadSize: config.maxPayloadSize ?? 1048576 // 1MB
     }
 
