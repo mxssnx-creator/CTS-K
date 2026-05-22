@@ -3699,12 +3699,13 @@ export async function calculateLivePositionStats(
       const lastStep = pos.progression?.find(s => s.step === "close")
       const exitPx = lastStep ? parseFloat(lastStep.details?.split("@ ")[1] || "0") : 0
       if (exitPx > 0 && pos.averageExecutionPrice > 0) {
-        const pnl =
+        const pnl = Math.round(
           pos.executedQuantity *
           (pos.direction === "long"
             ? exitPx - pos.averageExecutionPrice
-            : pos.averageExecutionPrice - exitPx)
-        totalPnL += pnl
+            : pos.averageExecutionPrice - exitPx) * 100
+        ) / 100
+        totalPnL = Math.round((totalPnL + pnl) * 100) / 100
         if (pnl > 0) winCount++
       }
     }
@@ -3714,8 +3715,8 @@ export async function calculateLivePositionStats(
       totalOpen: open.length,
       totalClosed: closed.length,
       totalPnL,
-      averageROI: closed.length > 0 ? totalPnL / closed.length : 0,
-      winRate: closed.length > 0 ? winCount / closed.length : 0,
+      averageROI: closed.length > 0 ? Math.round((totalPnL / closed.length) * 100) / 100 : 0,
+      winRate: closed.length > 0 ? Math.round((winCount / closed.length) * 100) / 100 : 0,
     }
   } catch (err) {
     console.error(`${LOG_PREFIX} Error calculating stats:`, err)

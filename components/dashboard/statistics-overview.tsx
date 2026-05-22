@@ -23,8 +23,10 @@ export interface ConnectionStats {
     live: number
     total: number
     evaluated: number
-    drawdown_max: number
-    drawdown_time_hours: number
+    // drawdown_max_usd: largest closed position loss in USD (rawnumber from posData.stats.largest_loss)
+    drawdown_max_usd: number
+    // drawdown_avg_hold_hours: avg position lifetime in hours, NOT a peak-to-trough drawdown duration
+    drawdown_avg_hold_hours: number
   }
   profit_factor: {
     last_5: number
@@ -137,8 +139,10 @@ export function StatisticsOverview({ connections }: StatisticsOverviewProps) {
             total: engineStatsData?.strategies?.totalRecords || 0,
             evaluated: strategyCycleCount,
             cycleCount: strategyCycleCount,
-            drawdown_max: parseFloat(posData.stats?.largest_loss || "0"),
-            drawdown_time_hours: parseFloat(posData.stats?.avg_holding_time_hours || "0"),
+            // largest_loss is a raw USD amount — display as $ not %
+            drawdown_max_usd: Math.abs(parseFloat(posData.stats?.largest_loss || "0")),
+            // drawdown_time_hours is currently the average position holding duration
+            drawdown_avg_hold_hours: parseFloat(posData.stats?.avg_holding_time_hours || "0"),
           },
           profit_factor: {
             last_5: stateData.cycleSuccessRate ? stateData.cycleSuccessRate / 50 : 0,
@@ -177,8 +181,8 @@ export function StatisticsOverview({ connections }: StatisticsOverviewProps) {
             live: validStats.reduce((sum, s) => sum + s.strategies.live, 0),
             total: validStats.reduce((sum, s) => sum + s.strategies.total, 0),
             evaluated: validStats.reduce((sum, s) => sum + s.strategies.evaluated, 0),
-            drawdown_max: Math.max(...validStats.map((s) => s.strategies.drawdown_max)),
-            drawdown_time_hours: validStats.reduce((sum, s) => sum + s.strategies.drawdown_time_hours, 0) / validStats.length,
+            drawdown_max_usd: Math.max(...validStats.map((s) => s.strategies.drawdown_max_usd)),
+            drawdown_avg_hold_hours: validStats.reduce((sum, s) => sum + s.strategies.drawdown_avg_hold_hours, 0) / validStats.length,
           },
           profit_factor: {
             last_5: validStats.reduce((sum, s) => sum + s.profit_factor.last_5, 0) / validStats.length,
@@ -304,7 +308,7 @@ function StatisticsCards({ stats }: { stats: ConnectionStats }) {
             Strategies
           </CardTitle>
           <CardDescription>
-            Cycles: {(stats.strategies as any).cycleCount} | Drawdown: {stats.strategies.drawdown_max.toFixed(1)}% | Time: {stats.strategies.drawdown_time_hours.toFixed(1)}h
+            Cycles: {(stats.strategies as any).cycleCount} | Largest Loss: ${stats.strategies.drawdown_max_usd.toFixed(0)} | Avg Hold: {stats.strategies.drawdown_avg_hold_hours.toFixed(1)}h
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">

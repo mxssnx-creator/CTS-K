@@ -222,7 +222,7 @@ function calculateRiskScore(positions: BasePosition[], maxDrawdown: number): num
     ...prices.map((p) => Math.abs(p - avgPrice) / avgPrice)
   )
 
-  return Math.min(1, maxDeviation / maxDrawdown)
+  return maxDrawdown > 0 ? Math.min(1, maxDeviation / maxDrawdown) : 0
 }
 
 /**
