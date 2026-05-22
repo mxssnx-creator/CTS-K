@@ -10,7 +10,7 @@
  * 6. Rate limiting and batch processing
  */
 
-import { getRedisClient } from "@/lib/redis"
+import { getRedisClient } from "@/lib/redis-db"
 
 interface DiagnosticReport {
   timestamp: string
@@ -121,13 +121,13 @@ export async function runSystemDiagnostics(
     console.log("[v0] [Diagnostics] CHECK 3: Position accumulation")
 
     const axisPosAccKey = `axis_pos_acc:${connectionId}`
-    const axisPosData = await client.hgetall(axisPosAccKey)
+    const axisPosData = await client.hgetall(axisPosAccKey) ?? {}
 
-    if (Object.keys(axisPosData).length > 0) {
+    if (Object.keys(axisPosData as Record<string, string>).length > 0) {
       report.stats.axisAccumulation = {
-        buckets: Object.keys(axisPosData).length,
-        totalCount: Object.values(axisPosData).reduce(
-          (sum, v) => sum + parseInt(v as string),
+        buckets: Object.keys(axisPosData as Record<string, string>).length,
+        totalCount: Object.values(axisPosData as Record<string, string>).reduce(
+          (sum: number, v) => sum + parseInt(v as string),
           0,
         ),
       }
@@ -202,7 +202,7 @@ export async function runSystemDiagnostics(
     // ── CHECK 6: Rate Limit and API Performance ────────────────────────
     console.log("[v0] [Diagnostics] CHECK 6: Rate limiting status")
 
-    const redisInfo = await client.info("stats")
+    const redisInfo = await client.info()
     report.stats.redisInfo = {
       totalCommands: redisInfo?.split("total_commands_processed:")[1]?.split("\r")[0],
     }

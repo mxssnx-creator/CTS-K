@@ -3271,7 +3271,7 @@ export async function closeLivePosition(
     // (reconciled/adopted position), use it to close via exchange-side
     // position ID. Without EITHER, skip exchange close — the position
     // may be external/manual.
-    const hasSystemOrderId = !!(position.orderId || position.exchangePositionId)
+    const hasSystemOrderId = !!(position.orderId || position.exchangeData?.exchangePositionId)
     if (!hasSystemOrderId && exchangeConnector) {
       exchangeCloseReason = "skipped"
       await logProgressionEvent(

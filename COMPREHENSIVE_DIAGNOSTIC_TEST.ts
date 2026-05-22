@@ -251,7 +251,7 @@ export async function runComprehensiveDiagnostic(
       const axisAccKey = `axis_pos_acc:${connectionId}`
       const axisData = await client.hgetall(axisAccKey)
       if (axisData && Object.keys(axisData).length > 0) {
-        result.stats.axisCounts = axisData as Record<string, number>
+        result.stats.axisCounts = axisData as unknown as Record<string, number>
         testAxis.details = `Axis accumulation: ${Object.keys(axisData).length} tracked axes`
         testAxis.passed = true
       } else {

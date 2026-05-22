@@ -12,8 +12,8 @@ export const dynamic = "force-dynamic"
 export async function GET() {
   try {
     await initRedis()
-    const connections = await getAllConnections()
-    if (!Array.isArray(connections)) connections = []
+    const connectionsRaw = await getAllConnections()
+    const connections = Array.isArray(connectionsRaw) ? connectionsRaw : []
     return NextResponse.json({
       success: true,
       connections: connections.map((c: any) => ({

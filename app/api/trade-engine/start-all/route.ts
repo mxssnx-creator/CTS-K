@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
-import { initRedis, getAllConnections, getSettings } from "@/lib/redis-db"
+import { initRedis, getAllConnections, getSettings, getRedisClient } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 
 async function handleStartAll() {
@@ -56,7 +56,7 @@ async function handleStartAll() {
     for (const connection of activeConnections) {
       try {
         // Reset evaluated counters for fresh start
-        const redis = await initRedis()
+        await initRedis()
         const evalKeys = [
           `strategies:${connection.id}:base:evaluated`,
           `strategies:${connection.id}:main:evaluated`,
@@ -64,7 +64,7 @@ async function handleStartAll() {
         ]
         for (const key of evalKeys) {
           try {
-            await redis.del(key)
+            await getRedisClient().del(key)
           } catch (delErr) {
             console.warn(`[START-ALL] Failed to delete ${key}:`, delErr)
           }

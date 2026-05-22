@@ -56,7 +56,7 @@ class IntegrationTestSuite {
 
       const [result1, result2] = await Promise.all(promises)
 
-      if (result1 && result2 && result1.connectionId === this.connectionId) {
+      if (result1 && result2 && (result1 as any).connectionId === this.connectionId) {
         test.passed = true
       } else {
         test.error = "Batch requests did not complete successfully"
