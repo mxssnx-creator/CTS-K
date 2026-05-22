@@ -2340,47 +2340,46 @@ export class TradeEngineManager {
 
       liveSyncInFlight = true
       try {
-        // Always run simulated-position sweep first (covers paper-only).
+        // syncWithExchange handles simulated positions internally (always-runs
+        // guard) and real exchange operations when a connector is available.
+        // Calling it here (instead of a separate _processSimulatedPositionsLazy
+        // + syncWithExchange combo) avoids a double-sweep of simulated positions
+        // per tick.  Only gated by the single-flight guard above.
         try {
-          await _processSimulatedPositionsLazy(this.connectionId)
-        } catch (simErr) {
-          console.warn(
-            `[v0] [LivePositions] processSimulatedPositions error:`,
-            simErr instanceof Error ? simErr.message : String(simErr),
-          )
-        }
-
-        if (!globallyPaused) {
-          try {
-            const connection = await _getConnectionLazy(this.connectionId)
-            if (connection) {
+          const connection = await _getConnectionLazy(this.connectionId)
+          if (connection) {
+            // Build connector only when not paused — exchange calls are
+            // meaningless during a global pause, and we avoid the REST round
+            // trips so paused-state cycles stay fast.
+            let connector: any = null
+            if (!globallyPaused) {
               const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
               const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
               if (apiKey && apiSecret) {
                 const createExchangeConnector = await _createExchangeConnectorLazy()
-                const connector = await createExchangeConnector(connection.exchange, {
+                connector = await createExchangeConnector(connection.exchange, {
                   apiKey,
                   apiSecret,
                   apiType: connection.api_type,
                   contractType: connection.contract_type,
                   isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
                 })
-                if (connector) {
-                  const syncWithExchange = await _syncWithExchangeLazy()
-                  await withCycleDeadline(
-                    syncWithExchange(this.connectionId, connector),
-                    `LivePositions ${this.connectionId} syncWithExchange`,
-                    CYCLE_DEADLINE_MS,
-                  )
-                }
               }
             }
-          } catch (syncErr) {
-            console.warn(
-              `[v0] [LivePositions] syncWithExchange error for ${this.connectionId}:`,
-              syncErr instanceof Error ? syncErr.message : String(syncErr),
+            // syncWithExchange handles sim sweep unconditionally (no connector
+            // = sims only, no exchange calls). Never throws — errors absorbed.
+            const syncWithExchange = await _syncWithExchangeLazy()
+            await withCycleDeadline(
+              syncWithExchange(this.connectionId, connector),
+              `LivePositions ${this.connectionId} syncWithExchange`,
+              CYCLE_DEADLINE_MS,
             )
           }
+        } catch (syncErr) {
+          console.warn(
+            `[v0] [LivePositions] syncWithExchange error for ${this.connectionId}:`,
+            syncErr instanceof Error ? syncErr.message : String(syncErr),
+          )
         }
 
         cycleCount++

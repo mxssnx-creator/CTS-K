@@ -175,7 +175,7 @@ async function executeReadyStrategiesAsLiveOrders(
             maxHoldTime: realSet.maxHoldTime,
             setKey: realSet.setKey,
             parentSetKey: realSet.parentSetKey,
-            variant: realSet.variant,
+            setVariant: realSet.variant,
             axisWindows: realSet.axisWindows,
             entryConfidence: entry.confidence,
             entryProfitFactor: entry.profitFactor,
