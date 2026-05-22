@@ -3,6 +3,8 @@
 import { useState, useEffect } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { useExchange } from "@/lib/exchange-context"
+import { TradeHistoryTable, type TradeHistoryRow } from "@/components/dashboard/trade-history-table"
+import { PerformanceTiers } from "@/components/dashboard/performance-tiers"
 
 interface CompactStats {
   indicationCycles: number
@@ -139,9 +141,47 @@ interface CompactStats {
   apStrategies:  ActiveProgressingByName
   phase: string
   isActive: boolean
+  // ── PERFORMANCE TIERS ───────────────────────────────────────────
+  // Per-stage (base / main / real / live) performance summary. Keys
+  // match PerformanceTier interface (avgPF, winRate, sharpe, etc.).
+  performanceTiers: {
+    base:  PerformanceTier
+    main:  PerformanceTier
+    real:  PerformanceTier
+    live:  PerformanceTier
+  }
+  // ── TRADE HISTORY ───────────────────────────────────────────────
+  // Up to 500 most-recently-closed live exchange positions.
+  tradeHistory: TradeHistoryRow[]
+  // ── SPEC PERFORMANCE HISTORY ─────────────────────────────────────
+  // Per-symbol performance breakdown per pipeline stage.
+  specPerformanceHistory: {
+    base:  { aggregated: Record<string, any>; detail: Array<Record<string, any>> }
+    main:  { aggregated: Record<string, any>; detail: Array<Record<string, any>> }
+    real:  { aggregated: Record<string, any>; detail: Array<Record<string, any>> }
+    live:  { aggregated: Record<string, any>; detail: Array<Record<string, any>> }
+  }
+}
+type PerformanceTier = {
+  avgProfitFactor: number
+  avgDrawdownMin:  number
+  avgPosPerSet:    number
+  winRate:         number
+  sharpe:          number
+  totalPnl:        number
+  avgPnl?:         number
+  totalCreated:    number
+  totalEntries:    number
+  totalRunning:    number
+  symbolCount:     number
+  isExecution:     boolean
+  fillRate?:       number
+  volumeUsdTotal?: number
+  totalClosed?:    number
+  openScanned?:    number
 }
 
-// Shared row shape — same as quickstart-section ActiveProgressingRow.
+// Shared row shapes
 type ActiveProgressingRow = { sets: number; trackings: number; positions: number }
 type ActiveProgressingByName = Record<string, ActiveProgressingRow>
 
@@ -193,8 +233,28 @@ const EMPTY: CompactStats = {
   liveConsolidatedSetsTotal: 0,
   livePositions: [],
   liveResolution: { pseudo: 0, realFallback: 0, unresolved: 0 },
+  performanceTiers: {
+    base:  buildEmptyTier(false), main: buildEmptyTier(false),
+    real:  buildEmptyTier(false), live: buildEmptyTier(true),
+  },
+  tradeHistory: [],
+  specPerformanceHistory: {
+    base:  { aggregated: {}, detail: [] },
+    main:  { aggregated: {}, detail: [] },
+    real:  { aggregated: {}, detail: [] },
+    live:  { aggregated: {}, detail: [] },
+  },
   phase: "",
   isActive: false,
+}
+
+function buildEmptyTier(isExecution: boolean): PerformanceTier {
+  return {
+    avgProfitFactor: 0, avgDrawdownMin: 0, avgPosPerSet: 0,
+    winRate: 0, sharpe: 0, totalPnl: 0, totalCreated: 0,
+    totalEntries: 0, totalRunning: 0, symbolCount: 0, isExecution,
+    fillRate: 0, volumeUsdTotal: 0,
+  }
 }
 
 function fmt(n: number): string {
@@ -756,6 +816,21 @@ export function StatisticsOverviewV2() {
           },
           phase:            d.metadata?.phase || "",
           isActive:         d.metadata?.engineRunning || false,
+          performanceTiers: (d.performanceTiers as any) || {
+            base: { avgProfitFactor: 0, avgDrawdownMin: 0, avgPosPerSet: 0, winRate: 0, sharpe: 0, totalPnl: 0, totalCreated: 0, totalEntries: 0, totalRunning: 0, symbolCount: 0, isExecution: false },
+            main: { avgProfitFactor: 0, avgDrawdownMin: 0, avgPosPerSet: 0, winRate: 0, sharpe: 0, totalPnl: 0, totalCreated: 0, totalEntries: 0, totalRunning: 0, symbolCount: 0, isExecution: false },
+            real: { avgProfitFactor: 0, avgDrawdownMin: 0, avgPosPerSet: 0, winRate: 0, sharpe: 0, totalPnl: 0, totalCreated: 0, totalEntries: 0, totalRunning: 0, symbolCount: 0, isExecution: false },
+            live: { avgProfitFactor: 0, avgDrawdownMin: 0, avgPosPerSet: 0, winRate: 0, sharpe: 0, totalPnl: 0, totalCreated: 0, totalEntries: 0, totalRunning: 0, symbolCount: 0, isExecution: true, fillRate: 0, volumeUsdTotal: 0 },
+          },
+          tradeHistory: Array.isArray((d as any).tradeHistory)
+            ? ((d as any).tradeHistory as TradeHistoryRow[])
+            : [],
+          specPerformanceHistory: (d.specPerformanceHistory as any) || {
+            base: { aggregated: {}, detail: [] },
+            main: { aggregated: {}, detail: [] },
+            real: { aggregated: {}, detail: [] },
+            live: { aggregated: {}, detail: [] },
+          },
         })
       } catch {
         // Non-critical polling — swallow silently so a blip doesn't
@@ -1392,6 +1467,22 @@ export function StatisticsOverviewV2() {
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {/* ── PERFORMANCE TIERS ─────────────────────────────────────────── */}
+        {/* Per-stage performance cards: base / main / real / live. */}
+        {((stats.performanceTiers?.base?.symbolCount || 0) +
+          (stats.performanceTiers?.live?.symbolCount || 0)) > 0 && (
+          <div className="mt-3 pt-3 border-t border-border/40">
+            <PerformanceTiers tiers={stats.performanceTiers} />
+          </div>
+        )}
+
+        {/* ── TRADE HISTORY ─────────────────────────────────────────────── */}
+        {stats.tradeHistory.length > 0 && (
+          <div className="mt-3 pt-3 border-t border-border/40">
+            <TradeHistoryTable trades={stats.tradeHistory} />
           </div>
         )}
 
