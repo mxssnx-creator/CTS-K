@@ -592,6 +592,12 @@ export class StrategyCoordinator {
   private _hedgeLoadedAt = 0
   private readonly _hedgeTtlMs = 5_000
 
+  // ── Hedge / directional normalize runtime state ───────────────────────
+  private _hedgeEnabled = false
+  private _hedgeThresholdPct = 10
+  private _hedgeMaxPerDirection = 20
+  private _hedgeVolumeMode: "neutralize" | "rebalance" | "reduce" = "neutralize"
+
   /**
    * Per-stage minimum position count thresholds.
    * Read from operator settings (`getAppSettings()`),
@@ -708,6 +714,63 @@ export class StrategyCoordinator {
         `[v0] [StrategyCoordinator] loadAppPFThresholds() failed; using last-known values`,
         err instanceof Error ? err.message : String(err),
       )
+    }
+  }
+
+  /**
+   * Load hedge accumulation / directional neutralization params from engine timings.
+   *
+   * Reads neutralizeEnabled, neutralizeThresholdPct, neutralizeMaxPerDirection,
+   * and neutralizeVolumeMode from getEngineTimings().
+   * Cached for _hedgeTtlMs (5s).
+   */
+  private async loadHedgeAccumulationParams(): Promise<void> {
+    const now = Date.now()
+    if (now - this._hedgeLoadedAt < this._hedgeTtlMs) return
+    this._hedgeLoadedAt = now
+
+    try {
+      const { getEngineTimings } = await import("@/lib/engine-timings")
+      const timings = getEngineTimings()
+      this._hedgeEnabled = timings.neutralizeEnabled
+      this._hedgeThresholdPct = timings.neutralizeThresholdPct
+      this._hedgeMaxPerDirection = timings.neutralizeMaxPerDirection
+      this._hedgeVolumeMode = timings.neutralizeVolumeMode
+    } catch {
+      // use last-known values
+    }
+  }
+
+  /**
+   * Load coordination settings from app settings.
+   *
+   * Reads axis enable flags, variant toggles, and block strategy settings.
+   * Cached for _coordinationTtlMs (5s).
+   */
+  private async loadCoordinationSettings(): Promise<void> {
+    const now = Date.now()
+    if (now - this._coordinationLoadedAt < this._coordinationTtlMs) return
+    this._coordinationLoadedAt = now
+
+    try {
+      const { getAppSettings } = await import("@/lib/redis-db")
+      const s = (await getAppSettings()) || {}
+
+      this._coordinationSettings.axes.prev.enabled = !!(s as any).axisPrevEnabled
+      this._coordinationSettings.axes.prev.maxWindow = Number((s as any).axisPrevMaxWindow) || 0
+      this._coordinationSettings.axes.last.enabled = !!(s as any).axisLastEnabled
+      this._coordinationSettings.axes.last.maxWindow = Number((s as any).axisLastMaxWindow) || 0
+      this._coordinationSettings.axes.cont.enabled = !!(s as any).axisContEnabled
+      this._coordinationSettings.axes.cont.maxWindow = Number((s as any).axisContMaxWindow) || 0
+      this._coordinationSettings.axes.pause.enabled = !!(s as any).axisPauseEnabled
+      this._coordinationSettings.axes.pause.maxWindow = Number((s as any).axisPauseMaxWindow) || 0
+
+      this._coordinationSettings.variants.trailing = !!(s as any).variantTrailingEnabled
+      this._coordinationSettings.variants.block = !!(s as any).variantBlockEnabled
+      this._coordinationSettings.variants.dca = !!(s as any).variantDcaEnabled
+      this._coordinationSettings.variants.pause = !!(s as any).variantPauseEnabled
+    } catch {
+      // use last-known values
     }
   }
 
