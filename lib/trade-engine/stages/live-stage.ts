@@ -87,7 +87,7 @@ interface LivePosition {
   assignedStopLoss?: number
   assignedTakeProfit?: number
   protectionArmedQuantity?: number
-  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error"
+  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated"
   statusReason?: string
   setKey?: string
   exchangeData?: Record<string, unknown>
@@ -124,15 +124,19 @@ async function incrementOrdersBySymbol(connectionId: string, symbol: string, sid
 }
 async function tryAcquireLock(connId: string, key: string, ttlMs: number): Promise<string | null> {
   /* stub */
+  return null
 }
 async function findOpenLivePositionByDir(connId: string, symbol: string, side: string): Promise<LivePosition | null> {
   /* stub */
+  return null
 }
 async function fetchCurrentPrice(connId: string, symbol: string): Promise<number> {
   /* stub */
+  return 0
 }
 async function accumulateIntoLivePosition(connId: string, real: any, existing: LivePosition): Promise<LivePosition> {
   /* stub */
+  return existing
 }
 async function refreshLockTTL(lockKey: string, ttlMs: number): Promise<void> {
   /* stub */
