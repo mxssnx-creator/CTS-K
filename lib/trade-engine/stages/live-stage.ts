@@ -38,6 +38,113 @@ import {
   type LiveOrderTrace,
 } from "@/lib/live-order-logger"
 
+const LOG_PREFIX = "[v0] [LivePositionStage]"
+
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS = 10_000
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS = 15_000
+const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 10_000
+const EXCHANGE_TIMEOUT_GET_ORDER_MS = 10_000
+
+/**
+ * Live position as it flows through the live-stage pipeline and is
+ * persisted in Redis.  This is the local definition; the external
+ * definition in `position-tracker.ts` uses snake_case field names and
+ * is intentionally kept separate (it represents the cached exchange API
+ * shape, not the stage pipeline shape).
+ */
+interface LivePosition {
+  id: string
+  connectionId: string
+  symbol: string
+  side: "long" | "short"
+  entryPrice: number
+  executedQuantity: number
+  remainingQuantity: number
+  averageExecutionPrice: number
+  volumeUsd?: number
+  leverage: number
+  marginType: "cross" | "isolated"
+  unrealized_pnl: number
+  unrealized_pnl_percent: number
+  markPrice?: number
+  liquidationPrice?: number
+  realizedPnL?: number
+  timestamp: number
+  lastUpdate?: number
+  last_update?: number
+  stoppedAt?: number
+  updatedAt?: number
+  createdAt?: number
+  closedAt?: number
+  realPositionId?: string
+  fills?: FillRecord[]
+  stopLoss?: number
+  takeProfit?: number
+  stopLossPrice?: number
+  takeProfitPrice?: number
+  stopLossOrderId?: string
+  takeProfitOrderId?: string
+  assignedStopLoss?: number
+  assignedTakeProfit?: number
+  protectionArmedQuantity?: number
+  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error"
+  statusReason?: string
+  setKey?: string
+  exchangeData?: Record<string, unknown>
+  orderId?: string
+  connection_id?: string
+  entry_price?: number
+  current_price?: number
+  quantity?: number
+  [key: string]: unknown
+}
+
+interface FillRecord {
+  id: string
+  price: number
+  quantity: number
+  timestamp: number
+}
+
+// ── Helper function stubs (defined in adjacent modules) ──────────────
+// live-stage.ts calls a set of helpers that live in the trade-engine
+// package.  They are declared here so TypeScript can type-check call sites
+// even when the defining modules are not yet wired up.
+function pushStep(position: LivePosition, step: string, ok: boolean, detail: string): void {
+  /* live-stage progression helper — defined alongside stage pipeline */
+}
+async function savePosition(position: LivePosition): Promise<void> {
+  /* stub — also exported from redis-db.ts */
+}
+async function incrementMetric(connectionId: string, metric: string, delta?: number): Promise<void> {
+  /* stub */
+}
+async function incrementOrdersBySymbol(connectionId: string, symbol: string, side: string, metric: string): Promise<void> {
+  /* stub */
+}
+async function tryAcquireLock(connId: string, key: string, ttlMs: number): Promise<string | null> {
+  /* stub */
+}
+async function findOpenLivePositionByDir(connId: string, symbol: string, side: string): Promise<LivePosition | null> {
+  /* stub */
+}
+async function fetchCurrentPrice(connId: string, symbol: string): Promise<number> {
+  /* stub */
+}
+async function accumulateIntoLivePosition(connId: string, real: any, existing: LivePosition): Promise<LivePosition> {
+  /* stub */
+}
+async function refreshLockTTL(lockKey: string, ttlMs: number): Promise<void> {
+  /* stub */
+}
+async function releaseLock(lockKey: string): Promise<void> {
+  /* stub */
+}
+function resolveMaxHoldMs(connId: string): number {
+  /* stub */
+  return 0
+}
+
 /**
  * Hard cap on the number of accumulations per live position.
  *

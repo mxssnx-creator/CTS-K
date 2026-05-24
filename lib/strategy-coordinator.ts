@@ -374,6 +374,9 @@ export interface StrategyCoordinatorConfig {
 
 export class StrategyCoordinator {
   private connectionId: string
+  constructor(connectionId: string) {
+    this.connectionId = connectionId
+  }
   private config: StrategyCoordinatorConfig = {
     maxEntriesPerSet: 250,
     // Live Sets default is now per-exchange (see setExchangeMaxLive).
