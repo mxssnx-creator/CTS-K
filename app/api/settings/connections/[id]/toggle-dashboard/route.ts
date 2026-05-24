@@ -159,16 +159,17 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         const apiSecret = (updatedConnection.api_secret || updatedConnection.apiSecret || "") as string
         const hasCredentials = apiKey.length > 10 && apiSecret.length > 10
         
-        // ALWAYS try to start the engine - even without credentials (for testing/demo)
-        // If credentials are missing, engine will start but won't be able to trade
-        await setSettings(`engine_progression:${resolvedId}`, {
-          phase: "initializing",
-          progress: 10,
-          detail: hasCredentials 
-            ? "Connection enabled - engine starting..." 
-            : "Connection enabled - engine starting (credentials needed for live trading)",
-          updated_at: new Date().toISOString(),
-        })
+        const isFirstEnable = needsUpdate && enableMain
+        if (isFirstEnable) {
+          await setSettings(`engine_progression:${resolvedId}`, {
+            phase: "initializing",
+            progress: 10,
+            detail: hasCredentials 
+              ? "Connection enabled - engine starting..." 
+              : "Connection enabled - engine starting (credentials needed for live trading)",
+            updated_at: new Date().toISOString(),
+          })
+        }
         
         if (!hasCredentials) {
           await logProgressionEvent(resolvedId, "engine_starting_no_credentials", "warning", 
@@ -298,8 +299,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       }
     }
 
+    const wasChange = needsUpdate || (engineAction === 'start')
+    const effectiveEnabled = enableMain
     return NextResponse.json({
       success: true,
+      changed: wasChange,
+      action: wasChange ? (effectiveEnabled ? 'enabled' : 'disabled') : (effectiveEnabled ? 'already_enabled' : 'already_disabled'),
       connection: {
         id: resolvedId,
         name: connection.name,

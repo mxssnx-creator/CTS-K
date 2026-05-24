@@ -212,19 +212,21 @@ export function DashboardActiveConnectionsManager() {
         ac.connectionId === connectionId ? { ...ac, isActive: newState } : ac
       ))
 
+      const toggleData = await toggleRes.json().catch(() => ({} as any))
       if (!newState) {
-        // Auto-disable live trade when connection is disabled
         await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ is_live_trade: false }),
           cache: "no-store"
-        }).catch(() => { /* non-critical */ })
+        }).catch(() => {})
         toast.success("Connection deactivated", { description: "Engine stopped" })
-      } else {
+      } else if (toggleData.changed) {
         toast.success("Connection added to Main Connections", {
           description: "Use the Live Trade slider to enable real exchange trading",
         })
+      } else {
+        toast.info("Connection already in Main Connections")
       }
 
       if (typeof window !== "undefined") {
