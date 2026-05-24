@@ -87,13 +87,13 @@ const DEFAULT_TIMINGS: EngineTimings = {
   realtimeIntervalMs:        1_000,
   realtimeCyclePauseMs:         50,
   livePositionsCyclePauseMs:    50,
-  // ── Hedge / Directional Accumulation defaults ──────────────────────────────
-  // Disabled by default to preserve existing behaviour for existing installs.
-  // Operator enables explicitly once the accumulator behaviour is wanted.
-  normalizeEnabled:            0,
-  normalizeThresholdPct:       10,
-  normalizeMaxPerDirection:    20,
-  normalizeVolumeMode:         "neutralize",
+// ── Hedge / Directional Accumulation defaults ──────────────────────────────
+   // Disabled by default to preserve existing behaviour for existing installs.
+   // Operator enables explicitly once the accumulator behaviour is wanted.
+   normalizeEnabled:            0,
+   normalizeThresholdPct:       10,
+   normalizeMaxPerDirection:    200,
+   normalizeVolumeMode:         "neutralize",
 }
 
 // Mirror of `ENGINE_TIMING_BOUNDS`. The API clamps server-side too;
@@ -174,10 +174,10 @@ const TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; max: number; uni
     min: 0, max: 50, unit: "%", live: true,
     help: "Imbalance threshold — |long−short|/(long+short) must exceed this ratio before normalize applies. Range 0–50, default 10.",
   },
-  normalizeMaxPerDirection: {
-    min: 1, max: 200, unit: "", live: true,
-    help: "Per-direction hard cap for the hedge accumulator. No more than this many concurrent open-sub-sets per direction are allowed before excess causes shedding.",
-  },
+normalizeMaxPerDirection: {
+     min: 1, max: 500, unit: "", live: true,
+     help: "Per-direction hard cap for the hedge accumulator. No more than this many concurrent open-sub-sets per direction are allowed before excess causes shedding.",
+   },
   normalizeVolumeMode: {
     min: 0, max: 0, unit: "enum", live: true,
     help: "How accumulated volume is adjusted on normalize trigger: neutralize (net-delta only), rebalance (full vol. toward dominant), reduce (scale by imbalance ratio). Default: neutralize.",
@@ -219,27 +219,35 @@ export function SystemSettings() {
         // (e.g. a fresh deploy where nobody has saved yet).
         if (sys) {
           const next: EngineTimings = { ...DEFAULT_TIMINGS }
-          const read = (snake: string, camel: keyof EngineTimings) => {
+          const readNum = (snake: string, camel: keyof Pick<EngineTimings, 'cronSyncIntervalSeconds' | 'liveSyncIntervalMs' | 'liveSyncPauseMs' | 'heartbeatIntervalMs' | 'strategyFlowMinIntervalMs' | 'strategyFlowHardThrottleMs' | 'strategyFlowMaxIntervalMs' | 'lockExtendIntervalMs' | 'maxPositionHoldMs' | 'progressionBufferFlushMs' | 'prehistoricIntervalMs' | 'prehistoricCyclePauseMs' | 'realtimeIntervalMs' | 'realtimeCyclePauseMs' | 'livePositionsCyclePauseMs' | 'normalizeThresholdPct' | 'normalizeMaxPerDirection'>) => {
             const raw = sys[snake] ?? (sys as any)[camel]
             if (raw === undefined || raw === null || raw === "") return
             const n = parseFloat(String(raw))
-            if (Number.isFinite(n)) next[camel] = n
+            if (Number.isFinite(n)) (next as any)[camel] = n
           }
-          read("cron_sync_interval_seconds",    "cronSyncIntervalSeconds")
-          read("live_sync_interval_ms",         "liveSyncIntervalMs")
-          read("live_sync_pause_ms",            "liveSyncPauseMs")
-          read("heartbeat_interval_ms",         "heartbeatIntervalMs")
-          read("strategy_flow_min_interval_ms", "strategyFlowMinIntervalMs")
-          read("strategy_flow_hard_throttle_ms","strategyFlowHardThrottleMs")
-          read("strategy_flow_max_interval_ms", "strategyFlowMaxIntervalMs")
-          read("lock_extend_interval_ms",       "lockExtendIntervalMs")
-          read("max_position_hold_ms",          "maxPositionHoldMs")
-          read("progression_buffer_flush_ms",   "progressionBufferFlushMs")
+          readNum("cron_sync_interval_seconds",    "cronSyncIntervalSeconds")
+          readNum("live_sync_interval_ms",         "liveSyncIntervalMs")
+          readNum("live_sync_pause_ms",            "liveSyncPauseMs")
+          readNum("heartbeat_interval_ms",         "heartbeatIntervalMs")
+          readNum("strategy_flow_min_interval_ms", "strategyFlowMinIntervalMs")
+          readNum("strategy_flow_hard_throttle_ms","strategyFlowHardThrottleMs")
+          readNum("strategy_flow_max_interval_ms", "strategyFlowMaxIntervalMs")
+          readNum("lock_extend_interval_ms",       "lockExtendIntervalMs")
+          readNum("max_position_hold_ms",          "maxPositionHoldMs")
+          readNum("progression_buffer_flush_ms",   "progressionBufferFlushMs")
+          readNum("prehistoric_interval_ms",       "prehistoricIntervalMs")
+          readNum("prehistoric_cycle_pause_ms",    "prehistoricCyclePauseMs")
+          readNum("realtime_interval_ms",          "realtimeIntervalMs")
+          readNum("realtime_cycle_pause_ms",       "realtimeCyclePauseMs")
+          readNum("live_positions_cycle_pause_ms", "livePositionsCyclePauseMs")
 
           // ── Hedge / directional normalize (numeric + string fields) ──────────
-          read("neutralize_enabled",           "normalizeEnabled")
-          read("neutralize_threshold_pct",     "normalizeThresholdPct")
-          read("neutralize_max_per_direction", "normalizeMaxPerDirection")
+          const rawEn = sys["neutralize_enabled"] ?? (sys as any)["normalizeEnabled"]
+          if (rawEn !== undefined && rawEn !== null && rawEn !== "") {
+            (next as any).normalizeEnabled = rawEn === "1" || rawEn === 1 || rawEn === true ? 1 : 0
+          }
+          readNum("neutralize_threshold_pct",     "normalizeThresholdPct")
+          readNum("neutralize_max_per_direction", "normalizeMaxPerDirection")
           const readNormalizeStr = (snake: string, camel: keyof EngineTimings) => {
             const raw = sys[snake] ?? (sys as any)[camel]
             if (typeof raw === "string" && raw.trim() !== "") return raw.trim()
@@ -254,9 +262,6 @@ export function SystemSettings() {
             // mismatch between EngineTimings and the 'any' map cast to it.
             ;(next as any)["normalizeVolumeMode"] = "neutralize"
           }
-          read("neutralize_enabled",         "normalizeEnabled")
-          read("neutralize_threshold_pct",   "normalizeThresholdPct")
-          read("neutralize_max_per_direction","normalizeMaxPerDirection")
 
           setTimings(next)
         }
@@ -565,13 +570,13 @@ export function SystemSettings() {
               <input
                 type="checkbox"
                 id="hedge-enabled"
-                checked={timings.neutralizeEnabled === 1}
-                onChange={(e) =>
-                  setTimings({
-                    ...timings,
-                    neutralizeEnabled: e.target.checked ? 1 : 0,
-                  })
-                }
+                checked={timings.normalizeEnabled === 1}
+onChange={(e) =>
+                   setTimings({
+                     ...timings,
+                     normalizeEnabled: e.target.checked ? 1 : 0,
+                   })
+                 }
                 className="w-5 h-5 rounded cursor-pointer"
               />
             </div>
@@ -585,14 +590,14 @@ export function SystemSettings() {
                   min={0}
                   max={50}
                   step={1}
-                  value={timings.neutralizeThresholdPct}
-                  onChange={(e) =>
-                    setTimings({ ...timings, neutralizeThresholdPct: Number(e.target.value) })
-                  }
+value={timings.normalizeThresholdPct}
+                   onChange={(e) =>
+                     setTimings({ ...timings, normalizeThresholdPct: Number(e.target.value) })
+                   }
                   className="flex-1"
                 />
-                <span className="text-sm font-semibold w-12 text-right">
-                  {timings.neutralizeThresholdPct}%
+<span className="text-sm font-semibold w-12 text-right">
+                   {timings.normalizeThresholdPct}%
                 </span>
               </div>
               <p className="text-xs text-muted-foreground">
@@ -608,16 +613,16 @@ export function SystemSettings() {
                 <input
                   type="range"
                   min={1}
-                  max={200}
+                  max={500}
                   step={1}
-                  value={timings.neutralizeMaxPerDirection}
-                  onChange={(e) =>
-                    setTimings({ ...timings, neutralizeMaxPerDirection: Number(e.target.value) })
-                  }
+value={timings.normalizeMaxPerDirection}
+                   onChange={(e) =>
+                     setTimings({ ...timings, normalizeMaxPerDirection: Number(e.target.value) })
+                   }
                   className="flex-1"
                 />
-                <span className="text-sm font-semibold w-12 text-right">
-                  {timings.neutralizeMaxPerDirection}
+<span className="text-sm font-semibold w-12 text-right">
+                   {timings.normalizeMaxPerDirection}
                 </span>
               </div>
               <p className="text-xs text-muted-foreground">
@@ -629,13 +634,13 @@ export function SystemSettings() {
             {/* Volume mode */}
             <div className="space-y-2 p-4 border rounded-lg">
               <Label className="text-sm font-medium">Volume Adjustment Mode</Label>
-              <select
-                value={timings.neutralizeVolumeMode}
-                onChange={(e) =>
-                  setTimings({
-                    ...timings,
-                    neutralizeVolumeMode: e.target.value as "neutralize" | "rebalance" | "reduce",
-                  })
+<select
+                 value={timings.normalizeVolumeMode}
+                 onChange={(e) =>
+                   setTimings({
+                     ...timings,
+                     normalizeVolumeMode: e.target.value as "neutralize" | "rebalance" | "reduce",
+                   })
                 }
                 className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
               >
@@ -652,12 +657,8 @@ export function SystemSettings() {
         </CardContent>
       </Card>
 
-      {/* Engine Timings & Cron Schedule */}
-            All knobs the operator previously had to redeploy to change.
-            Each row shows the field, current value, allowed range, and
-            whether the change takes effect Live or requires an engine
-            Restart (see TIMING_BOUNDS in the header for source of truth). */}
-      <Card>
+{/* Engine Timings & Cron Schedule */}
+       <Card>
         <CardHeader>
           <div className="flex items-center gap-2">
             <Clock className="h-5 w-5 text-blue-600" />

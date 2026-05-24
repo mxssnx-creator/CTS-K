@@ -149,11 +149,11 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   realtimeIntervalMs:           1_000,
   realtimeCyclePauseMs:            50,
   livePositionsCyclePauseMs:       50,
-  // ── Hedge Accumulation defaults (disabled until opted-in) ────────────────
-  neutralizeEnabled:               false,
-  neutralizeThresholdPct:          10,   // 10 % imbalance before reducing
-  neutralizeMaxPerDirection:       20,   // up to 20 concurrent sets before shedding
-  neutralizeVolumeMode:            "neutralize", // net-delta-only addition
+// ── Hedge Accumulation defaults (disabled until opted-in) ────────────────
+   neutralizeEnabled:               false,
+   neutralizeThresholdPct:          10,   // 10 % imbalance before reducing
+   neutralizeMaxPerDirection:       200,  // up to 200 concurrent sets before shedding
+   neutralizeVolumeMode:            "neutralize", // net-delta-only addition
 }
 
 // Hard min/max bounds — UI + API normalise to these to avoid pathological
@@ -183,11 +183,11 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
   realtimeIntervalMs:        { min: 200,         max: 60_000              },
   realtimeCyclePauseMs:      { min: 10,          max: 500                 },
   livePositionsCyclePauseMs:  { min: 10,          max: 200                 },
-  // ── Hedge Accumulation bounds ─────────────────────────────────────────────
-  neutralizeEnabled:           { min: 0,           max: 1  /* boolean */    },
-  neutralizeThresholdPct:      { min: 0,           max: 50                  },
-  neutralizeMaxPerDirection:   { min: 1,           max: 200                 },
-  neutralizeVolumeMode:        { min: 0,           max: 0  /* handled below */ }
+// ── Hedge Accumulation bounds ─────────────────────────────────────────────
+   neutralizeEnabled:           { min: 0,           max: 1  /* boolean */    },
+   neutralizeThresholdPct:      { min: 0,           max: 50                  },
+   neutralizeMaxPerDirection:   { min: 1,           max: 500                 },
+   neutralizeVolumeMode:        { min: 0,           max: 0  /* handled below */ }
 }
 
 // snake_case key in Redis hash → camelCase key in object. Both forms are
@@ -208,6 +208,10 @@ const REDIS_KEY_MAP: Record<keyof EngineTimings, string[]> = {
   realtimeIntervalMs:         ["realtime_interval_ms",          "realtimeIntervalMs"],
   realtimeCyclePauseMs:       ["realtime_cycle_pause_ms",       "realtimeCyclePauseMs"],
   livePositionsCyclePauseMs:  ["live_positions_cycle_pause_ms", "livePositionsCyclePauseMs"],
+  neutralizeEnabled:          ["neutralize_enabled",          "neutralizeEnabled"],
+  neutralizeThresholdPct:     ["neutralize_threshold_pct",    "neutralizeThresholdPct"],
+  neutralizeMaxPerDirection:  ["neutralize_max_per_direction","neutralizeMaxPerDirection"],
+  neutralizeVolumeMode:       ["neutralize_volume_mode",      "neutralizeVolumeMode"],
 }
 
 const CACHE_TTL_MS = 10_000
@@ -218,7 +222,7 @@ let inflight: Promise<EngineTimings> | null = null
 
 function clamp(key: keyof EngineTimings, value: number): number {
   const b = ENGINE_TIMING_BOUNDS[key]
-  if (!Number.isFinite(value)) return DEFAULT_ENGINE_TIMINGS[key]
+  if (!Number.isFinite(value)) return DEFAULT_ENGINE_TIMINGS[key] as number
   return Math.max(b.min, Math.min(b.max, value))
 }
 
@@ -235,8 +239,16 @@ function parseTimingsFromHash(hash: Record<string, any> | null | undefined): Eng
       }
     }
     if (raw === undefined) return
-    const n = parseFloat(String(raw))
-    out[k] = clamp(k, n)
+    if (k === "neutralizeEnabled") {
+      out[k] = raw === "1" || raw === 1 || raw === true
+    } else if (k === "neutralizeVolumeMode") {
+      out[k] = raw as "neutralize" | "rebalance" | "reduce"
+    } else if (k === "neutralizeThresholdPct" || k === "neutralizeMaxPerDirection") {
+      const n = parseFloat(String(raw))
+      if (Number.isFinite(n)) out[k] = n
+    } else {
+      out[k] = clamp(k, parseFloat(String(raw)))
+    }
   })
   return out
 }
