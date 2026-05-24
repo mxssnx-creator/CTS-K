@@ -360,7 +360,7 @@ export function QuickstartSection() {
 
   // Quickstart controls — how many top-volatile symbols to process (1-10)
   // and whether live exchange trading is currently enabled for the connection.
-  const [symbolCount, setSymbolCount] = useState<number>(1)
+  const [symbolCount, setSymbolCount] = useState<number>(10)
   const [liveTradeActive, setLiveTradeActive] = useState<boolean>(false)
   const [liveTradeLoading, setLiveTradeLoading] = useState<boolean>(false)
   // Connection the quickstart actually bound to on last start (or the

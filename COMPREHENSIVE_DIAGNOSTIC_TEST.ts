@@ -39,7 +39,7 @@ interface DiagnosticResult {
 
 export async function runComprehensiveDiagnostic(
   connectionId: string,
-  symbol: string
+  symbol: string | string[] = ["BTCUSDT"]
 ): Promise<DiagnosticResult> {
   const result: DiagnosticResult = {
     timestamp: new Date().toISOString(),
@@ -70,6 +70,12 @@ export async function runComprehensiveDiagnostic(
       })
       return result
     }
+    const symbols: string[] = Array.isArray(symbol) ? symbol : [symbol]
+    const primarySymbol = symbols[0] || "BTCUSDT"
+    result.symbol = primarySymbol
+    if (symbols.length > 1) {
+      result.stats.symbolCount = symbols.length
+    }
 
     // Test 1: BASE set statistics
     const testBase = {
@@ -89,8 +95,9 @@ export async function runComprehensiveDiagnostic(
           withValidBase: parsed.sets?.filter((s: any) => s.status === "valid_base").length ?? 0,
           withInvalid: parsed.sets?.filter((s: any) => s.status === "invalid").length ?? 0,
         }
-        testBase.details = `BASE: ${result.stats.baseStats.count} sets, ${result.stats.baseStats.hasStatus} with status field`
-        testBase.passed = result.stats.baseStats.count > 0
+        const bCount = result.stats.baseStats?.count ?? 0
+        testBase.details = `BASE: ${bCount} sets, ${(result.stats.baseStats?.hasStatus ?? 0)} with status field`
+        testBase.passed = bCount > 0
       } else {
         testBase.details = "No BASE sets stored yet"
         testBase.errors?.push("BASE sets key not found in Redis")
@@ -163,8 +170,12 @@ export async function runComprehensiveDiagnostic(
           totalEntries: parsed.sets?.reduce((sum: number, s: any) => sum + (s.entries?.length ?? 0), 0) ?? 0,
         }
         
-        testReal.details = `REAL: ${result.stats.realStats.count} sets, Long: ${result.stats.realStats.longCount}, Short: ${result.stats.realStats.shortCount}, ${result.stats.realStats.totalEntries} entries`
-        testReal.passed = result.stats.realStats.count > 0
+        const rCount = result.stats.realStats?.count ?? 0
+        const rLong = result.stats.realStats?.longCount ?? 0
+        const rShort = result.stats.realStats?.shortCount ?? 0
+        const rEnt = result.stats.realStats?.totalEntries ?? 0
+        testReal.details = `REAL: ${rCount} sets, Long: ${rLong}, Short: ${rShort}, ${rEnt} entries`
+        testReal.passed = rCount > 0
         
         // Check hedge netting
         if (result.stats.realStats.longCount > 0 && result.stats.realStats.shortCount > 0) {
@@ -187,9 +198,9 @@ export async function runComprehensiveDiagnostic(
     }
     try {
       const allSets = [
-        ...(result.stats.baseStats.count > 0 ? [result.stats.baseStats] : []),
-        ...(result.stats.mainStats.count > 0 ? [result.stats.mainStats] : []),
-        ...(result.stats.realStats.count > 0 ? [result.stats.realStats] : []),
+        ...((result.stats.baseStats?.count ?? 0) > 0 ? [result.stats.baseStats] : []),
+        ...((result.stats.mainStats?.count ?? 0) > 0 ? [result.stats.mainStats] : []),
+        ...((result.stats.realStats?.count ?? 0) > 0 ? [result.stats.realStats] : []),
       ]
       
       result.stats.positionTracking = {
@@ -199,8 +210,10 @@ export async function runComprehensiveDiagnostic(
         axisSetsWithSyntheticEntry: result.stats.mainStats.axisSets ?? 0,
       }
       
-      testPositions.details = `Entries: Main=${result.stats.mainStats.totalEntries}, Real=${result.stats.realStats.totalEntries}`
-      testPositions.passed = result.stats.mainStats.totalEntries > 0 || result.stats.realStats.totalEntries > 0
+      const mainEnt = result.stats.mainStats?.totalEntries ?? 0
+      const realEnt = result.stats.realStats?.totalEntries ?? 0
+      testPositions.details = `Entries: Main=${mainEnt}, Real=${realEnt}`
+      testPositions.passed = mainEnt > 0 || realEnt > 0
     } catch (e) {
       testPositions.errors?.push(String(e))
     }
@@ -270,8 +283,8 @@ export async function runComprehensiveDiagnostic(
       errors: [] as string[],
     }
     try {
-      const baseCount = result.stats.baseStats.count
-      const mainCount = result.stats.mainStats.count
+        const baseCount = result.stats.baseStats?.count ?? 0
+        const mainCount = result.stats.mainStats?.count ?? 0
       const realCount = result.stats.realStats.count
       
       if (baseCount > 0 && mainCount > 0) {
