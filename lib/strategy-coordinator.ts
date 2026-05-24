@@ -1882,10 +1882,15 @@ export class StrategyCoordinator {
       const hasEntries = (s.entries?.length ?? 0) > 0
       const isAxisSet = s.axisWindows && s.axisWindows.direction
       if (posCount < realMinPos && !(isAxisSet && hasEntries)) {
-        // Mark as invalid but keep for later evaluation
-        s.status = "invalid"
-        s.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
-        return s
+        // Real(active) continuous validity: if this Set currently has active Real/Live positions or is in active config keys, keep it valid (operator requirement for ongoing Real stage sets)
+        const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
+        if (!hasActiveReal) {
+          s.status = "invalid"
+          s.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
+          return s
+        }
+        // Force valid for active Real orders to prevent loss in progress processing
+        s.status = "valid_real"
       }
       return s
     })

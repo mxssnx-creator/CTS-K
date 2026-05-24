@@ -1071,7 +1071,7 @@ async function updateProtectionOrders(
       }
     } else if (
       desiredSl > 0 &&
-      (!pos.stopLossOrderId || priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted)
+      (!pos.stopLossOrderId || (liveOrderIds && pos.stopLossOrderId && liveOrderIds.has(String(pos.stopLossOrderId))) ? false : (priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted))
     ) {
       // Cancel-then-replace race: if a cancel fails we must NOT place
       // a new SL — the old one is still armed on the exchange, and
@@ -1127,7 +1127,7 @@ async function updateProtectionOrders(
       }
     } else if (
       desiredTp > 0 &&
-      (!pos.takeProfitOrderId || priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted)
+      (!pos.takeProfitOrderId || (liveOrderIds && pos.takeProfitOrderId && liveOrderIds.has(String(pos.takeProfitOrderId))) ? false : (priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted))
     ) {
       let oldGone = true
       if (pos.takeProfitOrderId) {
