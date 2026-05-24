@@ -1197,7 +1197,17 @@ export function getClient(): InlineLocalRedis {
 }
 
 export function getRedisClient(): InlineLocalRedis {
-  return getClient()
+  if (!redisInstance) {
+    redisInstance = new InlineLocalRedis()
+    isConnected = true
+  }
+  return redisInstance
+}
+
+export async function ensureRedisInitialized(): Promise<void> {
+  if (!isConnected || !redisInstance) {
+    await initRedis()
+  }
 }
 
 export function isRedisConnected(): boolean {

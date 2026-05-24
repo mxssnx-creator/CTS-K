@@ -87,7 +87,7 @@
  * ╚═════════════════════════════════════════════════════════════════════════╝
  */
 
-import { getRedisClient } from "@/lib/redis-db"
+import { getRedisClient, initRedis } from "@/lib/redis-db"
 
 export interface ProgressionState {
   connectionId: string
@@ -169,6 +169,7 @@ export class ProgressionStateManager {
   static async getProgressionState(connectionId: string): Promise<ProgressionState> {
     try {
       // PRODUCTION FIX: Always initialize Redis connection before using it
+      await initRedis()
       const client = getRedisClient()
       if (!client) {
         console.warn(`[v0] Redis client not initialized for ${connectionId}, returning default state`)
@@ -301,6 +302,10 @@ export class ProgressionStateManager {
     try {
       const client = getRedisClient()
       if (!client) {
+        await initRedis()
+      }
+      const actualClient = getRedisClient()
+      if (!actualClient) {
         console.warn(`[v0] Redis client not available for incrementCycle`)
         return
       }
@@ -393,6 +398,10 @@ export class ProgressionStateManager {
   static async incrementPrehistoricCycle(connectionId: string, symbol: string): Promise<void> {
     try {
       const client = getRedisClient()
+      if (!client) {
+        await initRedis()
+      }
+      const actualClient = getRedisClient()
       const key = `progression:${connectionId}`
 
       // PERFORMANCE: The previous implementation called `getProgressionState`
@@ -437,6 +446,10 @@ export class ProgressionStateManager {
   static async completePrehistoricPhase(connectionId: string): Promise<void> {
     try {
       const client = getRedisClient()
+      if (!client) {
+        await initRedis()
+      }
+      const actualClient = getRedisClient()
       const key = `progression:${connectionId}`
 
       await client.hset(key, {
@@ -473,6 +486,10 @@ export class ProgressionStateManager {
     try {
       const client = getRedisClient()
       if (!client) {
+        await initRedis()
+      }
+      const actualClient = getRedisClient()
+      if (!actualClient) {
         console.warn(`[v0] Redis client not available for recordTrade`)
         return
       }
@@ -559,6 +576,10 @@ export class ProgressionStateManager {
   static async resetProgressionState(connectionId: string): Promise<void> {
     try {
       const client = getRedisClient()
+      if (!client) {
+        await initRedis()
+      }
+      const actualClient = getRedisClient()
       const key = `progression:${connectionId}`
       await client.del(key)
       console.log(`[v0] [Progression] State reset for ${connectionId}`)
@@ -584,6 +605,10 @@ export class ProgressionStateManager {
   static async endProgression(connectionId: string, epoch = 0): Promise<void> {
     try {
       const client = getRedisClient()
+      if (!client) {
+        await initRedis()
+      }
+      const actualClient = getRedisClient()
       const key = `progression:${connectionId}`
       const now = Date.now()
 
@@ -633,6 +658,10 @@ export class ProgressionStateManager {
     newEpoch: number,
   ): Promise<number> {
     const client = getRedisClient()
+    if (!client) {
+      await initRedis()
+    }
+    const actualClient = getRedisClient()
     const key = `progression:${connectionId}`
     const now = Date.now()
 
