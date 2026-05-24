@@ -5,6 +5,13 @@ let ran = false
 
 function shouldRunPreStartup(): boolean {
   if (process.env.NEXT_RUNTIME !== "nodejs") return false
+  // In production, we still need to run essential initialization (Redis, migrations)
+  // but we skip the UI/UX seeding and connection testing
+  return true
+}
+
+function shouldRunDevOnlyPreStartup(): boolean {
+  if (process.env.NEXT_RUNTIME !== "nodejs") return false
   if (process.env.NODE_ENV === "production") return false
   return true
 }
@@ -132,10 +139,14 @@ export async function runPreStartup() {
   try {
     await initRedis()
     await runMigrations()
-    await initializeDefaultSettings()
-    await seedPredefinedConnections()
-    await seedMarketData()
-    await testAllExchangeConnections()
+    
+    // Only run dev-specific seeding and testing in development
+    if (shouldRunDevOnlyPreStartup()) {
+      await initializeDefaultSettings()
+      await seedPredefinedConnections()
+      await seedMarketData()
+      await testAllExchangeConnections()
+    }
 
     // Engine start is intentionally skipped in safe bootstrap mode.
   } catch (error) {
