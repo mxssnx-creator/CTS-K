@@ -53,10 +53,11 @@ const EXCHANGE_TIMEOUT_GET_ORDER_MS = 10_000
  * shape, not the stage pipeline shape).
  */
 interface LivePosition {
-  id: string
+  id?: string
   connectionId: string
   symbol: string
-  side: "long" | "short"
+  side?: "long" | "short"
+  direction?: "long" | "short"
   entryPrice: number
   executedQuantity: number
   remainingQuantity: number
@@ -64,12 +65,14 @@ interface LivePosition {
   volumeUsd?: number
   leverage: number
   marginType: "cross" | "isolated"
-  unrealized_pnl: number
-  unrealized_pnl_percent: number
+  unrealized_pnl?: number
+  unrealized_pnl_percent?: number
   markPrice?: number
   liquidationPrice?: number
   realizedPnL?: number
-  timestamp: number
+  timestamp?: number
+  fee?: number
+  feeAsset?: string
   lastUpdate?: number
   last_update?: number
   stoppedAt?: number
@@ -77,7 +80,7 @@ interface LivePosition {
   createdAt?: number
   closedAt?: number
   realPositionId?: string
-  fills?: FillRecord[]
+  fills: FillRecord[]
   stopLoss?: number
   takeProfit?: number
   stopLossPrice?: number
@@ -87,23 +90,31 @@ interface LivePosition {
   assignedStopLoss?: number
   assignedTakeProfit?: number
   protectionArmedQuantity?: number
-  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated"
+  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated" | "pending"
   statusReason?: string
+  closeReason?: string
   setKey?: string
   exchangeData?: Record<string, unknown>
   orderId?: string
   connection_id?: string
   entry_price?: number
   current_price?: number
-  quantity?: number
-  [key: string]: unknown
+  quantity: number
+  axisWindows?: { prev: number; last: number; cont: number; pause: number }
+  parentSetKey?: string
+  setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
+  accumulatedSetKeys?: string[]
+  
+  progression?: { step: string; timestamp: number; success: boolean; details: string }[]
 }
 
 interface FillRecord {
-  id: string
+  id?: string
   price: number
   quantity: number
-  timestamp: number
+  timestamp?: number
+  fee?: number
+  feeAsset?: string
 }
 
 // ── Helper function stubs (defined in adjacent modules) ──────────────
@@ -122,7 +133,7 @@ async function incrementMetric(connectionId: string, metric: string, delta?: num
 async function incrementOrdersBySymbol(connectionId: string, symbol: string, side: string, metric: string): Promise<void> {
   /* stub */
 }
-async function tryAcquireLock(connId: string, key: string, ttlMs: number): Promise<string | null> {
+async function tryAcquireLock(connId: string, symbol: string, direction: string): Promise<string | null> {
   /* stub */
   return null
 }
@@ -130,18 +141,18 @@ async function findOpenLivePositionByDir(connId: string, symbol: string, side: s
   /* stub */
   return null
 }
-async function fetchCurrentPrice(connId: string, symbol: string): Promise<number> {
+async function fetchCurrentPrice(symbol: string, connId?: string): Promise<number> {
   /* stub */
   return 0
 }
-async function accumulateIntoLivePosition(connId: string, real: any, existing: LivePosition): Promise<LivePosition> {
+async function accumulateIntoLivePosition(connId: string, existing: LivePosition, real: any, price: number, connector: any): Promise<LivePosition> {
   /* stub */
   return existing
 }
-async function refreshLockTTL(lockKey: string, ttlMs: number): Promise<void> {
+async function refreshLockTTL(connId: string, symbol: string, direction: string, ttlMs?: number): Promise<void> {
   /* stub */
 }
-async function releaseLock(lockKey: string): Promise<void> {
+async function releaseLock(connId: string, symbol: string, direction: string): Promise<void> {
   /* stub */
 }
 function resolveMaxHoldMs(connId: string): number {
@@ -1086,7 +1097,7 @@ async function updateProtectionOrders(
           effectiveQty,
           desiredSl,
           "StopLoss",
-          pos.direction,
+          pos.direction!,
         )
         // Only treat the leg as "armed at desiredSl" when we actually
         // have a confirmed order id. Setting stopLossPrice = desiredSl
@@ -1135,7 +1146,7 @@ async function updateProtectionOrders(
           effectiveQty,
           desiredTp,
           "TakeProfit",
-          pos.direction,
+          pos.direction!,
         )
         if (id) {
           pos.takeProfitOrderId = id
@@ -1242,7 +1253,7 @@ export async function executeLivePosition(
       axisWindows: realPosition.axisWindows,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
     }
-    pushStep(cbSkipped, "preflight", false, cbSkipped.statusReason)
+    pushStep(cbSkipped, "preflight", false, cbSkipped.statusReason!)
     logProgressionEvent(connectionId, "live_trading", "warning", cbSkipped.statusReason!, {
       symbol: realPosition.symbol,
       direction: realPosition.direction,
@@ -1297,7 +1308,7 @@ export async function executeLivePosition(
       axisWindows: realPosition.axisWindows,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
     }
-    pushStep(skipped, "preflight", false, skipped.statusReason)
+    pushStep(skipped, "preflight", false, skipped.statusReason!)
     // Don't await — fire-and-forget is fine for the cooldown skip log.
     logProgressionEvent(connectionId, "live_trading", "warning", skipped.statusReason!, {
       symbol: realPosition.symbol,
@@ -2209,7 +2220,7 @@ export async function executeLivePosition(
       livePosition.executedQuantity = fill.filledQty
       livePosition.remainingQuantity = Math.max(0, computedVolume - fill.filledQty)
       livePosition.averageExecutionPrice = fill.filledPrice || currentPrice
-      livePosition.fills.push({
+      livePosition.fills!.push({
         timestamp: Date.now(),
         quantity: fill.filledQty,
         price: fill.filledPrice || currentPrice,
@@ -2246,7 +2257,7 @@ export async function executeLivePosition(
       livePosition.executedQuantity = computedVolume
       livePosition.remainingQuantity = 0
       livePosition.averageExecutionPrice = currentPrice
-      livePosition.fills.push({
+      livePosition.fills!.push({
         timestamp: Date.now(),
         quantity: computedVolume,
         price: currentPrice,
@@ -2525,11 +2536,11 @@ export async function updateLivePositionFill(
     if (!data) return null
 
     const position: LivePosition = JSON.parse(data as string)
-    position.fills.push(fill)
+    position.fills!.push(fill)
     position.executedQuantity += fill.quantity
-    position.remainingQuantity = position.quantity - position.executedQuantity
+    position.remainingQuantity = position.quantity! - position.executedQuantity
 
-    const totalCost = position.fills.reduce((sum, f) => sum + f.price * f.quantity, 0)
+    const totalCost = position.fills!.reduce((sum, f) => sum + f.price * f.quantity, 0)
     position.averageExecutionPrice = totalCost / position.executedQuantity
 
     if (position.remainingQuantity <= 0) {
@@ -2888,7 +2899,7 @@ export async function closeLivePosition(
     await savePosition(position)
 
     // ── 5. Release dedup lock + counters + audit log ────────────────────
-    await releaseLock(connectionId, position.symbol, position.direction)
+    await releaseLock(connectionId, position.symbol, position.direction!)
     if (!wasAlreadyClosed) {
       await incrementMetric(connectionId, "live_positions_closed_count")
       if (pnl > 0) await incrementMetric(connectionId, "live_wins_count")
@@ -3172,6 +3183,7 @@ async function checkAndForceCloseOnSltpCross(
       : 0
 
   let crossReason: "sl_hit" | "tp_hit" | null = null
+  if (!crossReason) return null
   if (pos.direction === "long") {
     if (desiredSl > 0 && markPrice <= desiredSl) crossReason = "sl_hit"
     else if (desiredTp > 0 && markPrice >= desiredTp) crossReason = "tp_hit"
@@ -3195,7 +3207,7 @@ async function checkAndForceCloseOnSltpCross(
       markPrice,
       desiredSl,
       desiredTp,
-      direction: pos.direction,
+      direction: pos.direction!,
       averageEntry: pos.averageExecutionPrice,
       // Useful for the operator audit trail: was the cross because the
       // exchange-placed control order failed to fire, or because the
@@ -3207,10 +3219,10 @@ async function checkAndForceCloseOnSltpCross(
   )
 
   try {
-    await closeLivePosition(connectionId, pos.id, markPrice, exchangeConnector, crossReason)
+    await closeLivePosition(connectionId, pos.id, markPrice, exchangeConnector, crossReason as unknown as string)
   } catch (closeErr) {
     console.warn(
-      `${LOG_PREFIX} force-close on ${crossReason} failed for ${pos.id}:`,
+      `${LOG_PREFIX} force-close on ${crossReason!} failed for ${pos.id}:`,
       closeErr instanceof Error ? closeErr.message : String(closeErr),
     )
   }
@@ -3282,7 +3294,7 @@ async function orphanCloseExpiredPositions(
     orphansSwept: number
   },
 ): Promise<void> {
-  const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
+  const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
   if (MAX_HOLD_TIME_MS <= 0) return
 
   try {
@@ -3299,7 +3311,7 @@ async function orphanCloseExpiredPositions(
       const heldMin = Math.round((Date.now() - (pos.createdAt || pos.updatedAt || 0)) / 60000)
       // Same exit-price resolution chain as reconcileLivePositions:
       // markPrice → averageExecutionPrice → Redis market_data → entryPrice
-      let exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || 0
+      let exitPrice: number = Number(pos.exchangeData?.markPrice) || pos.averageExecutionPrice || 0
       if (exitPrice <= 0) {
         try {
           const orphanRedis = getRedisClient()
@@ -3545,7 +3557,7 @@ export async function reconcileLivePositions(
               pos.updatedAt = Date.now()
               justFilled = true
               await incrementMetric(connectionId, "live_orders_filled_count")
-              await incrementOrdersBySymbol(connectionId, pos.symbol, pos.direction, "filled")
+              await incrementOrdersBySymbol(connectionId, pos.symbol, pos.direction!, "filled")
             }
 
             if (pos.orderId) {
@@ -3564,7 +3576,7 @@ export async function reconcileLivePositions(
                   if (!justFilled) {
                     justFilled = true
                     await incrementMetric(connectionId, "live_orders_filled_count")
-                    await incrementOrdersBySymbol(connectionId, pos.symbol, pos.direction, "filled")
+                    await incrementOrdersBySymbol(connectionId, pos.symbol, pos.direction!, "filled")
                   }
                 } else if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
                   pos.status = "rejected"
@@ -3632,7 +3644,7 @@ export async function reconcileLivePositions(
           }
 
           // ── Max-hold-time safety closer (reconcile path) ────────────
-          const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
+          const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
           const openedAt = pos.createdAt || pos.updatedAt || 0
           const heldMs = Date.now() - openedAt
           if (
@@ -3661,7 +3673,7 @@ export async function reconcileLivePositions(
           delta.updated++
         } else {
           // Position closed externally — compute PnL, move to archive.
-          let exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || 0
+          let exitPrice: number = Number(pos.exchangeData?.markPrice) || pos.averageExecutionPrice || 0
           if (exitPrice <= 0) {
             try {
               const mdHash = await client.hgetall(`market_data:${pos.symbol}`)
@@ -3712,7 +3724,7 @@ export async function reconcileLivePositions(
           pos.closedAt = Date.now()
           pos.realizedPnL = Math.round(realizedPnl * 100) / 100
           pos.closeReason = pos.closeReason || "exchange_reconciliation"
-          pos.progression.push({
+          pos.progression!.push({
             step: "close",
             timestamp: Date.now(),
             success: true,
@@ -3848,7 +3860,7 @@ export async function processSimulatedPositions(
       }),
     )
 
-    const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
+    const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
     for (const pos of sims) {
       summary.processed++
       try {
@@ -4066,7 +4078,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               if (crossed) continue
             }
             // Max-hold safety closer (parallel to the real-position path).
-            const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
+            const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
             const openedAt = pos.createdAt || pos.updatedAt || 0
             const heldMs = Date.now() - openedAt
             if (
@@ -4390,7 +4402,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           // exchange returned markPrice in the closing batch, we kept a
           // markPrice from the previous tick, the symbol's market_data
           // hash has fresh ticks, or we fall back to entryPrice.
-          let exitPrice = position.exchangeData?.markPrice || position.averageExecutionPrice || 0
+          let exitPrice: number = Number(position.exchangeData?.markPrice) || position.averageExecutionPrice || 0
           if (exitPrice <= 0) {
             try {
               const mdHash = await client.hgetall(`market_data:${position.symbol}`)
@@ -4460,7 +4472,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             )
             if (order?.status === "filled") {
               position.executedQuantity = order.filledQty || position.quantity
-              position.remainingQuantity = Math.max(0, position.quantity - position.executedQuantity)
+              position.remainingQuantity = Math.max(0, position.quantity! - position.executedQuantity)
               position.averageExecutionPrice = order.filledPrice || position.entryPrice
               position.status = "open"
               position.updatedAt = Date.now()
@@ -4626,7 +4638,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
   // Default: 4 hours. Live override via /settings → System →
   // Engine Timings → max_position_hold_ms (or deploy-time
   // MAX_POSITION_HOLD_MS env var). 0 = disabled.
-  const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
+  const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
         const openedAt = position.createdAt || position.updatedAt || 0
         const heldMs = Date.now() - openedAt
         if (

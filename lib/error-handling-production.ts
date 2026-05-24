@@ -182,7 +182,7 @@ export class ProductionErrorHandler {
 
           for (const pos of open) {
             if (Date.now() > deadline) break
-            const exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || pos.entryPrice
+            const exitPrice = Number(pos.exchangeData?.markPrice) || pos.averageExecutionPrice || pos.entryPrice
             console.log(`[SHUTDOWN] Emergency-closing ${pos.symbol} @ ${exitPrice}`)
             await closeLivePosition(connId, pos.id, exitPrice, connector, "shutdown").catch(() => {})
           }
