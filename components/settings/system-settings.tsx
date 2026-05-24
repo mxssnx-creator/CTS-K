@@ -84,9 +84,9 @@ const DEFAULT_TIMINGS: EngineTimings = {
   // but edits to them have no effect on the running engine.
   prehistoricIntervalMs:     1_000,
   prehistoricCyclePauseMs:      50,
-  realtimeIntervalMs:        1_000,
+  realtimeIntervalMs:        300,
   realtimeCyclePauseMs:         50,
-  livePositionsCyclePauseMs:    50,
+  livePositionsCyclePauseMs:    300,
 // ── Hedge / Directional Accumulation defaults ──────────────────────────────
    // Disabled by default to preserve existing behaviour for existing installs.
    // Operator enables explicitly once the accumulator behaviour is wanted.

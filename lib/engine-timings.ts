@@ -146,9 +146,9 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   // ── Three-progression defaults ────────────────────────────────────────
   prehistoricIntervalMs:        1_000,  // 1s timeframe cadence
   prehistoricCyclePauseMs:         50,
-  realtimeIntervalMs:           1_000,
+  realtimeIntervalMs:           300,
   realtimeCyclePauseMs:            50,
-  livePositionsCyclePauseMs:       50,
+  livePositionsCyclePauseMs:       300,
 // ── Hedge Accumulation defaults (disabled until opted-in) ────────────────
    neutralizeEnabled:               false,
    neutralizeThresholdPct:          10,   // 10 % imbalance before reducing

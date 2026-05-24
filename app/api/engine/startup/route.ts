@@ -33,7 +33,7 @@ export async function POST(request: NextRequest) {
       connectionId: "global",
       indicationInterval: 5, // 5 seconds
       strategyInterval: 10, // 10 seconds
-      realtimeInterval: 8, // 8 seconds
+      realtimeInterval: 0.3,
     }
 
     const engine = new TradeEngineManager(config)

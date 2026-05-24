@@ -208,7 +208,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               engine_type: "main",
               indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-              realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+              realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             })
             
             console.log(`[v0] [Toggle] ✓ Engine started directly for ${connection.name}`)
