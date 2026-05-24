@@ -2296,6 +2296,9 @@ export async function executeLivePosition(
       const sideClose: "buy" | "sell" = realPosition.direction === "long" ? "sell" : "buy"
       const { desiredSl: slPrice, desiredTp: tpPrice } =
         computeDesiredProtectionPrices(livePosition)
+      // Ultrathink guard: if a concurrent reconcile/sync already armed for this exact live order volume, do not create second control order
+      if (livePosition.stopLossOrderId && slPrice > 0) { /* already has SL for this live order - skip duplicate */ }
+      if (livePosition.takeProfitOrderId && tpPrice > 0) { /* already has TP for this live order - skip duplicate */ }
 
       // DO NOT pre-stamp the desired prices onto livePosition before the
       // exchange confirms placement. The original code set
@@ -2314,7 +2317,7 @@ export async function executeLivePosition(
       // `priceDrifted(0, desired)` correctly classifies as "needs arming"
       // on the next reconcile pass.
       const [slOrderId, tpOrderId] = await Promise.all([
-        slPrice > 0
+        (slPrice > 0 && !livePosition.stopLossOrderId)
           ? placeProtectionOrder(
               exchangeConnector,
               realPosition.symbol,
@@ -2324,8 +2327,8 @@ export async function executeLivePosition(
               "StopLoss",
               realPosition.direction,
             )
-          : Promise.resolve(null),
-        tpPrice > 0
+          : Promise.resolve(livePosition.stopLossOrderId || null),
+        (tpPrice > 0 && !livePosition.takeProfitOrderId)
           ? placeProtectionOrder(
               exchangeConnector,
               realPosition.symbol,
@@ -2335,7 +2338,7 @@ export async function executeLivePosition(
               "TakeProfit",
               realPosition.direction,
             )
-          : Promise.resolve(null),
+          : Promise.resolve(livePosition.takeProfitOrderId || null),
       ])
 
       if (slOrderId) {
