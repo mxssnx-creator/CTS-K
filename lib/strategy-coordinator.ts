@@ -1637,7 +1637,7 @@ export class StrategyCoordinator {
       ? Math.min(1, uniqueBaseSetsProduced.size / baseSets.length)
       : 0
 
-    // ── Write Main counts to Redis ──���─────────────────────────────────────
+    // ── Write Main counts to Redis ──���─────────────────────────────���───────
     // CUMULATIVE via hincrby so the dashboard does not oscillate with
     // per-cycle snapshots (see matching fix in createBaseSets).
     try {
@@ -1901,7 +1901,15 @@ export class StrategyCoordinator {
       const isAxisSet = s.axisWindows && s.axisWindows.direction
       if (posCount < realMinPos && !(isAxisSet && hasEntries)) {
         // Real(active) continuous validity: if this Set currently has active Real/Live positions or is in active config keys, keep it valid (operator requirement for ongoing Real stage sets)
-        const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
+        // Guard: realActiveKeysForVP must be a Set — defensive check prevents
+        // ReferenceError in any stale HMR hot-update replay where the variable
+        // declaration order differed from the current source. The outer `await`
+        // on getActiveConfigKeys() always resolves to a valid Set<string>,
+        // so this check is O(1) and never false in normal operation.
+        const _activeKeys: Set<string> = (typeof realActiveKeysForVP !== "undefined" && realActiveKeysForVP instanceof Set)
+          ? realActiveKeysForVP
+          : new Set<string>()
+        const hasActiveReal = _activeKeys.has(s.setKey) || (s as any)._hasLivePositions === true
         if (!hasActiveReal) {
           s.status = "invalid"
           s.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
@@ -2220,7 +2228,7 @@ export class StrategyCoordinator {
           symbol,
           indicationType: s.indicationType,
           direction: s.direction,
-          isRunningNow: realActiveKeysForVP.has(parentKey),
+          isRunningNow: (typeof realActiveKeysForVP !== "undefined" && realActiveKeysForVP instanceof Set ? realActiveKeysForVP : new Set<string>()).has(parentKey),
           externalPipeline: accPipeline,
         })
       }
@@ -2352,13 +2360,15 @@ export class StrategyCoordinator {
       // active positions (they survive in mainSetsEligible with valid_real).
       const realActiveCount = realSets.filter((s) => {
         const parentKey = (s.parentSetKey ?? s.setKey).split("#")[0]
-        return realActiveKeysForVP.has(parentKey) || realActiveKeysForVP.has(s.setKey)
+        const _safeKeys = typeof realActiveKeysForVP !== "undefined" && realActiveKeysForVP instanceof Set ? realActiveKeysForVP : new Set<string>()
+        return _safeKeys.has(parentKey) || _safeKeys.has(s.setKey)
       }).length
       // Mark active Sets with the "active" status so downstream consumers
       // (Live stage, dashboard) can identify continuously-valid open-position Sets.
       for (const s of realSets) {
         const parentKey = (s.parentSetKey ?? s.setKey).split("#")[0]
-        if (realActiveKeysForVP.has(parentKey) || realActiveKeysForVP.has(s.setKey)) {
+        const _sk = typeof realActiveKeysForVP !== "undefined" && realActiveKeysForVP instanceof Set ? realActiveKeysForVP : new Set<string>()
+        if (_sk.has(parentKey) || _sk.has(s.setKey)) {
           s.status = "active"
         }
       }
