@@ -1860,23 +1860,27 @@ export class StrategyCoordinator {
     const metrics = this.METRICS.real
 
     // ── realActiveKeysForVP: Set of active config keys for continuous validity ──
-    // Declared here (before the pos-gate .map()) to satisfy the reference at
-    // line 1886 which checks active state for Sets below the pos threshold.
-    // A bootstrapped empty Set is used on any Redis error so the pos-gate
-    // still runs correctly without crashing the cycle.
-    const realActiveKeysForVP = await (async () => {
-      try {
-        // Prefer the warm cache populated by createBaseSets in this same cycle.
-        const cache = this._activeKeysCache
-        if (cache && Date.now() - cache.cycleAt < 30_000) return cache.keys
+    // MUST be declared before the synchronous .map() at line 1894 so the
+    // closure inside the callback can reference it. The async IIFE is awaited
+    // so the result is available synchronously inside the callback.
+    // Falls back to an empty Set on any Redis error so the pos-gate still
+    // runs correctly without crashing the progression cycle.
+    let realActiveKeysForVP: Set<string>
+    try {
+      // Prefer the warm in-cycle cache populated by createBaseSets.
+      const cache = this._activeKeysCache
+      if (cache && Date.now() - cache.cycleAt < 30_000) {
+        realActiveKeysForVP = cache.keys
+      } else {
         const c = getRedisClient()
-        return new Set<string>(
-          (await c
-            .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
-            .catch(() => [])) as string[],
-        )
-      } catch { return new Set<string>() }
-    })()
+        const members = await c
+          .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
+          .catch(() => [] as string[])
+        realActiveKeysForVP = new Set<string>(members)
+      }
+    } catch {
+      realActiveKeysForVP = new Set<string>()
+    }
 
     // ── Stage-validation min-position threshold (operator spec, systemwide fix) ────
     // Same semantics as Main: Sets below `realEvalPosCount` are
@@ -3548,7 +3552,7 @@ export class StrategyCoordinator {
         // meanPF. When parent does not yet have M completed entries
         // (warming up), the outcome is *undefined* — we emit BOTH
         // `pos` AND `neg` projections so neither side is suppressed
-        // during bootstrap. Once the parent accumulates ≥ M entries
+        // during bootstrap. Once the parent accumulates ��� M entries
         // the outcome resolves to a single side per cycle as before.
         const lastMeanPF = this.meanPFOfLastN(entries, last)
         const outcomes: Array<"pos" | "neg"> =
