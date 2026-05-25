@@ -1991,6 +1991,23 @@ export function setMigrationsRun(value: boolean): void {
   globalMigrationState.__migrations_run = value
 }
 
+/**
+ * Returns true when running in a production or Vercel preview environment.
+ * Used to decide whether to run expensive "complete coverage" repair passes
+ * on every cold start (required for correct migration state + non-zero counts).
+ */
+export function isProductionEnvironment(): boolean {
+  if (typeof process === "undefined") return false
+  const env = process.env.NODE_ENV
+  const vercelEnv = process.env.VERCEL_ENV || process.env.VERCEL
+  // Treat "production" and "preview" (Vercel PR previews) as "production mode" for migrations.
+  if (env === "production") return true
+  if (vercelEnv === "production" || vercelEnv === "preview") return true
+  // Fallback for common hosting hints
+  if (process.env.CI === "true" || process.env.VERCEL_GIT_COMMIT_SHA) return true
+  return false
+}
+
 // ========== Engine Connection Operations ==========
 
 export async function getActiveConnectionsForEngine(): Promise<any[]> {

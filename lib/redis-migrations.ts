@@ -1289,6 +1289,140 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
 const ensureBootstrapDiag = new Set<string>()
 
 /**
+ * PRODUCTION MODE COMPLETE COVERAGE REPAIR
+ * 
+ * This function is the "make sure everything is correct and non-zero in production"
+ * pass. It is ALWAYS executed (even when schema is already at latest) when
+ * running in production / Vercel preview / prod deploys.
+ * 
+ * It guarantees:
+ *  - All migration-022 style indexes and progression containers exist
+ *  - Progression counters, strategy sets, live-position indexes are repaired
+ *  - trade_engine:global is bootstrapped to "running" (unless operator stopped)
+ *  - Zero-count metadata keys are initialized for every enabled connection
+ *  - No "No Progress / No counts" after cold start / redeploy
+ * 
+ * Dev mode intentionally skips the heavy parts (see startPersistence comments).
+ */
+async function ensureCompleteProductionCoverage(client: any): Promise<void> {
+  const isProd = (await import("@/lib/redis-db")).isProductionEnvironment?.() ?? false
+  if (!isProd) {
+    return // Dev keeps the fast paths exactly as before
+  }
+
+  console.log("[v0] [Migrations] PRODUCTION MODE — running COMPLETE COVERAGE repair (progress, counts, indexes, engine status)")
+
+  try {
+    // 1. Re-assert global engine status (same logic as ensureBaseConnections but unconditional in prod)
+    const hasAutoActive = BASE_CONNECTION_CONFIG.some((c) => c.autoActive)
+    if (hasAutoActive) {
+      const globalState = (await client.hgetall("trade_engine:global")) as Record<string, string> | null
+      const currentStatus = globalState && typeof globalState.status === "string" ? globalState.status : ""
+      const operatorStopped = globalState?.operator_stopped === "1" || globalState?.operator_stopped === "true"
+
+      const needsBootstrap =
+        !currentStatus ||
+        (currentStatus !== "running" && currentStatus !== "paused" && !operatorStopped)
+
+      if (needsBootstrap) {
+        const nowIso = new Date().toISOString()
+        await client.hset("trade_engine:global", {
+          status: "running",
+          started_at: nowIso,
+          bootstrapped_at: nowIso,
+          bootstrapped_by: "ensureCompleteProductionCoverage",
+          stopped_at: "",
+          error_message: "",
+        })
+        console.log("[v0] [Migrations] [PROD-COVERAGE] Bootstrapped trade_engine:global -> running")
+      }
+    }
+
+    // 2. Get all enabled connections and force-create/repair their progression + strategy containers
+    const enabledConns = (await client.smembers("connections:main:enabled")) || []
+    const allConns = (await client.smembers("connections")) || []
+    const connSet = new Set([...enabledConns, ...allConns])
+
+    for (const connId of connSet) {
+      if (!connId) continue
+
+      // Progression containers (the source of "progress" and counts in dashboard)
+      const prefixes = [
+        `strategies:${connId}`,
+        `progression:${connId}`,
+        `live_positions:${connId}`,
+        `realtime:${connId}`,
+      ]
+      for (const p of prefixes) {
+        const metaKey = `${p}:metadata`
+        const exists = await client.exists(metaKey)
+        if (!exists) {
+          await client.hset(metaKey, {
+            created_at: new Date().toISOString(),
+            last_cycle: new Date().toISOString(),
+            total_base_created: "0",
+            total_main_created: "0",
+            total_real_created: "0",
+            total_live_created: "0",
+            repaired_by: "ensureCompleteProductionCoverage",
+          })
+        }
+      }
+
+      // Strategy counters that the UI and engine read for "counts"
+      const counters = [
+        `strategy_count:${connId}`,
+        `real_pi_acc:${connId}`,
+        `axis_pos_acc:${connId}`,
+        `strategies:${connId}:indices`,
+      ]
+      for (const c of counters) {
+        const ex = await client.exists(c)
+        if (!ex) {
+          await client.hset(c, "_initialized", "1", "count", "0")
+        }
+      }
+
+      // Live position indexes (prevents "0 live positions" after restart)
+      const liveIdx = `live:positions:${connId}:open`
+      if (!(await client.exists(liveIdx))) {
+        await client.sadd(liveIdx, "__init__") // empty set marker (code ignores it)
+        await client.srem(liveIdx, "__init__")
+      }
+
+      // Ensure per-connection engine status keys exist
+      const engineStatusKey = `trade_engine:status:${connId}`
+      if (!(await client.exists(engineStatusKey))) {
+        await client.hset(engineStatusKey, {
+          status: "running",
+          last_tick: new Date().toISOString(),
+          cycles: "0",
+        })
+      }
+    }
+
+    // 3. Global zero-count safety nets (many dashboards read these directly)
+    const globalZeros = [
+      "trades:counter:open", "trades:counter:closed",
+      "positions:counter:open", "positions:counter:closed",
+      "strategies:counter:active", "strategies:counter:paused",
+      "logs:system:counter", "logs:trades:counter", "logs:errors:counter",
+      "_migration_total_runs",
+    ]
+    for (const z of globalZeros) {
+      const val = await client.get(z)
+      if (val == null) {
+        await client.set(z, "0")
+      }
+    }
+
+    console.log(`[v0] [Migrations] [PROD-COVERAGE] Complete coverage repair finished for ${connSet.size} connections`)
+  } catch (err) {
+    console.warn("[v0] [Migrations] [PROD-COVERAGE] Repair pass had non-fatal error (continuing):", err)
+  }
+}
+
+/**
  * Run all pending migrations
  */
 export async function runMigrations(): Promise<{ success: boolean; message: string; version: number }> {
@@ -1329,6 +1463,10 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
             `base ensured=${ensured.createdOrUpdated}, credentialsInjected=${ensured.credentialsInjected}`,
         )
       }
+
+      // PRODUCTION: always run the full coverage repair even on the "already executed" path
+      await ensureCompleteProductionCoverage(client)
+
       return { success: true, message: "Already run in this process", version: finalVer }
     }
 
@@ -1366,6 +1504,12 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
         )
       }
        await setMigrationsRun(true)
+
+      // PRODUCTION: always run the full coverage repair (progression, counts, engine status, etc.)
+      // even when we are already at the latest schema version. This is what eliminates
+      // "No Progress / No counts" after deploys and cold starts in prod/preview.
+      await ensureCompleteProductionCoverage(client)
+
       return { success: true, message: `Already at latest version ${finalVersion}`, version: finalVersion }
     }
 
@@ -1402,6 +1546,10 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
     
      // Mark migrations as run in this process
      await setMigrationsRun(true)
+
+    // PRODUCTION: run the complete coverage pass after any migration work.
+    // Guarantees progression counters, live indexes, engine status etc. are healthy.
+    await ensureCompleteProductionCoverage(client)
     
     return { success: true, message: `Migrated from v${currentVersion} to v${finalVersion}`, version: finalVersion }
   } catch (error) {

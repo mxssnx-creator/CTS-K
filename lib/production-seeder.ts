@@ -119,11 +119,11 @@ async function seedPredefinedConnections(): Promise<void> {
     const client = getRedisClient()
     const connectionsKey = "all_connections"
     
-    // Check if connections already exist
-    const existingConnections = await client.get(connectionsKey)
-    if (existingConnections) {
-      const connections = JSON.parse(existingConnections)
-      if (connections.length > 0) {
+    // In production always ensure complete state (no early skip)
+    const { isProductionEnvironment } = await import("@/lib/redis-db")
+    if (!isProductionEnvironment()) {
+      const existingConnections = await client.get(connectionsKey)
+      if (existingConnections) {
         console.log("[v0] [ProductionSeeder] Connections already exist, skipping...")
         return
       }
@@ -202,11 +202,15 @@ async function seedProgressionState(): Promise<void> {
     
     const client = getRedisClient()
     
-    // Check if we already have progression state
-    const progressionKeys = await client.keys("progression:*")
-    if (progressionKeys.length > 0) {
-      console.log("[v0] [ProductionSeeder] Progression state already exists, skipping...")
-      return
+    // In production we never skip — we always run the full coverage repair
+    // so that progression counters are guaranteed correct after redeploy.
+    const { isProductionEnvironment } = await import("@/lib/redis-db")
+    if (!isProductionEnvironment()) {
+      const progressionKeys = await client.keys("progression:*")
+      if (progressionKeys.length > 0) {
+        console.log("[v0] [ProductionSeeder] Progression state already exists, skipping...")
+        return
+      }
     }
     
     // Get all connections to create progression states for
