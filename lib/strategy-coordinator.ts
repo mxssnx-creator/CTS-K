@@ -2980,9 +2980,16 @@ export class StrategyCoordinator {
               }
             }
 
-            if (placed > 0 || rejected > 0 || errored > 0) {
+            if (placed > 0 || errored > 0) {
               console.log(
                 `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} errored=${errored}`
+              )
+            } else if (rejected > 0 && (this as any)._liveRejectLogThrottle?.[symbol] !== Math.floor(Date.now() / 30000)) {
+              // Throttle pure-rejection summaries (common in dev/test with no real exchange balance) — log at most once per 30s per symbol
+              if (!(this as any)._liveRejectLogThrottle) (this as any)._liveRejectLogThrottle = {}
+              ;(this as any)._liveRejectLogThrottle[symbol] = Math.floor(Date.now() / 30000)
+              console.log(
+                `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} errored=${errored} (throttled)`
               )
             }
           } else {

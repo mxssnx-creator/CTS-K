@@ -1456,13 +1456,17 @@ export async function executeLivePosition(
           pushStep(livePosition, "preflight", false, livePosition.statusReason)
           await savePosition(livePosition)
           await incrementMetric(connectionId, "live_orders_deferred_count")
-          await logProgressionEvent(
-            connectionId,
-            "live_trading",
-            "info",
-            livePosition.statusReason,
-            { symbol: realPosition.symbol, direction: realPosition.direction },
-          ).catch(() => {})
+          // Normal high-frequency deferral under load — do not spam progression logs at "info".
+          // The statusReason + saved position already provide visibility; only warn at low frequency.
+          if (Math.random() < 0.05) {
+            await logProgressionEvent(
+              connectionId,
+              "live_trading",
+              "info",
+              livePosition.statusReason,
+              { symbol: realPosition.symbol, direction: realPosition.direction },
+            ).catch(() => {})
+          }
           return livePosition
         }
 
