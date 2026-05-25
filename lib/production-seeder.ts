@@ -4,7 +4,7 @@
  */
 
 import { saveSettings } from "@/lib/settings-storage"
-import { saveConnection, saveAllConnections } from "@/lib/connection-manager"
+import { saveConnection } from "@/lib/redis-db"
 import { loadMarketDataForEngine } from "@/lib/market-data-loader"
 import { getPredefinedAsExchangeConnections } from "@/lib/connection-predefinitions"
 import { getRedisClient, initRedis } from "@/lib/redis-db"
@@ -24,10 +24,9 @@ export interface ProductionSeedOptions {
  */
 export async function seedProductionData(options: ProductionSeedOptions = {}): Promise<void> {
   console.log("[v0] [ProductionSeeder] Starting production data seeding...")
-  
+   
   try {
     await initRedis()
-    const client = getRedisClient()
     
     // Seed default settings if none exist
     if (options.seedSettings !== false) {
@@ -61,12 +60,10 @@ export async function seedProductionData(options: ProductionSeedOptions = {}): P
  */
 async function seedDefaultSettings(): Promise<void> {
   try {
-    const client = getRedisClient()
-    const settingsKey = "app_settings"
-    
-    // Check if settings already exist
-    const existingSettings = await client.get(settingsKey)
-    if (existingSettings) {
+    // Check if settings already exist via getAppSettings (canonical source)
+    const { getAppSettings } = await import("@/lib/redis-db")
+    const existingSettings = await getAppSettings()
+    if (Object.keys(existingSettings).length > 0) {
       console.log("[v0] [ProductionSeeder] Settings already exist, skipping...")
       return
     }
@@ -103,7 +100,10 @@ async function seedDefaultSettings(): Promise<void> {
       databaseLimitPerDay: 0,
     }
     
-    await saveSettings(defaultSettings)
+    // Save to Redis (canonical location for engine reads)
+    await setSettings("app_settings", defaultSettings)
+    // Also save to file-based storage for backward compatibility
+    saveSettings(defaultSettings)
     console.log("[v0] [ProductionSeeder] ✅ Default settings seeded")
   } catch (error) {
     console.error("[v0] [ProductionSeeder] ❌ Failed to seed settings:", error)
@@ -132,8 +132,10 @@ async function seedPredefinedConnections(): Promise<void> {
     // Get predefined connections
     const predefinedConnections = getPredefinedAsExchangeConnections()
     
-    // Save them as actual connections (enabled=false by default)
-    await saveAllConnections(predefinedConnections)
+    // Save individual connections to Redis (connection:{id} hashes)
+    for (const conn of predefinedConnections) {
+      await saveConnection(conn)
+    }
     
     // Enable one connection for immediate trading (BingX X01)
     if (predefinedConnections.length > 0) {
