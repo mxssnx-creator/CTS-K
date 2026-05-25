@@ -1732,6 +1732,15 @@ export async function executeLivePosition(
       )
     }
 
+    // High-visibility diagnostic for the most common reason real orders never appear on the exchange
+    if (computedVolume <= 0) {
+      console.error(
+        `${LOG_PREFIX} [NO_REAL_ORDER] ${realPosition.symbol} ${realPosition.direction} — computedVolume=0 after all fallbacks. ` +
+        `This is almost always why "no positions on live exchange" after quickstart. ` +
+        `volumeResult=${JSON.stringify(volumeResult)}`
+      )
+    }
+
     livePosition.quantity = computedVolume
     livePosition.remainingQuantity = computedVolume
     livePosition.volumeUsd = computedVolume * currentPrice
@@ -1857,6 +1866,13 @@ export async function executeLivePosition(
       ).catch(() => {})
       return livePosition
     }
+
+    // Strong diagnostic log right before real money order attempt
+    console.log(
+      `${LOG_PREFIX} [REAL_ORDER_ATTEMPT] conn=${connectionId} sym=${realPosition.symbol} dir=${realPosition.direction} ` +
+      `computedVol=${computedVolume} price=${currentPrice} lev=${livePosition.leverage} ` +
+      `setKey=${livePosition.setKey} trace=${orderTrace.traceId}`
+    )
 
     // The `retry()` helper repeats up to 3× on transient failures; we
     // emit PRE/POST per ATTEMPT so the log shows each round-trip. The
