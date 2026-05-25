@@ -25,6 +25,7 @@ export const STRATEGY_COORD_VERSION = "1.2"
 
 import { initRedis, getSettings, setSettings, getRedisClient } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { getActiveConfigKeys } from "@/lib/trade-engine/active-config-keys"
 import { PositionThresholdManager } from "@/lib/position-threshold-manager"
 import { PseudoPositionManager } from "@/lib/trade-engine/pseudo-position-manager"
 import {
@@ -1866,28 +1867,15 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.real
 
-    // ── realActiveKeysForVP: Set of active config keys for continuous validity ──
-    // MUST be declared before the synchronous .map() at line 1894 so the
-    // closure inside the callback can reference it. The async IIFE is awaited
-    // so the result is available synchronously inside the callback.
-    // Falls back to an empty Set on any Redis error so the pos-gate still
-    // runs correctly without crashing the progression cycle.
-    let realActiveKeysForVP: Set<string>
-    try {
-      // Prefer the warm in-cycle cache populated by createBaseSets.
-      const cache = this._activeKeysCache
-      if (cache && Date.now() - cache.cycleAt < 30_000) {
-        realActiveKeysForVP = cache.keys
-      } else {
-        const c = getRedisClient()
-        const members = await c
-          .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
-          .catch(() => [] as string[])
-        realActiveKeysForVP = new Set<string>(members)
-      }
-    } catch {
-      realActiveKeysForVP = new Set<string>()
-    }
+    // ── Active config keys for Real-stage continuous validity ────────────────
+    // Fetched via a dedicated helper module (active-config-keys.ts) so the
+    // logic lives in its own compiled chunk — immune to stale module cache
+    // from previous server boots. The result is a plain Set<string> that is
+    // fully resolved before the synchronous .map() below executes.
+    const realActiveKeysForVP = await getActiveConfigKeys(
+      this.connectionId,
+      this._activeKeysCache ?? null,
+    )
 
     // ── Stage-validation min-position threshold (operator spec, systemwide fix) ────
     // Same semantics as Main: Sets below `realEvalPosCount` are
@@ -3809,7 +3797,7 @@ export class StrategyCoordinator {
           positionState:  cfg.state,
           profitFactor:   pf,
           drawdownTime:   ddt,
-          // Confidence is preserved from the base entry — the variant changes
+          // Confidence is preserved from the base entry ��� the variant changes
           // sizing/leverage/state, not the underlying signal quality.
           confidence:     Math.min(0.99, baseEntry.confidence),
         })
