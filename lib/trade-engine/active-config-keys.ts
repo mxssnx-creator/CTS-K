@@ -20,6 +20,17 @@ export interface ActiveKeysCache {
   cycleAt: number
 }
 
+// ── globalThis safety net ─────────────────────────────────────────────────────
+// The instrumentation bundle compiled at server boot may contain a stale
+// version of strategy-coordinator.ts where `realActiveKeysForVP` was NOT
+// declared before the .map() callback. JavaScript's scope chain resolves
+// unqualified identifiers all the way up to globalThis, so by seeding
+// globalThis.realActiveKeysForVP with an empty Set at module-load time we
+// guarantee the old bundle never throws ReferenceError — it will simply get
+// an empty Set (conservative: keeps position-gate open) until the next
+// evaluation cycle populates it via the fresh source.
+;(globalThis as any).realActiveKeysForVP = (globalThis as any).realActiveKeysForVP ?? new Set<string>()
+
 /**
  * Returns the set of config keys that currently have active (open)
  * pseudo-positions for a given connection.
@@ -34,15 +45,23 @@ export async function getActiveConfigKeys(
   warmCache?: ActiveKeysCache | null,
 ): Promise<Set<string>> {
   try {
+    let result: Set<string>
     if (warmCache && Date.now() - warmCache.cycleAt < 30_000) {
-      return warmCache.keys
+      result = warmCache.keys
+    } else {
+      const c = getRedisClient()
+      const members = await c
+        .smembers(`pseudo_positions:${connectionId}:active_config_keys`)
+        .catch(() => [] as string[])
+      result = new Set<string>(members)
     }
-    const c = getRedisClient()
-    const members = await c
-      .smembers(`pseudo_positions:${connectionId}:active_config_keys`)
-      .catch(() => [] as string[])
-    return new Set<string>(members)
+    // Keep globalThis.realActiveKeysForVP current so any stale compiled bundle
+    // that references the bare name `realActiveKeysForVP` (without a local `const`
+    // declaration) resolves it via the global scope chain instead of crashing.
+    ;(globalThis as any).realActiveKeysForVP = result
+    return result
   } catch {
-    return new Set<string>()
+    // On error keep the global as-is (don't wipe a good value with empty).
+    return (globalThis as any).realActiveKeysForVP ?? new Set<string>()
   }
 }
