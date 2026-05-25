@@ -3139,9 +3139,15 @@ export class StrategyCoordinator {
                 const trailingSuffix = profile
                   ? `:t${Math.round(profile.startRatio * 100)}-${Math.round(profile.stopRatio * 100)}`
                   : trailing ? `:tr1` : `:tr0`
+                // Include full axis identity (prev/last/cont/outcome) so different position-count
+                // variants of the same (ind, dir, pf...) get distinct pseudo positions.
+                // This prevents key collisions that contributed to "millions of open positions at 8k Sets".
+                const axisSuffix = set.axisWindows
+                  ? `|p${set.axisWindows.prev ?? 0}|l${set.axisWindows.last ?? 0}|c${set.axisWindows.cont ?? 0}|o${set.axisWindows.outcome ?? "pos"}`
+                  : ""
                 const configSetKey =
                   `${set.indicationType}:${set.direction}:${symbol}` +
-                  `:tp${tp.toFixed(2)}:sl${sl.toFixed(2)}${trailingSuffix}`
+                  `:tp${tp.toFixed(2)}:sl${sl.toFixed(2)}${trailingSuffix}${axisSuffix}`
 
                 const posId = await posManager.createPosition({
                   symbol,
