@@ -44,7 +44,7 @@ export async function runComprehensiveDiagnostic(
   const result: DiagnosticResult = {
     timestamp: new Date().toISOString(),
     connectionId,
-    symbol,
+    symbol: Array.isArray(symbol) ? symbol[0] || "BTCUSDT" : symbol,
     tests: [],
     summary: { totalTests: 0, passed: 0, failed: 0, coverage: "0%" },
     issues: [],
@@ -74,7 +74,7 @@ export async function runComprehensiveDiagnostic(
     const primarySymbol = symbols[0] || "BTCUSDT"
     result.symbol = primarySymbol
     if (symbols.length > 1) {
-      result.stats.symbolCount = symbols.length
+      ;(result.stats as any).symbolCount = symbols.length
     }
 
     // Test 1: BASE set statistics

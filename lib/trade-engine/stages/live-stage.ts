@@ -53,7 +53,7 @@ const EXCHANGE_TIMEOUT_GET_ORDER_MS = 10_000
  * shape, not the stage pipeline shape).
  */
 interface LivePosition {
-  id?: string
+  id: string
   connectionId: string
   symbol: string
   side?: "long" | "short"
@@ -4481,7 +4481,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               position.updatedAt = Date.now()
               justFilled = true
               await incrementMetric(connectionId, "live_orders_filled_count")
-              await incrementOrdersBySymbol(connectionId, position.symbol, position.direction, "filled")
+              await incrementOrdersBySymbol(connectionId, position.symbol, position.direction || position.side || "long", "filled")
               await logProgressionEvent(
                 connectionId,
                 "live_trading",
