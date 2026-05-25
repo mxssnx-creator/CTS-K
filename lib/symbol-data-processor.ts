@@ -216,7 +216,7 @@ export class SymbolDataProcessor {
         }
         if (apiKey && apiSecret && exchange === 'bingx') {
           const { BingXConnector } = await import('@/lib/exchange-connectors/bingx-connector')
-          const connector = new BingXConnector({ apiKey, apiSecret, isTestnet: true } as any)
+          const connector = new BingXConnector({ apiKey, apiSecret, isTestnet: true, apiType: 'perpetual_futures' } as any)
           const raw = await connector.getOHLCV(symbol, '1m', 500)
           if (raw && raw.length > 0) {
             candles = raw.map((c: any) => ({
