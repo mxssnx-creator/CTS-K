@@ -30,11 +30,17 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
 
-    // Check if already inserted in active list
+    // Check if already inserted in active list.
+    // Return HTTP 200 with alreadyInserted=true so the UI can differentiate
+    // "added now" from "already was there" without treating it as an error.
+    // Previously this returned success:false which caused toast confusion and
+    // broke the enable flow because the UI couldn't tell whether to proceed.
     if (isTruthyFlag(baseConnection.is_active_inserted)) {
       return NextResponse.json({
-        success: false,
-        error: "Connection already in Active panel",
+        success: true,
+        alreadyInserted: true,
+        message: "Connection is already in the Active panel. Use the toggle to enable it.",
+        connection: baseConnection,
       })
     }
 

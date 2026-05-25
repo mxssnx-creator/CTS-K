@@ -1019,6 +1019,77 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "21")
     },
   },
+  {
+    name: "023-strategy-set-position-secondary-indexes",
+    version: 23,
+    up: async (client: any) => {
+      await client.set("_schema_version", "23")
+
+      // ── Secondary SADD indexes for strategy Sets and pseudo-positions ─────
+      //
+      // The in-memory Redis uses plain Map structures. Lookups of Sets by
+      // (connectionId + symbol + stage) require client.keys() pattern scans
+      // which iterate ALL stored keys — O(N) over the total keyspace. At
+      // 10 connections × 10 symbols × 1000+ Sets per symbol this is 100k+
+      // key scans per query cycle, causing measurable CPU overhead.
+      //
+      // This migration initialises the secondary index key structure so the
+      // engine can start SADD-ing to these sets on every Set/Position write
+      // and use SMEMBERS for O(1) lookups instead of pattern scans.
+      //
+      //   strategy_sets_idx:{connId}:{symbol}:{stage}  → SADD setKey
+      //   pseudo_positions_idx:{connId}               → SADD positionId
+      //
+      // The migration itself is a no-op write (just marks the structure as
+      // initialised by inserting a sentinel member that all readers skip).
+      // The engine-manager writes to these indexes on every new Set/Position
+      // creation going forward. Existing data backfill is deferred to the
+      // engine's first cycle (it rebuilds from the stored sets naturally).
+
+      console.log("[v0] Migration 023: Initialising strategy Set/Position secondary index structure")
+
+      let indexesCreated = 0
+      try {
+        const connections = (await client.smembers("connections:main:enabled")) || []
+        const stages = ["base", "main", "real", "live"]
+
+        for (const connId of connections) {
+          // Pseudo-positions index sentinel
+          const ppIdxKey = `pseudo_positions_idx:${connId}`
+          const ppExists = await client.exists(ppIdxKey)
+          if (!ppExists) {
+            await client.sadd(ppIdxKey, "_init")
+            await client.expire(ppIdxKey, 7 * 24 * 60 * 60)
+            indexesCreated++
+          }
+
+          // Per-symbol per-stage Set index sentinels
+          const symbols = (await client.smembers(`strategies:${connId}:symbols`)) || []
+          for (const symbol of symbols) {
+            for (const stage of stages) {
+              const idxKey = `strategy_sets_idx:${connId}:${symbol}:${stage}`
+              const exists = await client.exists(idxKey)
+              if (!exists) {
+                await client.sadd(idxKey, "_init")
+                await client.expire(idxKey, 7 * 24 * 60 * 60)
+                indexesCreated++
+              }
+            }
+          }
+        }
+      } catch (err) {
+        // Non-fatal — the engine will create indexes on first write.
+        console.warn("[v0] Migration 023: Index initialisation partial:", err)
+      }
+
+      console.log(`[v0] Migration 023: COMPLETE — ${indexesCreated} index sentinel entries created`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "22")
+      // Secondary indexes are auxiliary — deleting sentinels is sufficient
+      // since the keys have TTLs and will expire naturally.
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{

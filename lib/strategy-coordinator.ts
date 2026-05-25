@@ -76,7 +76,7 @@ export interface StrategySet {
    * Allows efficient pipeline by checking status before re-evaluating,
    * avoiding duplicate calculations while maintaining set uniqueness.
    */
-  status?: "valid_base" | "valid_main" | "valid_real" | "invalid"
+  status?: "valid_base" | "valid_main" | "valid_real" | "active" | "invalid"
   
   /**
    * ── Evaluation reason when status is "invalid" ──────────────────────
@@ -1859,6 +1859,25 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.real
 
+    // ── realActiveKeysForVP: Set of active config keys for continuous validity ──
+    // Declared here (before the pos-gate .map()) to satisfy the reference at
+    // line 1886 which checks active state for Sets below the pos threshold.
+    // A bootstrapped empty Set is used on any Redis error so the pos-gate
+    // still runs correctly without crashing the cycle.
+    const realActiveKeysForVP = await (async () => {
+      try {
+        // Prefer the warm cache populated by createBaseSets in this same cycle.
+        const cache = this._activeKeysCache
+        if (cache && Date.now() - cache.cycleAt < 30_000) return cache.keys
+        const c = getRedisClient()
+        return new Set<string>(
+          (await c
+            .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
+            .catch(() => [])) as string[],
+        )
+      } catch { return new Set<string>() }
+    })()
+
     // ── Stage-validation min-position threshold (operator spec, systemwide fix) ────
     // Same semantics as Main: Sets below `realEvalPosCount` are
     // MARKED as invalid with status flag — they're not validated against PF/DDT
@@ -2093,16 +2112,7 @@ export class StrategyCoordinator {
       const { bumpRealPosAccumulation, bumpValidPositions, bumpAxisPosAccumulation, bumpHedgePosAccumulation } = await import(
         "@/lib/pos-history",
       )
-      const realActiveKeysForVP = await (async () => {
-        try {
-          const c = getRedisClient()
-          return new Set<string>(
-            (await c
-              .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
-              .catch(() => [])) as string[],
-          )
-        } catch { return new Set<string>() }
-      })()
+      // realActiveKeysForVP already declared at method top — reuse it here.
       const accPipeline = getRedisClient().multi()
       for (const s of realSets) {
         const parentKey = s.parentSetKey || s.setKey.split("#")[0]
@@ -2333,8 +2343,30 @@ export class StrategyCoordinator {
         }
       } catch { /* fallback: 0 */ }
 
+      // ── Active Positions Count at Real stage (operator spec) ──────────
+      // "Add to Strategies Stage 'Real' also 'Active' Positions Count
+      // (actively + running Open)." A Real Set is "active" when it has an
+      // open live position tracked in realActiveKeysForVP. Sets in this
+      // state get status = "active" and are continuously valid regardless
+      // of PF/DDT evaluation. We count them from the full realSets list
+      // plus those that might have been gated out by pos-count but have
+      // active positions (they survive in mainSetsEligible with valid_real).
+      const realActiveCount = realSets.filter((s) => {
+        const parentKey = (s.parentSetKey ?? s.setKey).split("#")[0]
+        return realActiveKeysForVP.has(parentKey) || realActiveKeysForVP.has(s.setKey)
+      }).length
+      // Mark active Sets with the "active" status so downstream consumers
+      // (Live stage, dashboard) can identify continuously-valid open-position Sets.
+      for (const s of realSets) {
+        const parentKey = (s.parentSetKey ?? s.setKey).split("#")[0]
+        if (realActiveKeysForVP.has(parentKey) || realActiveKeysForVP.has(s.setKey)) {
+          s.status = "active"
+        }
+      }
+
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),
+        client.hset(redisKey, "strategies_real_active_count", String(realActiveCount)),
         client.hset(realDetailKey, {
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
           // for backwards compat; /stats prefers per-symbol sums below.
@@ -2360,6 +2392,10 @@ export class StrategyCoordinator {
           sets_progressing:         String(
             realSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
+          // ── Active Positions Count (operator spec) ────────────────
+          // Count of Real Sets with open live positions — "active" status.
+          active_positions_count: String(realActiveCount),
+          [`s:${symbol}:active`]:   String(realActiveCount),
           // ── 4-perspective Real stats ──────────────────────────────
           // These are connection-wide (not per-symbol) so writing them
           // once per (symbol, cycle) is fine — every symbol computes the
@@ -2367,6 +2403,7 @@ export class StrategyCoordinator {
           stat_general:      String(realSets.length),         // this cycle
           stat_combined:     String(realRunningNow),          // running now
           stat_accumulated:  String(realAccumulatedSum),      // axis sum
+          stat_active:       String(realActiveCount),         // open positions
           // (Overall is pulled from `strategies_real_total` on read.)
           updated_at:         String(Date.now()),
           // Per-symbol fields — see createBaseSets for rationale.

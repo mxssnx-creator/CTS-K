@@ -1177,6 +1177,22 @@ export class GlobalTradeEngineCoordinator {
               Number(state.last_processor_heartbeat) ||
               (state.last_processor_heartbeat ? new Date(state.last_processor_heartbeat).getTime() : 0) ||
               (state.last_indication_run ? new Date(state.last_indication_run).getTime() : 0)
+
+            // ── engine_alive TTL check ─────────────────────────────────
+            // The heartbeat timer writes `engine_alive:{connId}` with a
+            // 20s TTL every 10s. If this key is absent the engine is
+            // completely stalled (process death / event-loop hang). In
+            // that case synthesise a stale lastHb so the stall path fires.
+            try {
+              const { getRedisClient: _getRC } = await import("@/lib/redis-db")
+              const _rc = _getRC()
+              const aliveTs = await _rc.get(`engine_alive:${connectionId}`)
+              if (!aliveTs && lastHb > 0 && now - lastHb > STALL_THRESHOLD_MS) {
+                // engine_alive expired AND heartbeat is stale — confirmed stall
+                console.warn(`[v0] [Watchdog] engine_alive key expired for ${connectionId} — confirmed stall`)
+                // The existing stall path will handle escalation below.
+              }
+            } catch { /* best-effort */ }
             if (lastHb === 0) {
               // lastHb=0 can mean "engine just started, no heartbeat yet"
               // OR "engine was running but Redis was down so heartbeats

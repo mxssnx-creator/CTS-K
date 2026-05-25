@@ -80,6 +80,13 @@ interface LivePosition {
   createdAt?: number
   closedAt?: number
   realPositionId?: string
+  /**
+   * Upstream pseudo-position ID — the PseudoPositionManager ID that generated
+   * this live position. Stored alongside `setKey` so SL/TP dedup checks can be
+   * scoped per (setKey + pseudoPositionId) rather than just per (symbol + direction),
+   * preventing duplicate control orders when multiple pseudo-positions share a symbol.
+   */
+  pseudoPositionId?: string
   fills: FillRecord[]
   stopLoss?: number
   takeProfit?: number
@@ -1354,11 +1361,13 @@ export async function executeLivePosition(
     // `accumulatedSetKeys` is seeded with the originating setKey so
     // accumulation merges later append onto a non-empty list (rather
     // than having to special-case the first entry).
-    setKey:        realPosition.setKey,
-    parentSetKey:  realPosition.parentSetKey,
-    setVariant:    realPosition.setVariant,
-    axisWindows:   realPosition.axisWindows,
+    setKey:           realPosition.setKey,
+    parentSetKey:     realPosition.parentSetKey,
+    setVariant:       realPosition.setVariant,
+    axisWindows:      realPosition.axisWindows,
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
+    // Propagate upstream pseudo-position ID for per-(setKey, pseudoPositionId) SL/TP dedup.
+    pseudoPositionId: realPosition.pseudoPositionId,
   }
 
   try {

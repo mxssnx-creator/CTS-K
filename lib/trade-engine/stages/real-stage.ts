@@ -43,6 +43,11 @@ export interface RealPosition {
   parentSetKey?: string
   setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
   axisWindows?: { prev: number; last: number; cont: number; pause: number }
+  /**
+   * The upstream PseudoPosition ID that generated this RealPosition.
+   * Propagated to LivePosition for per-(setKey, pseudoPositionId) SL/TP dedup.
+   */
+  pseudoPositionId?: string
 }
 
 /**

@@ -963,6 +963,10 @@ export class TradeEngineManager {
       try {
         const stateKey = `trade_engine_state:${this.connectionId}`
         await setSettings(stateKey, { last_processor_heartbeat: Date.now() })
+        // Refresh the TTL-bearing liveness key — if the heartbeat timer stalled
+        // briefly the watchdog may see an expired key; re-arming refreshes it.
+        const client = getRedisClient()
+        await client.set(`engine_alive:${this.connectionId}`, String(Date.now()), { EX: 20 })
       } catch {}
       return false
     }
@@ -3295,6 +3299,11 @@ export class TradeEngineManager {
           last_processor_heartbeat: Date.now(),
           connection_id: this.connectionId,
         })
+        // Write a TTL-bearing liveness key so the watchdog can detect a
+        // completely stalled engine (process death / event-loop hang) by
+        // checking whether this key has expired (20s TTL, renewed every 10s).
+        const client = getRedisClient()
+        await client.set(`engine_alive:${this.connectionId}`, String(Date.now()), { EX: 20 })
       } catch {
         // Silent fail - heartbeat is non-critical
       }
