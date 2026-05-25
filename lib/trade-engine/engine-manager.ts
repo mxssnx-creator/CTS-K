@@ -785,6 +785,23 @@ export class TradeEngineManager {
           this.startStrategyProcessor(config.strategyInterval)
           this.startRealtimeProcessor(config.realtimeInterval)
           cacheHit = true // treat as hit for the rest of startup
+          // Advance phase so dashboard doesn't appear stuck in prehistoric in prod
+          try {
+            const symCount = (await this.getSymbols()).length
+            await this.updateProgressionPhase(
+              "live_trading",
+              100,
+              `Live trading ACTIVE (prod fast-path) — ${symCount} symbols`
+            )
+            await setSettings(`trade_engine_state:${this.connectionId}`, {
+              all_phases_started: true,
+              live_trading_started: true,
+              engine_ready: true,
+              updated_at: new Date().toISOString(),
+            })
+          } catch (phaseErr) {
+            console.warn(`[v0] [Engine] Prod fast-path phase advance warning:`, phaseErr)
+          }
         } else {
           // Non-blocking prehistoric loading (fresh or forced after stale cache) — dev / non-live paths
           await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
