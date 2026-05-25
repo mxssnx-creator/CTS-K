@@ -109,7 +109,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             engine_type: "live",
             indicationInterval: settings?.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 1,
             strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
-            realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.2,
+            realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
           })
           engineStatus = "starting"
           engineStartedNow = true

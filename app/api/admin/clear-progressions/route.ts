@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic"
 /**
  * POST /api/admin/clear-progressions
  *
- * Targeted "Reset DB" surface for the QuickStart panel.
+ * Targeted "Soft Reset DB" surface for the QuickStart panel.
  *
  * The existing `/api/admin/reset-and-init` flushes the entire Redis
  * keyspace and re-runs migrations — that is too destructive for the
@@ -25,8 +25,13 @@ export const dynamic = "force-dynamic"
  *     engine state/metrics, cycle counters, variant fingerprint cache,
  *     and per-connection trade history.
  *   • PRESERVES: connection records (`connection:*`), settings
- *     (`settings:*`, `app_settings:*`), migration markers, and
- *     predefinitions.
+ *     (`settings:*`, `app_settings:*`), migration markers, strategy
+ *     coordination framework (axis_pos_acc, real_pi_acc, progression
+ *     metadata, strategy_count), and position history structure.
+ *
+ * The coordination framework is preserved so new strategy progression
+ * runs can start fresh without rebuilding the infrastructure. All
+ * runtime strategy data and positions are cleared.
  *
  * Returns a per-pattern breakdown of how many keys were removed so the
  * UI can show a useful confirmation toast.
@@ -70,6 +75,11 @@ const PROTECTED_PREFIXES = [
   "auth:",                // Auth sessions & tokens
   "session:",             // User session data
   "api_key:",             // Stored API keys
+  "axis_pos_acc:",        // Axis position accumulation ledger (coordination framework)
+  "real_pi_acc:",         // Real PI accumulation (coordination framework)
+  "progression:",         // Progression metadata (coordination framework)
+  "strategy_count:",      // Strategy count tracking (coordination framework)
+  "pi_history:",          // Position history structure (coordination framework - base structure only, data will be cleared separately)
 ] as const
 
 // FORCE-CLEAR: prefixes that LOOK like they're protected but are pure
@@ -199,21 +209,26 @@ export async function POST() {
     // transient flags (paused-by-global, dashboard-active, live-trade)
     // must reset so the operator gets a clean slate on the next QuickStart.
     //
-    // CRITICAL: after updateConnection() writes new values to memory we
-    // MUST call persistNow() / saveToDisk() again. The earlier saveToDisk()
-    // inside flushRuntimeKeys() ran BEFORE these updates, so a hot-reload
-    // without a second flush would restore the old flag values (e.g.
-    // is_enabled_dashboard:"1") from the stale snapshot.
+    // EXCEPTION: base connection (bingx-x01) is persistent
+    // operator choices — their is_enabled_dashboard / is_assigned flags
+    // must NOT be zeroed out here. The self-healing monitor in
+    // trade-engine-auto-start.ts re-applies them on every 30s tick, but
+    // clearing them triggers a 30s window where those connections are
+    // disabled, which is surprising and incorrect behaviour for a "Reset DB"
+    // operation that is supposed to clear only runtime state.
+    const BASE_CONNECTION_IDS_CLEAR = ["bingx-x01"]
     try {
       const { getAllConnections, updateConnection } = await import("@/lib/redis-db")
       const conns = await getAllConnections()
       for (const c of conns) {
+        const isBaseConn = BASE_CONNECTION_IDS_CLEAR.includes(c.id)
         await updateConnection(c.id, {
           ...c,
-          is_enabled_dashboard: "0",
+          // Preserve enabled state for base connections — they are always on.
+          is_enabled_dashboard: isBaseConn ? "1" : "0",
           is_active: "0",
-          is_active_inserted: "0",
-          is_assigned: "0",
+          is_active_inserted: isBaseConn ? "1" : "0",
+          is_assigned: isBaseConn ? "1" : "0",
           is_live_trade: "0",
           is_preset_trade: "0",
           paused_by_global: "0",
@@ -221,7 +236,7 @@ export async function POST() {
           updated_at: new Date().toISOString(),
         })
       }
-      console.log(`[v0] [ClearProgressions] reset runtime flags on ${conns.length} connections`)
+      console.log(`[v0] [ClearProgressions] reset runtime flags on ${conns.length} connections (base connections preserved)`)
       // Second persist — captures the connection-flag resets so they are
       // durable on disk, not just in-memory. Without this, a Next.js
       // hot-reload between the reset and the next request restores the

@@ -685,7 +685,8 @@ export default function ExchangeConnectionManager() {
         )
       )
 
-      toast.success(enabled ? "Connection now enabled in Main Connections" : "Connection disabled in Main Connections")
+      const t = data.changed ? (enabled ? "Connection now enabled in Main Connections" : "Connection disabled in Main Connections") : (enabled ? "Already enabled in Main Connections" : "Already disabled")
+      toast.success(t)
       
       console.log("[v0] [Dashboard] Toggle successful for:", id, "is_enabled_dashboard:", enabled)
     } catch (error) {

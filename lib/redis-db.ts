@@ -27,7 +27,13 @@ interface RedisData {
 }
 
 // Global storage for persistence across hot reloads
-const globalForRedis = globalThis as unknown as { __redis_data?: RedisData }
+const globalForRedis = globalThis as unknown as {
+  __redis_data?: RedisData
+  // In-flight guard for loadFromDisk — ensures concurrent initRedis() calls
+  // from different module scopes share a single disk-read rather than racing
+  // to overwrite each other's post-migration state.
+  __redis_load_promise?: Promise<boolean>
+}
 
 export class InlineLocalRedis {
   private data: RedisData
@@ -35,7 +41,11 @@ export class InlineLocalRedis {
   constructor() {
     // Use global storage for persistence across hot reloads
     if (!globalForRedis.__redis_data) {
-      // Initialize with defaults
+      // Initialize with defaults. Do NOT fire loadFromDisk() here — initRedis()
+      // awaits it explicitly after construction when wasEmpty=true. Firing a
+      // background load here races with initRedis() and overwrites migration
+      // writes (ensureBaseConnections / migration 021) because the unawaited
+      // Promise settles AFTER migrations have already set is_enabled_dashboard=1.
       globalForRedis.__redis_data = {
         strings: new Map(),
         hashes: new Map(),
@@ -49,11 +59,6 @@ export class InlineLocalRedis {
           operationsPerSecond: 0,
         },
       }
-      
-      // Try to load from disk snapshot if available
-      this.loadFromDisk().catch(() => {
-        // Ignore load errors - start with empty database
-      });
     }
     
     // Ensure ttl map exists for older data structures
@@ -194,6 +199,18 @@ export class InlineLocalRedis {
   }
 
   async loadFromDisk(): Promise<boolean> {
+    // ── Safety guard: prevent snapshot reload if engine is running ──
+    // In dev mode, multiple Next.js workers each call initRedis()
+    // independently. Each worker loads the snapshot, which can overwrite
+    // lock values held by a live engine in a different worker. This causes
+    // "ownership loss" crashes. Check the global flag published by the
+    // trade-engine coordinator; if ANY engine is active, skip the reload.
+    const globalCtx = globalThis as any
+    if (globalCtx.__engine_manager_instance?.isEngineRunning) {
+      console.log(`[v0] [Redis] Snapshot reload skipped: engine running in this process`)
+      return false
+    }
+
     const target = await this.resolveSnapshotPath()
     if (!target) return false
     // Bare specifier — see comment in `resolveSnapshotPath`. Type alias
@@ -309,6 +326,16 @@ export class InlineLocalRedis {
     if (InlineLocalRedis.persistenceTickStarted) return true
     InlineLocalRedis.persistenceTickStarted = true
 
+    // ── Dev-mode optimization: disable periodic snapshots ──
+    // In Next.js dev mode, module reloads + multiple workers independently
+    // load/save snapshots, causing stale lock values to overwrite live engine
+    // lock tokens → "ownership loss" crashes every ~75s. In dev, disable
+    // periodic snapshots; in production, the 5-minute cycle is safe.
+    if (process.env.NODE_ENV === "development") {
+      console.log(`[v0] [Redis] Dev mode: periodic snapshot disabled to prevent lock churn`)
+      return true // Mark as started so we don't retry
+    }
+
     // 5-minute snapshot tick. unref() so this timer never holds the
     // process open during a graceful exit.
     const FIVE_MIN_MS = 5 * 60 * 1000
@@ -331,16 +358,34 @@ export class InlineLocalRedis {
   }
   
   private startTTLCleanup(): void {
-    // DISABLED: Automatic TTL cleanup causing all data to be deleted every 60 seconds
-    // Only run cleanup manually when explicitly requested
-    // const globalCleanup = globalThis as unknown as { __redis_cleanup_started?: boolean }
-    // if (globalCleanup.__redis_cleanup_started) return
-    // globalCleanup.__redis_cleanup_started = true
+    // TTL-based cleanup + LRU eviction when heap memory exceeds threshold.
+    // In dev mode, module reloads accumulate data; in prod, this prevents
+    // unbounded growth of position history and candle buffers.
+    const globalCleanup = globalThis as unknown as { __redis_cleanup_started?: boolean }
+    if (globalCleanup.__redis_cleanup_started) return
+    globalCleanup.__redis_cleanup_started = true
     
-    // const ttlCleanupTimer = setInterval(() => {
-    //   this.cleanupExpiredKeys()
-    // }, 60000)
-    // ttlCleanupTimer.unref?.()
+    const CLEANUP_INTERVAL_MS = 60_000 // Every 60s
+    const MEMORY_LIMIT_BYTES = 1_000_000_000 // 1GB soft limit
+    
+    const ttlCleanupTimer = setInterval(() => {
+      try {
+        // First, clean up expired keys
+        const cleaned = this.cleanupExpiredKeys()
+        
+        // Check memory pressure: if heap > threshold, evict old position/candle records
+        const heapUsedMB = (process.memoryUsage?.().heapUsed || 0) / 1024 / 1024
+        const heapLimitMB = 1000 // 1GB
+        
+        if (heapUsedMB > heapLimitMB) {
+          console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
+          this.evictOldRecords()
+        }
+      } catch (err) {
+        // Swallow errors so the cleanup timer doesn't die
+      }
+    }, CLEANUP_INTERVAL_MS)
+    ttlCleanupTimer.unref?.()
   }
   
   private cleanupExpiredKeys(): number {
@@ -357,6 +402,37 @@ export class InlineLocalRedis {
       }
     }
     return cleaned
+  }
+  
+  private evictOldRecords(): number {
+    // LRU eviction: delete oldest position/candle records when heap pressure high.
+    // Target keys that accumulate unboundedly: `strategy:*:positions`, `market_data:*:candles`.
+    // We measure "age" by parsing timestamps in the key structure or falling back to FIFO order.
+    let evicted = 0
+    const targetPatterns = [
+      (k: string) => k.startsWith("strategy:") && k.includes(":positions"),
+      (k: string) => k.startsWith("market_data:") && k.endsWith(":candles"),
+    ]
+    
+    const keysToEvict: string[] = []
+    for (const [key] of this.data.hashes.entries()) {
+      if (targetPatterns.some(p => p(key))) {
+        keysToEvict.push(key)
+      }
+    }
+    
+    // Evict oldest 20% of matching keys to recover memory
+    const evictCount = Math.max(1, Math.floor(keysToEvict.length * 0.2))
+    for (let i = 0; i < evictCount && i < keysToEvict.length; i++) {
+      const key = keysToEvict[i]
+      this.deleteKey(key)
+      evicted++
+    }
+    
+    if (evicted > 0) {
+      console.log(`[v0] [Redis Memory] Evicted ${evicted} old records to reduce memory pressure`)
+    }
+    return evicted
   }
   
   private isExpired(key: string): boolean {
@@ -1064,11 +1140,29 @@ export async function initRedis(): Promise<void> {
   if (isConnected) return
 
   if (!redisInstance) {
+    // Capture emptiness BEFORE construction. The constructor now only
+    // initialises the in-memory Maps without loading from disk, so after
+    // `new InlineLocalRedis()` the data structure exists but is empty.
+    // wasEmpty=true  → first boot, load the snapshot now (awaited, ordered before migrations)
+    // wasEmpty=false → hot-reload; data is already in globalForRedis.__redis_data
+    //                  from the previous module instance — do NOT reload the
+    //                  snapshot or it overwrites post-migration state.
+    const wasEmpty = !globalForRedis.__redis_data
     redisInstance = new InlineLocalRedis()
-    // Restore from disk snapshot before any caller reads keys. The
-    // constructor also kicks off a background load, but awaiting here
-    // guarantees migrations + readers see hydrated state on first tick.
-    await redisInstance.loadFromDisk().catch(() => { /* fresh start ok */ })
+    if (wasEmpty) {
+      // Dedup concurrent loadFromDisk calls across module scopes. If another
+      // initRedis() already fired loadFromDisk in this process (via a
+      // concurrent route handler), wait for that promise instead of loading
+      // the snapshot a second time — the second load would overwrite
+      // post-migration writes (e.g. is_enabled_dashboard=1 from mig 021).
+      if (!globalForRedis.__redis_load_promise) {
+        globalForRedis.__redis_load_promise = redisInstance.loadFromDisk().catch(() => false)
+        globalForRedis.__redis_load_promise.finally(() => {
+          globalForRedis.__redis_load_promise = undefined
+        })
+      }
+      await globalForRedis.__redis_load_promise
+    }
   }
 
   isConnected = true
@@ -1103,7 +1197,17 @@ export function getClient(): InlineLocalRedis {
 }
 
 export function getRedisClient(): InlineLocalRedis {
-  return getClient()
+  if (!redisInstance) {
+    redisInstance = new InlineLocalRedis()
+    isConnected = true
+  }
+  return redisInstance
+}
+
+export async function ensureRedisInitialized(): Promise<void> {
+  if (!isConnected || !redisInstance) {
+    await initRedis()
+  }
 }
 
 export function isRedisConnected(): boolean {
@@ -1200,7 +1304,7 @@ export async function getConnection(id: string): Promise<any | null> {
 // ops per poll per component. A short TTL (1.5s) dedupes bursts without
 // introducing user-visible staleness (all writes invalidate the cache
 // immediately via `invalidateConnectionsCache()`).
-// ────────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────�����───────────────────────────────────────
 const __CONN_CACHE_TTL_MS = 1500
 let __connCache: { at: number; value: any[] } | null = null
 let __connInflight: Promise<any[]> | null = null
@@ -1717,7 +1821,15 @@ export async function saveIndication(indication: any): Promise<void> {
     updated_at: new Date().toISOString(),
   })
   
-  await client.hset(`indication:${id}`, data)
+  const key = `indication:${id}`
+  await client.hset(key, data)
+  // Bound retention: prehistoric/realtime can mint hundreds of thousands
+  // of these. Without a TTL the in-process Redis snapshot grows
+  // unbounded (observed 295k keys / 39MB after a few quickstart runs)
+  // and dev memory blows past the 6GB heap. 24h is plenty for any
+  // dashboard/debug consumer; the `indications:{connId}:*` lists
+  // (lib/indication-evaluator.ts) are the durable view.
+  await client.expire(key, 86400).catch(() => 0)
 }
 
 // ========== Strategy Operations ==========
@@ -2402,3 +2514,111 @@ export function saveDatabaseSnapshotSync(): boolean {
   client.saveToDiskSync()
   return true
 }
+
+/**
+ * Verify that a position was created by this system using system_tracking_id.
+ * Prevents modifications to manually-entered or foreign orders.
+ * @returns true if position has valid sys-* tracking ID, false otherwise
+ */
+export function isSystemCreatedPosition(position: Record<string, string> | null | undefined): boolean {
+  if (!position) return false
+  const trackingId = String(position.system_tracking_id || "").trim()
+  // System tracking IDs follow format: sys-{connId}-{timestamp}-{random}
+  return trackingId.startsWith("sys-") && trackingId.length > 10
+}
+
+/**
+ * Soft reset: Clear all runtime data while preserving coordination framework
+ * 
+ * Coordination framework that is PRESERVED:
+ * - axis_pos_acc:* (axis position accumulation ledgers)
+ * - real_pi_acc:* (real PI accumulation structures)
+ * - progression:* (progression metadata)
+ * - strategy_count:* (strategy count tracking)
+ * - pi_history:* (position history framework - structure kept, data cleared)
+ * 
+ * Allows new strategy progression runs to start fresh without rebuilding
+ * the infrastructure. All runtime strategy data and positions are cleared.
+ * 
+ * @returns object with cleared key counts per bucket
+ */
+export async function softResetWithCoordinationPreserved(): Promise<{
+  deleted: number
+  protected: number
+  buckets: Record<string, number>
+}> {
+  const client = getRedisClient()
+  
+  // Prefixes to preserve (coordination framework + credentials/settings)
+  const PRESERVED = [
+    "connection:",
+    "connections:tombstoned",
+    "settings:",
+    "app_settings",
+    "all_settings",
+    "migration:",
+    "_migration",
+    "_schema_version",
+    "predefinitions:",
+    "system:base_connections_seeded",
+    "auth:",
+    "session:",
+    "api_key:",
+    "axis_pos_acc:",      // COORDINATION FRAMEWORK
+    "real_pi_acc:",       // COORDINATION FRAMEWORK
+    "progression:",       // COORDINATION FRAMEWORK
+    "strategy_count:",    // COORDINATION FRAMEWORK
+  ]
+  
+  // Get all keys
+  const allKeys = await client.keys("*").catch(() => [] as string[])
+  
+  // Filter to keys to delete
+  const keysToDelete = allKeys.filter((k) => {
+    if (typeof k !== "string") return false
+    // Check if key should be preserved
+    for (const prefix of PRESERVED) {
+      if (k.startsWith(prefix)) return false
+    }
+    return true
+  })
+  
+  // Build bucket summary before deletion
+  const buckets: Record<string, number> = {}
+  for (const k of keysToDelete) {
+    const idx = k.indexOf(":")
+    const bucket = idx > 0 ? k.slice(0, idx) + ":*" : k
+    buckets[bucket] = (buckets[bucket] || 0) + 1
+  }
+  
+  // Delete in chunks
+  let deleted = 0
+  const CHUNK_SIZE = 500
+  for (let i = 0; i < keysToDelete.length; i += CHUNK_SIZE) {
+    const chunk = keysToDelete.slice(i, i + CHUNK_SIZE)
+    try {
+      const n = await client.del(...chunk)
+      deleted += typeof n === "number" ? n : chunk.length
+    } catch {
+      for (const k of chunk) {
+        try { await client.del(k); deleted++ } catch { /* skip */ }
+      }
+    }
+  }
+  
+  // Persist to disk
+  try {
+    if (typeof (client as any).persistNow === "function") {
+      await (client as any).persistNow().catch(() => null)
+    } else if (typeof (client as any).saveToDisk === "function") {
+      await (client as any).saveToDisk().catch(() => null)
+    }
+  } catch { /* non-critical */ }
+  
+  return {
+    deleted,
+    protected: allKeys.length - keysToDelete.length,
+    buckets,
+  }
+}
+

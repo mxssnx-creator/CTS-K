@@ -71,6 +71,13 @@ export async function notifySettingsChanged(
 
   // Write the change event so running engines can detect it
   await setSettings(`settings_change:${connectionId}`, event)
+  // Also write settings:dirty flag so processor-level caches (strategy,
+  // realtime, indication) invalidate on next tick. Previously the
+  // disjoint propagation system meant only one path was triggered per
+  // save path — this ensures BOTH happen on every settings change.
+  try {
+    await setSettings(`settings:dirty:${connectionId}`, "1")
+  } catch { /* non-critical */ }
   
   // Increment a global change counter for this connection
   const counter = await getSettings(`settings_change_counter:${connectionId}`)
@@ -93,7 +100,9 @@ export async function notifySettingsChanged(
     }
   }
 
-  // If hot-reload, update engine state to signal reload needed
+  // If hot-reload, update engine state to signal reload needed.
+  // Also reset per-stage strategy counters so the dashboard doesn't show
+  // a statistically-incoherent blend of old-setting and new-setting data.
   if (changeType === "reload") {
     const engineState = await getSettings(`trade_engine_state:${connectionId}`)
     if (engineState && (engineState.status === "running" || engineState.status === "ready")) {
@@ -103,6 +112,24 @@ export async function notifySettingsChanged(
         reload_fields: changedFields,
         reload_requested_at: new Date().toISOString(),
       })
+      // Reset per-stage counters so stats are recomputed from scratch
+      // under the new settings — avoids blending pre-change and
+      // post-change data in the dashboard.
+      try {
+        const progKey = `progression:${connectionId}`
+        await setSettings(progKey, {
+          strategies_base_count: "0",
+          strategies_main_count: "0",
+          strategies_real_count: "0",
+          strategies_live_count: "0",
+          indication_auto_count: "0",
+          indication_main_count: "0",
+          indication_common_count: "0",
+          indication_optimal_count: "0",
+          indication_manual_count: "0",
+          settings_changed_at: new Date().toISOString(),
+        })
+      } catch { /* non-critical */ }
       console.log(`[v0] [SettingsCoordinator] Engine hot-reload flagged for ${connectionId}`)
     }
   }

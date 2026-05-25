@@ -3,6 +3,8 @@
 import { useState, useEffect } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { useExchange } from "@/lib/exchange-context"
+import { TradeHistoryTable, type TradeHistoryRow } from "@/components/dashboard/trade-history-table"
+import { PerformanceTiers } from "@/components/dashboard/performance-tiers"
 
 interface CompactStats {
   indicationCycles: number
@@ -139,9 +141,47 @@ interface CompactStats {
   apStrategies:  ActiveProgressingByName
   phase: string
   isActive: boolean
+  // ── PERFORMANCE TIERS ───────────────────────────────────────────
+  // Per-stage (base / main / real / live) performance summary. Keys
+  // match PerformanceTier interface (avgPF, winRate, sharpe, etc.).
+  performanceTiers: {
+    base:  PerformanceTier
+    main:  PerformanceTier
+    real:  PerformanceTier
+    live:  PerformanceTier
+  }
+  // ── TRADE HISTORY ───────────────────────────────────────────────
+  // Up to 500 most-recently-closed live exchange positions.
+  tradeHistory: TradeHistoryRow[]
+  // ── SPEC PERFORMANCE HISTORY ─────────────────────────────────────
+  // Per-symbol performance breakdown per pipeline stage.
+  specPerformanceHistory: {
+    base:  { aggregated: Record<string, any>; detail: Array<Record<string, any>> }
+    main:  { aggregated: Record<string, any>; detail: Array<Record<string, any>> }
+    real:  { aggregated: Record<string, any>; detail: Array<Record<string, any>> }
+    live:  { aggregated: Record<string, any>; detail: Array<Record<string, any>> }
+  }
+}
+type PerformanceTier = {
+  avgProfitFactor: number
+  avgDrawdownMin:  number
+  avgPosPerSet:    number
+  winRate:         number
+  sharpe:          number
+  totalPnl:        number
+  avgPnl?:         number
+  totalCreated:    number
+  totalEntries:    number
+  totalRunning:    number
+  symbolCount:     number
+  isExecution:     boolean
+  fillRate?:       number
+  volumeUsdTotal?: number
+  totalClosed?:    number
+  openScanned?:    number
 }
 
-// Shared row shape — same as quickstart-section ActiveProgressingRow.
+// Shared row shapes
 type ActiveProgressingRow = { sets: number; trackings: number; positions: number }
 type ActiveProgressingByName = Record<string, ActiveProgressingRow>
 
@@ -193,8 +233,28 @@ const EMPTY: CompactStats = {
   liveConsolidatedSetsTotal: 0,
   livePositions: [],
   liveResolution: { pseudo: 0, realFallback: 0, unresolved: 0 },
+  performanceTiers: {
+    base:  buildEmptyTier(false), main: buildEmptyTier(false),
+    real:  buildEmptyTier(false), live: buildEmptyTier(true),
+  },
+  tradeHistory: [],
+  specPerformanceHistory: {
+    base:  { aggregated: {}, detail: [] },
+    main:  { aggregated: {}, detail: [] },
+    real:  { aggregated: {}, detail: [] },
+    live:  { aggregated: {}, detail: [] },
+  },
   phase: "",
   isActive: false,
+}
+
+function buildEmptyTier(isExecution: boolean): PerformanceTier {
+  return {
+    avgProfitFactor: 0, avgDrawdownMin: 0, avgPosPerSet: 0,
+    winRate: 0, sharpe: 0, totalPnl: 0, totalCreated: 0,
+    totalEntries: 0, totalRunning: 0, symbolCount: 0, isExecution,
+    fillRate: 0, volumeUsdTotal: 0,
+  }
 }
 
 function fmt(n: number): string {
@@ -632,19 +692,40 @@ export function StatisticsOverviewV2() {
           stratMain:        d.breakdown?.strategies?.main || 0,
           stratReal:        d.breakdown?.strategies?.real || 0,
           stratLive:        d.breakdown?.strategies?.live || liveExec.positionsCreated || 0,
-          // Active-now snapshot — written per cycle by engine writers
-          // (indication-sets-processor + strategy-coordinator). The UI
-          // shows these as the headline numbers and the cumulative
-          // counts above as smaller subtext.
-          activeIndDirection: Number(d.activeCounts?.indications?.direction)      || 0,
-          activeIndMove:      Number(d.activeCounts?.indications?.move)           || 0,
-          activeIndActive:    Number(d.activeCounts?.indications?.active)         || 0,
-          activeIndOptimal:   Number(d.activeCounts?.indications?.optimal)        || 0,
-          activeIndTotal:     Number(d.activeCounts?.indications?.total)          || 0,
+          // Active-now snapshot — written per cycle by engine writers.
+          // Falls back to breakdown cumulative counts when activeCounts
+          // is 0 (hash expired, not yet written, or engine just started)
+          // so per-type tiles stay non-zero while the engine is running.
+          activeIndDirection: Number(d.activeCounts?.indications?.direction) ||
+                              Number(d.breakdown?.indications?.direction) || 0,
+          activeIndMove:      Number(d.activeCounts?.indications?.move) ||
+                              Number(d.breakdown?.indications?.move) || 0,
+          activeIndActive:    Number(d.activeCounts?.indications?.active) ||
+                              Number(d.breakdown?.indications?.active) || 0,
+          activeIndOptimal:   Number(d.activeCounts?.indications?.optimal) ||
+                              Number(d.breakdown?.indications?.optimal) || 0,
+          // Fall back to cumulative indicationsTotal when the per-cycle
+          // active-sets count is 0 — keeps the tile non-zero while the
+          // engine is running but nothing has crossed the threshold yet.
+          // Third fallback: breakdown.indications.total (type-summed)
+          // which is the most reliable cumulative source and does not
+          // depend on the per-cycle active-hash write timing.
+          activeIndTotal: (() => {
+            const active = Number(d.activeCounts?.indications?.total) || 0
+            if (active > 0) return active
+            const rt = Number(d.realtime?.indicationsTotal) || 0
+            if (rt > 0) return rt
+            return Number(d.breakdown?.indications?.total) || 0
+          })(),
           activeStratBase:    Number(d.activeCounts?.strategies?.base)            || 0,
           activeStratMain:    Number(d.activeCounts?.strategies?.main)            || 0,
           activeStratReal:    Number(d.activeCounts?.strategies?.real)            || 0,
-          activeStratTotal:   Number(d.activeCounts?.strategies?.total)           || 0,
+          // Fall back to activeProgressing strategies total when activeCounts is 0.
+          activeStratTotal: (() => {
+            const active = Number(d.activeCounts?.strategies?.total) || 0
+            if (active > 0) return active
+            return Number(d.activeProgressing?.strategies?.total?.sets) || 0
+          })(),
           mainEvaluated:    mainBreakdownEval,
           mainCoordCreated,
           mainBlockDcaSets,
@@ -735,6 +816,21 @@ export function StatisticsOverviewV2() {
           },
           phase:            d.metadata?.phase || "",
           isActive:         d.metadata?.engineRunning || false,
+          performanceTiers: (d.performanceTiers as any) || {
+            base: { avgProfitFactor: 0, avgDrawdownMin: 0, avgPosPerSet: 0, winRate: 0, sharpe: 0, totalPnl: 0, totalCreated: 0, totalEntries: 0, totalRunning: 0, symbolCount: 0, isExecution: false },
+            main: { avgProfitFactor: 0, avgDrawdownMin: 0, avgPosPerSet: 0, winRate: 0, sharpe: 0, totalPnl: 0, totalCreated: 0, totalEntries: 0, totalRunning: 0, symbolCount: 0, isExecution: false },
+            real: { avgProfitFactor: 0, avgDrawdownMin: 0, avgPosPerSet: 0, winRate: 0, sharpe: 0, totalPnl: 0, totalCreated: 0, totalEntries: 0, totalRunning: 0, symbolCount: 0, isExecution: false },
+            live: { avgProfitFactor: 0, avgDrawdownMin: 0, avgPosPerSet: 0, winRate: 0, sharpe: 0, totalPnl: 0, totalCreated: 0, totalEntries: 0, totalRunning: 0, symbolCount: 0, isExecution: true, fillRate: 0, volumeUsdTotal: 0 },
+          },
+          tradeHistory: Array.isArray((d as any).tradeHistory)
+            ? ((d as any).tradeHistory as TradeHistoryRow[])
+            : [],
+          specPerformanceHistory: (d.specPerformanceHistory as any) || {
+            base: { aggregated: {}, detail: [] },
+            main: { aggregated: {}, detail: [] },
+            real: { aggregated: {}, detail: [] },
+            live: { aggregated: {}, detail: [] },
+          },
         })
       } catch {
         // Non-critical polling — swallow silently so a blip doesn't
@@ -1371,6 +1467,22 @@ export function StatisticsOverviewV2() {
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {/* ── PERFORMANCE TIERS ─────────────────────────────────────────── */}
+        {/* Per-stage performance cards: base / main / real / live. */}
+        {((stats.performanceTiers?.base?.symbolCount || 0) +
+          (stats.performanceTiers?.live?.symbolCount || 0)) > 0 && (
+          <div className="mt-3 pt-3 border-t border-border/40">
+            <PerformanceTiers tiers={stats.performanceTiers} />
+          </div>
+        )}
+
+        {/* ── TRADE HISTORY ─────────────────────────────────────────────── */}
+        {stats.tradeHistory.length > 0 && (
+          <div className="mt-3 pt-3 border-t border-border/40">
+            <TradeHistoryTable trades={stats.tradeHistory} />
           </div>
         )}
 

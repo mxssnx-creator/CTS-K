@@ -159,6 +159,39 @@ export interface StrategyStageTracking {
     avgProfitFactor: number
     cap: number                       // maxLiveSets, default 500
   }
+  /**
+   * ── Valid Positions Counts (operator spec) ─────────────────────────
+   * "add to statistics and overviews.. Valid Positions Counts ..
+   *  Overall, Combined (Accumulated)."
+   *
+   * Maintained by `lib/pos-history.ts::bumpValidPositions`, fired from
+   * `evaluateRealSets` once per Real Set produced.
+   *   - overall:  lifetime count of valid Real Sets ever produced
+   *   - combined: Sets whose parent Base is currently running (alive)
+   *   - bySymbol/byDirection/byType: dimensional breakdowns
+   */
+  validPositions: {
+    overall: number
+    combined: number
+    bySymbol: Record<string, number>
+    byDirection: Record<string, number>
+    byType: Record<string, number>
+  }
+  /**
+   * Connection-level prev-pos summary so settings panels and dashboard
+   * tiles can render "what's the engine learning right now" without
+   * reading raw redis hashes.
+   */
+  prevPos: {
+    count: number
+    successRate: number
+    profitFactor: number
+    avgDDT: number
+    /** Operator-tunable activation threshold (default 5). */
+    minCount: number
+    /** True when current count clears `minCount` and PF blending is active. */
+    active: boolean
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -277,6 +310,30 @@ export async function getStrategyTracking(
   // Axis accumulation at Real stage
   const axisAccumulation = await readAxisAccumulation(client, connectionId)
 
+  // ── Valid Positions + Prev-pos rollup ──
+  // Both are connection-scoped HASHes maintained by `lib/pos-history.ts`.
+  // We resolve them in parallel with the rest of the tracking reads so
+  // dashboard refreshes stay one round-trip in the steady state.
+  const { getValidPositions, getPosHistoryOverall } = await import(
+    "@/lib/pos-history",
+  )
+  // Backwards-compat: the operator setting key was historically
+  // `prevPiMinCount`. The new code-side name is `prevPosMinCount`. We
+  // accept either to avoid silently losing the operator's tuning when
+  // the rename ships, with the new key taking precedence.
+  const csRecord = settings as Record<string, string>
+  const prevPosMinCountSetting = Number(
+    csRecord.prevPosMinCount || csRecord.prevPiMinCount || "5",
+  )
+  const prevPosMinCount =
+    Number.isFinite(prevPosMinCountSetting) && prevPosMinCountSetting > 0
+      ? Math.min(50, Math.floor(prevPosMinCountSetting))
+      : 5
+  const [validPositions, prevPos] = await Promise.all([
+    getValidPositions(connectionId),
+    getPosHistoryOverall(connectionId, prevPosMinCount),
+  ])
+
   // Active sets currently processing (counted across symbols)
   let baseActivelyProcessing = 0
   let liveActive = 0
@@ -364,6 +421,15 @@ export async function getStrategyTracking(
       setsTotal: Number(prog.strategies_live_total || "0"),
       avgProfitFactor: Number(prog.live_avg_profit_factor || "0"),
       cap: Number(settings.maxLiveSets || "500"),
+    },
+    validPositions,
+    prevPos: {
+      count: prevPos.count,
+      successRate: prevPos.successRate,
+      profitFactor: prevPos.profitFactor,
+      avgDDT: prevPos.avgDDT,
+      minCount: prevPosMinCount,
+      active: prevPos.hasSignal,
     },
   }
 }

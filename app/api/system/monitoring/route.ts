@@ -10,7 +10,6 @@ export async function GET() {
     const client = getRedisClient()
 
     const memUsage = process.memoryUsage()
-    // Get system CPU usage (not process CPU time)
     const os = await import('os')
     const cpus = os.cpus()
     let totalIdle = 0

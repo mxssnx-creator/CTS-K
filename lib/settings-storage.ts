@@ -7,10 +7,10 @@ let settingsCache: Record<string, any> | null = null
 
 function getDefaultSettings(): Record<string, any> {
   return {
-    mainEngineIntervalMs: 1000,
+    mainEngineIntervalMs: 700,
     presetEngineIntervalMs: 120000,
     strategyUpdateIntervalMs: 10000,
-    realtimeIntervalMs: 3000,
+    realtimeIntervalMs: 300,
     mainEngineEnabled: true,
     presetEngineEnabled: true,
     minimum_connect_interval: 200,

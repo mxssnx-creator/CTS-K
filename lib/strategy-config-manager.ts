@@ -28,6 +28,24 @@ export interface PseudoPosition {
   result?: number // PnL percentage when closed
   exit_time?: string
   exit_price?: number
+  /**
+   * Direction of the trade — only carried on the in-memory PseudoPosition
+   * shape used by the prehistoric calculator (see
+   * ConfigSetProcessor.calculateStrategyPositions). The serialized
+   * "|"-delimited Set entry does NOT include direction; this field exists
+   * so the prehistoric write path can call recordPosClosed() with the
+   * correct (long|short) bucket before persisting. See the systemwide
+   * fix in commit history for "no sets evaluated → prehistoric fills
+   * pos_history".
+   */
+  direction?: "long" | "short"
+  /**
+   * Indication type that drove this prehistoric position (e.g.
+   * "MA_Cross", "RSI_Band"). Mirrors `StrategyConfig.type`. Only used
+   * by the prehistoric write path to bucket into the correct
+   * (symbol × type × direction) Pos history hash.
+   */
+  indication_type?: string
 }
 
 export interface StrategyStats {
@@ -295,6 +313,32 @@ export class StrategyConfigManager {
     return idx >= 0 ? raw.slice(idx + 1) : raw
   }
 
+  /**
+   * Best-effort indication-type extraction from a composite configSetKey.
+   * The keys produced upstream embed the indication type as one of the
+   * leading segments (e.g. `direction:long:cfg_…` or
+   * `connId:active_advanced:short:cfg_…`). We scan for the first segment
+   * that matches our known type vocabulary and return it lower-cased;
+   * returns "" when no recognised token appears (callers fall back to
+   * "unknown" rather than dropping the position from PI history).
+   */
+  static extractIndicationType(configSetKey: string | undefined | null): string {
+    if (!configSetKey) return ""
+    const KNOWN = new Set([
+      "direction",
+      "move",
+      "active",
+      "active_advanced",
+      "optimal",
+      "auto",
+    ])
+    for (const seg of String(configSetKey).split(":")) {
+      const s = seg.trim().toLowerCase()
+      if (KNOWN.has(s)) return s
+    }
+    return ""
+  }
+
   async getPositionCount(configId: string): Promise<number> {
     await initRedis()
     const client = getRedisClient()
@@ -434,15 +478,16 @@ export class StrategyConfigManager {
 
   async getBestPerformingConfig(): Promise<{ config: StrategyConfig; stats: StrategyStats } | null> {
     const configs = await this.getEnabledConfigs()
-    let best: { config: StrategyConfig; stats: StrategyStats } | null = null
-
-    for (const config of configs) {
-      const stats = await this.getStats(config.id)
-      if (!best || stats.winRate > best.stats.winRate) {
-        best = { config, stats }
-      }
-    }
-
-    return best
+    if (configs.length === 0) return null
+    // Pipeline the per-config stats reads — they are independent
+    // Redis keys and the original sequential loop was N · RTT for an
+    // N-config universe (often 50+).
+    const all = await Promise.all(
+      configs.map((config) => this.getStats(config.id).then((stats) => ({ config, stats }))),
+    )
+    return all.reduce<{ config: StrategyConfig; stats: StrategyStats } | null>(
+      (best, cur) => (!best || cur.stats.winRate > best.stats.winRate ? cur : best),
+      null,
+    )
   }
 }

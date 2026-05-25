@@ -5,6 +5,13 @@ let ran = false
 
 function shouldRunPreStartup(): boolean {
   if (process.env.NEXT_RUNTIME !== "nodejs") return false
+  // In production, we still need to run essential initialization (Redis, migrations)
+  // but we skip the UI/UX seeding and connection testing
+  return true
+}
+
+function shouldRunDevOnlyPreStartup(): boolean {
+  if (process.env.NEXT_RUNTIME !== "nodejs") return false
   if (process.env.NODE_ENV === "production") return false
   return true
 }
@@ -30,6 +37,23 @@ async function seedPredefinedConnections() {
 }
 
 async function seedMarketData() {
+  // Only seed placeholder prices when the canonical key for BTCUSDT does not
+  // already exist. This prevents overwriting real market data that was fetched
+  // by the live-price loader on a previous run (e.g. after a hot-reload in dev
+  // or after a cold start where the Redis snapshot was already restored from disk).
+  try {
+    const { getRedisClient } = await import("@/lib/redis-db")
+    const client = getRedisClient()
+    const existing = await client.exists("market_data:BTCUSDT")
+    if (existing) {
+      console.log("[v0] [PreStartup] seedMarketData: real data present — skipping placeholder seed")
+      return
+    }
+  } catch {
+    // If the Redis check fails, fall through and seed anyway so the engine has
+    // something to work with on a completely fresh DB.
+  }
+
   const symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "SOLUSDT"]
   const basePrices: Record<string, number> = {
     BTCUSDT: 100000,
@@ -40,28 +64,37 @@ async function seedMarketData() {
     SOLUSDT: 180,
   }
 
-  for (const symbol of symbols) {
-    const base = basePrices[symbol] ?? 100
-    for (let i = 0; i < 20; i += 1) {
-      const variation = base * 0.02
-      const close = base + (Math.random() - 0.5) * variation
-      // Spec §7: pre-startup seeds 1s placeholders so the engine has
-      // *something* under the canonical key before the real loader
-      // runs. Timestamps step at 1s instead of 60s.
-      await saveMarketData(symbol, "1s", {
-        symbol,
-        exchange: "bybit",
-        interval: "1s",
-        price: close,
-        open: base,
-        high: base + variation,
-        low: base - variation,
-        close,
-        volume: Math.random() * 1_000_000,
-        timestamp: new Date(Date.now() - (20 - i) * 1_000).toISOString(),
+  // ── Parallel seeding ────────────────────────────────────────────
+  // Every (symbol, tick) write is independent. Previously this was a
+  // nested for-loop with 6 × 20 = 120 sequential awaits — easily a
+  // full second of pointless serialisation on every startup. Fan
+  // out everything in a single Promise.all so the placeholder seed
+  // lands on Redis as one parallel batch.
+  await Promise.all(
+    symbols.flatMap((symbol) => {
+      const base = basePrices[symbol] ?? 100
+      return Array.from({ length: 20 }, (_v, i) => {
+        const variation = base * 0.02
+        const close = base + (Math.random() - 0.5) * variation
+        // Spec §7: pre-startup seeds 1s placeholders so the engine has
+        // *something* under the canonical key before the real loader
+        // runs. Timestamps step at 1s instead of 60s.
+        return saveMarketData(symbol, "1s", {
+          symbol,
+          exchange: "bybit",
+          interval: "1s",
+          price: close,
+          open: base,
+          high: base + variation,
+          low: base - variation,
+          close,
+          volume: Math.random() * 1_000_000,
+          timestamp: new Date(Date.now() - (20 - i) * 1_000).toISOString(),
+        })
       })
-    }
-  }
+    }),
+  )
+  console.log("[v0] [PreStartup] seedMarketData: seeded placeholder prices for", symbols.length, "symbols")
 }
 
 export async function testAllExchangeConnections() {
@@ -106,10 +139,14 @@ export async function runPreStartup() {
   try {
     await initRedis()
     await runMigrations()
-    await initializeDefaultSettings()
-    await seedPredefinedConnections()
-    await seedMarketData()
-    await testAllExchangeConnections()
+    
+    // Only run dev-specific seeding and testing in development
+    if (shouldRunDevOnlyPreStartup()) {
+      await initializeDefaultSettings()
+      await seedPredefinedConnections()
+      await seedMarketData()
+      await testAllExchangeConnections()
+    }
 
     // Engine start is intentionally skipped in safe bootstrap mode.
   } catch (error) {

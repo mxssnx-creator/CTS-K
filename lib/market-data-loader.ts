@@ -153,11 +153,45 @@ async function fetchRealMarketData(
   }
 }
 
+// ── In-flight deduplication ─────────────────────────────────────────
+// `loadMarketDataForEngine` is called from four independent paths:
+// engine boot, heartbeat (30s), prehistoric cycle (adaptive), and the
+// fallback error handler. When two callers fire concurrently, they
+// would each fetch+parse+write the same symbol list independently,
+// doubling exchange API calls and Redis writes.
+let __loadFlight: Promise<number> | null = null
+
 /**
  * Load market data for all symbols into Redis
  * Fetches REAL data from exchanges, falls back to synthetic only on failure
  */
 export async function loadMarketDataForEngine(symbols: string[] = []): Promise<number> {
+  // Coalesce concurrent calls — the second caller joins the first
+  // promise and receives the same result, avoiding duplicate work.
+  if (__loadFlight) return __loadFlight
+  __loadFlight = (async () => {
+  // ── Dev-mode optimization: skip cold-boot loading if already cached ──
+  // In Next.js dev mode, module reloads and hot-reload cause repeated
+  // calls to loadMarketDataForEngine. Each call fetches 86k candles per
+  // symbol from exchange APIs, bloating heap and hammering rate limits.
+  // Check if data is already resident; reuse existing candles.
+  try {
+    await initRedis()
+    const client = getClient()
+    const isDev = process.env.NODE_ENV === "development"
+    
+    if (isDev) {
+      const checkKey = `market_data:BTCUSDT:1s`
+      const existing = await client.get(checkKey)
+      if (existing) {
+        console.log(`[v0] [MarketData] Dev-mode: data already cached, skipping reload`)
+        return 0 // Already loaded in this dev session
+      }
+    }
+  } catch (_) {
+    // Proceed normally if the check fails
+  }
+  
   try {
     await initRedis()
     const client = getClient()
@@ -181,7 +215,7 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
     let realDataCount = 0
     let syntheticCount = 0
 
-    console.log(`[v0] [MarketData] Loading 1s market data for ${targetSymbols.length} symbols (1-day window)...`)
+    console.log(`[v0] [MarketData] Loading 1s market data for ${targetSymbols.length} symbols (1-day window, parallel)...`)
     console.log(`[v0] [MarketData] Will try to fetch REAL 1s intervals from exchanges first...`)
 
     // ── Window: 1 day at 1s timeframe (spec §7) ─────────────────────
@@ -191,7 +225,15 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
     // best-effort coverage from recent-trades aggregation.
     const ONE_DAY_SECONDS = 86_400
 
-    for (const symbol of targetSymbols) {
+    // ── Per-symbol cold-boot loader ─────────────────────────────────
+    // Each symbol's fetch + 4 Redis writes (set candles, expire,
+    // set 1s blob, expire, hmset latest, expire) is fully independent.
+    // We bound concurrency to avoid hammering exchange APIs with
+    // 15+ simultaneous REST calls — pick the lower of the symbol
+    // count and 6 (conservative under public rate limits).
+    const SYMBOL_CONCURRENCY = Math.max(1, Math.min(targetSymbols.length, 6))
+    let nextIdx = 0
+    const loadOne = async (symbol: string): Promise<void> => {
       try {
         // Try to fetch real 1s data first.
         const realData = await fetchRealMarketData(symbol, "1s", ONE_DAY_SECONDS)
@@ -226,16 +268,21 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
         // Authoritative key under the new :1s suffix.
         const key = `market_data:${symbol}:1s`
         const jsonData = JSON.stringify(marketData)
-        await client.set(key, jsonData)
-        await client.expire(key, 86400) // 24 hour TTL
 
         // Store raw candles array for indication processor historical access.
         const candlesKey = `market_data:${symbol}:candles`
-        await client.set(candlesKey, JSON.stringify(candles))
-        await client.expire(candlesKey, 86400)
 
         // Also write latest bucket to hash format so getMarketData() works.
         const latestCandle = candles[candles.length - 1]
+
+        // Fire every Redis write for this symbol in one parallel
+        // batch — previously these were six chained awaits.
+        const writes: Promise<unknown>[] = [
+          client.set(key, jsonData),
+          client.expire(key, 86400),
+          client.set(candlesKey, JSON.stringify(candles)),
+          client.expire(candlesKey, 86400),
+        ]
         if (latestCandle) {
           const hashKey = `market_data:${symbol}`
           const flatHash: Record<string, string> = {
@@ -258,19 +305,34 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
           for (const [k, v] of Object.entries(flatHash)) {
             flatArgs.push(k, v)
           }
-          await client.hmset(hashKey, ...flatArgs)
-          await client.expire(hashKey, 86400)
+          writes.push(client.hmset(hashKey, ...flatArgs))
+          writes.push(client.expire(hashKey, 86400))
 
           const priceStr = latestCandle.close.toFixed(2)
           const sourceLabel = source === "synthetic" ? "(synthetic)" : `(real: ${source})`
           console.log(`[v0] [MarketData] ✓ ${symbol}: $${priceStr} ${sourceLabel} (${candles.length} intervals)`)
         }
+        await Promise.all(writes)
 
         loaded++
       } catch (error) {
         console.error(`[v0] [MarketData] Failed to load ${symbol}:`, error)
       }
     }
+
+    // Bounded worker pool — same pattern as engine-manager's
+    // `mapWithConcurrency` (kept local here to avoid circular imports).
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const i = nextIdx++
+        if (i >= targetSymbols.length) return
+        await loadOne(targetSymbols[i])
+      }
+    }
+    const workers: Promise<void>[] = []
+    const pool = Math.min(SYMBOL_CONCURRENCY, targetSymbols.length)
+    for (let w = 0; w < pool; w++) workers.push(worker())
+    await Promise.all(workers)
 
     console.log(`[v0] [MarketData] ✅ Loaded ${loaded}/${targetSymbols.length} symbols`)
     console.log(`[v0] [MarketData]    Real data: ${realDataCount} | Synthetic: ${syntheticCount}`)
@@ -279,6 +341,9 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
     console.error("[v0] [MarketData] Failed to load market data:", error)
     return 0
   }
+  })()
+  __loadFlight.finally(() => { __loadFlight = null })
+  return __loadFlight
 }
 
 /**

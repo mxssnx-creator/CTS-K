@@ -465,9 +465,9 @@ const migrations: Migration[] = [
     up: async (client: any) => {
       await client.set("_schema_version", "15")
       
-      // The 2 base exchanges that should be marked as INSERTED and ENABLED
-      // Main connections are ONLY bybit and bingx
-      const baseExchangeIds = ["bybit-x03", "bingx-x01"]
+      // The base exchange that should be marked as INSERTED and ENABLED.
+      // Bybit (bybit-x03) is no longer a canonical base connection — only bingx-x01.
+      const baseExchangeIds = ["bingx-x01"]
       
       const connections = await client.smembers("connections")
       let updatedBase = 0
@@ -519,10 +519,10 @@ const migrations: Migration[] = [
     up: async (client: any) => {
       await client.set("_schema_version", "16")
       
-// Migration 016: Ensure the 2 base connections are properly set up with predefined real credentials
-       // Base connections: bybit, bingx only - should be INSERTED and ENABLED
-       // NOTE: is_active_inserted is NOT set here - user must explicitly assign to main via dashboard
-       const baseTemplateIds = ["bybit-x03", "bingx-x01"]
+// Migration 016: Ensure canonical base connections are properly set up with predefined real credentials.
+       // Bybit (bybit-x03) is no longer canonical — only bingx-x01 is auto-seeded.
+       // NOTE: is_active_inserted is NOT set here - user must explicitly assign to main via dashboard.
+       const baseTemplateIds = ["bingx-x01"]
        
        const connections = await client.smembers("connections") || []
        let updatedTemplates = 0
@@ -588,9 +588,9 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "17")
       
       // Cleanup migration: Reset all connections to proper state
-      // Only bybit-x03 and bingx-x01 should be base connections (inserted=1, enabled=1)
+      // Only bingx-x01 should be a base connection (inserted=1, enabled=1)
       // All others (pionex, orangex, binance, etc) should be templates only (inserted=0, enabled=0)
-      const baseExchangeIds = ["bybit-x03", "bingx-x01"]
+      const baseExchangeIds = ["bingx-x01"]
       
       const connections = await client.smembers("connections")
       let cleanedBase = 0
@@ -674,6 +674,21 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "17")
+    },
+  },
+  {
+    // Version 19 was intentionally skipped during a refactor cycle — this tombstone
+    // prevents the gap from causing confusion if a v19 migration is ever introduced
+    // later, and ensures any system that somehow stored "_schema_version"="19" in
+    // Redis is still advanced to v20 on the next startup.
+    name: "019-tombstone-skipped-version",
+    version: 19,
+    up: async (client: any) => {
+      await client.set("_schema_version", "19")
+      console.log("[v0] Migration 019: tombstone — version 19 was intentionally skipped")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "18")
     },
   },
   {
@@ -777,12 +792,12 @@ const migrations: Migration[] = [
       // getAssignedAndEnabledConnections() requires is_enabled/is_enabled_dashboard.
       //
       // This migration re-enables dashboard activation for autoActive base
-      // connections (bybit-x03, bingx-x01) that already have API credentials
+      // connections (bingx-x01) that already have API credentials
       // stored. It runs AFTER the cleanup migrations so it is not overridden.
       //
       // A connection is considered credential-ready if it has a non-empty
       // api_key stored in its connection hash OR in its credentials hash.
-      const AUTO_ACTIVE_IDS = ["bybit-x03", "bingx-x01"]
+      const AUTO_ACTIVE_IDS = ["bingx-x01"]
       let fixed = 0
 
       for (const connId of AUTO_ACTIVE_IDS) {
@@ -829,9 +844,179 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "20")
-      for (const connId of ["bybit-x03", "bingx-x01"]) {
+      for (const connId of ["bingx-x01"]) {
         await client.hset(`connection:${connId}`, { is_enabled_dashboard: "0", is_active: "0" })
       }
+    },
+  },
+  {
+    name: "022-comprehensive-data-structure-consistency",
+    version: 22,
+    up: async (client: any) => {
+      await client.set("_schema_version", "22")
+      
+      // Comprehensive data structure validation and repair migration
+      // Ensures all required keys, indexes, and data structures are present
+      
+      console.log(`[v0] Migration 022: Starting comprehensive data structure validation...`)
+      
+      let fixed = 0
+      let validated = 0
+      
+      // ── 1. Validate and fix strategy progression keys ─────────────
+      const connections = await client.smembers("connections:main:enabled") || []
+      
+      for (const connId of connections) {
+        try {
+          // Ensure progression container exists for each connection
+          const keysPrefix = `strategies:${connId}`
+          const indices = [
+            { key: `${keysPrefix}:indices`, description: "Connection indices" },
+            { key: `strategy_count:${connId}`, description: "Total strategy count" },
+            { key: `real_pi_acc:${connId}`, description: "Real position accumulation" },
+            { key: `axis_pos_acc:${connId}`, description: "Axis position accumulation" },
+          ]
+          
+          for (const { key, description } of indices) {
+            const exists = await client.exists(key)
+            if (!exists) {
+              // Initialize with empty marker
+              await client.hset(key, "_initialized", "1")
+              fixed++
+              console.log(`[v0] Migration 022: Created ${description} key: ${key}`)
+            }
+            validated++
+          }
+          
+          // Ensure progression metadata exists
+          const progMetadata = `progression:${connId}:metadata`
+          const metaExists = await client.exists(progMetadata)
+          if (!metaExists) {
+            await client.hset(progMetadata, {
+              created_at: new Date().toISOString(),
+              last_cycle: new Date().toISOString(),
+              total_base_created: "0",
+              total_main_created: "0",
+              total_real_created: "0",
+              total_live_created: "0",
+            })
+            fixed++
+            console.log(`[v0] Migration 022: Created progression metadata for ${connId}`)
+          }
+          validated++
+          
+          // Ensure per-symbol tracking sets exist
+          const symbols = await client.smembers(`${keysPrefix}:symbols`) || []
+          for (const symbol of symbols) {
+            const symbolSets = [
+              `${keysPrefix}:${symbol}:base:sets`,
+              `${keysPrefix}:${symbol}:main:sets`,
+              `${keysPrefix}:${symbol}:real:sets`,
+              `${keysPrefix}:${symbol}:live:sets`,
+            ]
+            
+            for (const setKey of symbolSets) {
+              const isSet = await client.type(setKey)
+              if (isSet === "none") {
+                // Initialize as empty set with marker
+                await client.sadd(setKey, "_init")
+                await client.srem(setKey, "_init")
+                fixed++
+                console.log(`[v0] Migration 022: Initialized set key: ${setKey}`)
+              }
+              validated++
+            }
+          }
+        } catch (err) {
+          console.warn(`[v0] Migration 022: Error validating connection ${connId}:`, err)
+        }
+      }
+      
+      // ── 2. Validate position history structures ──────────────────
+      try {
+        const historyKeys = await client.keys("pi_history:*")
+        console.log(`[v0] Migration 022: Found ${historyKeys.length} position history keys`)
+        validated += historyKeys.length
+        
+        // Each position history hash should have standard fields
+        for (const key of historyKeys) {
+          const data = await client.hgetall(key)
+          const requiredFields = ["count", "wins", "losses", "pf_num_x1000", "pf_den_x1000", "ddt_num_x10"]
+          const hasAllFields = requiredFields.every(f => f in data || data[f] !== undefined)
+          
+          if (!hasAllFields) {
+            // Repair by ensuring all fields exist
+            const updates: Record<string, string> = {}
+            for (const field of requiredFields) {
+              if (!(field in data)) {
+                updates[field] = "0"
+              }
+            }
+            if (Object.keys(updates).length > 0) {
+              await client.hset(key, updates)
+              fixed++
+              console.log(`[v0] Migration 022: Repaired position history key: ${key}`)
+            }
+          }
+          validated++
+        }
+      } catch (err) {
+        console.warn(`[v0] Migration 022: Error validating position history:`, err)
+      }
+      
+      // ── 3. Validate axis position accumulation ledgers ──────────
+      try {
+        const axisKeys = await client.keys("axis_pos_acc:*")
+        console.log(`[v0] Migration 022: Found ${axisKeys.length} axis position accumulation keys`)
+        validated += axisKeys.length
+        
+        // Axis ledgers should have accumulation data
+        for (const key of axisKeys) {
+          const exists = await client.exists(key)
+          if (exists) {
+            // Check TTL is set (90 days)
+            const ttl = await client.ttl(key)
+            if (ttl === -1) {
+              // No expiry set, add it
+              await client.expire(key, 90 * 24 * 60 * 60)
+              fixed++
+              console.log(`[v0] Migration 022: Set expiry on axis ledger: ${key}`)
+            }
+          }
+          validated++
+        }
+      } catch (err) {
+        console.warn(`[v0] Migration 022: Error validating axis accumulation:`, err)
+      }
+      
+      // ── 4. Validate hedge bucket structures ─────────────────────
+      try {
+        const hedgeKeys = await client.keys("live_net_target:*")
+        console.log(`[v0] Migration 022: Found ${hedgeKeys.length} hedge net target keys`)
+        validated += hedgeKeys.length
+        
+        // Each should contain direction:remainder pairs
+        for (const key of hedgeKeys) {
+          const value = await client.get(key)
+          if (!value || !value.includes(":")) {
+            // Repair with neutral default
+            await client.set(key, "flat:0")
+            fixed++
+            console.log(`[v0] Migration 022: Repaired hedge target: ${key}`)
+          }
+          validated++
+        }
+      } catch (err) {
+        console.warn(`[v0] Migration 022: Error validating hedge structures:`, err)
+      }
+      
+      console.log(`[v0] Migration 022: COMPLETE`)
+      console.log(`  - Fixed: ${fixed} keys/structures`)
+      console.log(`  - Validated: ${validated} keys`)
+      console.log(`[v0] Migration 022: Data structure consistency check finished`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "21")
     },
   },
 ]
@@ -851,7 +1036,6 @@ const BASE_CONNECTION_CONFIG: Array<{
   // dashboard toggle) is preserved by the existing `(existing?.is_*) || …`
   // fallback chain in `ensureBaseConnections` below — autoActive only
   // affects the initial-create defaults, never overwrites prior state.
-  { id: "bybit-x03", name: "Bybit Base", exchange: "bybit", credentialId: "bybit-x03", autoActive: true },
   { id: "bingx-x01", name: "BingX Base", exchange: "bingx", credentialId: "bingx-x01", autoActive: true },
   { id: "pionex-x01", name: "Pionex Base", exchange: "pionex", credentialId: "pionex-x01", autoActive: false },
   { id: "orangex-x01", name: "OrangeX Base", exchange: "orangex", credentialId: "orangex-x01", autoActive: false },
@@ -861,7 +1045,10 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   let createdOrUpdated = 0
   let credentialsInjected = 0
 
-  const legacyIds = ["bybit-base", "bingx-base", "binance-base", "okx-base", "bybit-default-disabled", "bingx-default-disabled"]
+  // bybit-x03 is included here: it was previously a canonical base connection but is no
+  // longer auto-seeded. Any row in Redis left over from an older schema version must be
+  // cleaned up so it does not appear as a ghost connection in the dashboard.
+  const legacyIds = ["bybit-base", "bingx-base", "binance-base", "okx-base", "bybit-default-disabled", "bingx-default-disabled", "bybit-x03"]
   for (const legacyId of legacyIds) {
     const exists = await client.sismember("connections", legacyId)
     if (exists) {
@@ -914,7 +1101,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     //
     // Root cause: previous version unconditionally set
     //   is_active_inserted: cfg.autoActive ? "1" : ...
-    // for autoActive base connections (bybit-x03, bingx-x01). Every
+    // for autoActive base connections (bingx-x01). Every
     // cold-start (or any code path that calls `initRedis` followed by
     // `runMigrations` — which is essentially every Vercel function
     // invocation) re-flipped the flag back to "1", undoing the
@@ -1010,7 +1197,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     if (didChange) createdOrUpdated++
   }
 
-  // ── Bootstrap the global engine status ────────────────────────────
+  // ── Bootstrap / re-assert the global engine status ────────────────
   // The auto-start monitor in `lib/trade-engine-auto-start.ts` only
   // attempts to start missing connection engines when
   // `trade_engine:global.status === "running"`. On a brand-new DB this
@@ -1019,34 +1206,69 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   // in the UI. That is exactly the symptom reported in production:
   // "Low Counts, Low DB Activity, No really processings".
   //
-  // We bootstrap the hash to `running` ONLY when:
+  // We bootstrap the hash to `running` when:
   //   - at least one autoActive base connection is configured, AND
-  //   - the hash is currently empty OR carries no `status` field.
+  //   - EITHER the hash is empty / has no `status`,
+  //     OR the `operator_stopped` flag is NOT explicitly set to "1"
+  //       (i.e. the operator never pressed "Stop" via the dashboard).
   //
-  // We never overwrite an existing `status` (incl. `stopped`,
-  // `paused`, `error`) — those represent explicit operator state and
-  // must be preserved across reloads. This keeps the user's "Stop"
-  // button authoritative while solving the cold-boot dead-on-arrival
-  // problem.
+  // The `operator_stopped` flag is written by `POST /api/trade-engine/stop`
+  // when the user explicitly halts processing. Until that flag is set,
+  // the system self-heals back to `running` on every boot — solving the
+  // "engine never restarts after redeploy / snapshot restore" symptom
+  // while still respecting an explicit operator stop.
   const hasAutoActive = BASE_CONNECTION_CONFIG.some((c) => c.autoActive)
   if (hasAutoActive) {
     try {
-      const globalState = await client.hgetall("trade_engine:global")
-      const hasStatus =
-        globalState && typeof (globalState as any).status === "string" &&
-        (globalState as any).status.length > 0
-      if (!hasStatus) {
+      const globalState = (await client.hgetall("trade_engine:global")) as Record<string, string> | null
+      const currentStatus =
+        globalState && typeof globalState.status === "string" ? globalState.status : ""
+      const operatorStopped = globalState?.operator_stopped === "1" || globalState?.operator_stopped === "true"
+
+      // Three cases we want to bootstrap to "running":
+      //   (1) Hash is empty / no status field         → cold boot
+      //   (2) Status === "stopped" but not operator-stopped → crashed/redeploy
+      //   (3) Status === "" / "idle" / "error"        → recovery
+      //
+      // We DO honour:
+      //   - operator_stopped === "1"  → leave status as-is
+      //   - currentStatus === "paused" → leave (explicit pause)
+      const needsBootstrap =
+        !currentStatus ||
+        (currentStatus !== "running" && currentStatus !== "paused" && !operatorStopped)
+
+      if (needsBootstrap) {
         const nowIso = new Date().toISOString()
-        await client.hset("trade_engine:global", {
+        const updates: Record<string, string> = {
           status: "running",
           started_at: nowIso,
           bootstrapped_at: nowIso,
           bootstrapped_by: "ensureBaseConnections",
-        })
+        }
+        // Clear any stale stopped_at / error fields so the dashboard
+        // doesn't display contradictory info ("running, stopped 12s ago").
+        if (globalState?.stopped_at) updates.stopped_at = ""
+        if (globalState?.error_message) updates.error_message = ""
+        await client.hset("trade_engine:global", updates)
+        const reason = !currentStatus
+          ? "cold-boot"
+          : currentStatus === "stopped"
+          ? "post-redeploy resurrect"
+          : `recover from ${currentStatus}`
         console.log(
           `[v0] [Migrations] Bootstrapped trade_engine:global status=running ` +
-          `(autoActive base connections detected)`,
+            `(${reason}; autoActive base connection detected)`,
         )
+      } else if (operatorStopped) {
+        // Quiet diagnostic — operator-stopped is the expected sticky
+        // state after explicit halt; log once per process to confirm
+        // we honoured the flag.
+        if (!ensureBootstrapDiag.has("operator_stopped")) {
+          ensureBootstrapDiag.add("operator_stopped")
+          console.log(
+            `[v0] [Migrations] Honouring operator_stopped flag — engine remains ${currentStatus || "stopped"}`,
+          )
+        }
       }
     } catch (err) {
       // Non-critical: the auto-start monitor will retry on the next
@@ -1061,21 +1283,26 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   return { createdOrUpdated, credentialsInjected }
 }
 
+// Per-process set of one-shot diagnostic messages already emitted by
+// `ensureBaseConnections`. Avoids log spam when migrations run on every
+// HTTP request due to module reload (HMR / cold-warm).
+const ensureBootstrapDiag = new Set<string>()
+
 /**
  * Run all pending migrations
  */
 export async function runMigrations(): Promise<{ success: boolean; message: string; version: number }> {
+  // If a run is already in-flight (or completed), return the same promise so
+  // concurrent callers coalesce onto a single execution and never re-enter
+  // runMigrationsInternal(). The promise is intentionally kept after resolution —
+  // clearing it in `finally` caused a race where a second caller that had just
+  // started awaiting would see null and immediately start a second migration run.
   if (migrationRunPromise) {
     return migrationRunPromise
   }
 
   migrationRunPromise = runMigrationsInternal()
-
-  try {
-    return await migrationRunPromise
-  } finally {
-    migrationRunPromise = null
-  }
+  return migrationRunPromise
 }
 
 async function runMigrationsInternal(): Promise<{ success: boolean; message: string; version: number }> {
@@ -1093,7 +1320,15 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
       }
 
       const ensured = await ensureBaseConnections(client)
-      console.log(`[v0] [Migrations] ✓ Already executed in this process; base ensured=${ensured.createdOrUpdated}, credentialsInjected=${ensured.credentialsInjected}`)
+      // Only log when something actually changed; otherwise the "ensured=0,
+      // credentialsInjected=0" line spams every HTTP request because the
+      // migration loader runs on every module reload (HMR / cold-warm).
+      if (ensured.createdOrUpdated > 0 || ensured.credentialsInjected > 0) {
+        console.log(
+          `[v0] [Migrations] ✓ Already executed in this process; ` +
+            `base ensured=${ensured.createdOrUpdated}, credentialsInjected=${ensured.credentialsInjected}`,
+        )
+      }
       return { success: true, message: "Already run in this process", version: finalVer }
     }
 
@@ -1115,10 +1350,21 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
     const pendingMigrations = migrations.filter((m) => m.version > currentVersion)
     
     if (pendingMigrations.length === 0) {
-      console.log(`[v0] [Migrations] Already at latest version ${finalVersion}`)
+      // Suppress the "already at latest" line after the first occurrence
+      // in this process — it fires on every module reload and contributes
+      // most of the log noise during normal operation.
+      if (!ensureBootstrapDiag.has("already_latest")) {
+        ensureBootstrapDiag.add("already_latest")
+        console.log(`[v0] [Migrations] Already at latest version ${finalVersion}`)
+      }
       const ensured = await ensureBaseConnections(client)
-      console.log(`[v0] [Migrations] ✓ Ensured ${ensured.createdOrUpdated} base connections; injected credentials for ${ensured.credentialsInjected}`)
-      
+      // Only log when something actually changed (see same-pattern note above).
+      if (ensured.createdOrUpdated > 0 || ensured.credentialsInjected > 0) {
+        console.log(
+          `[v0] [Migrations] ✓ Ensured ${ensured.createdOrUpdated} base connections; ` +
+            `injected credentials for ${ensured.credentialsInjected}`,
+        )
+      }
        await setMigrationsRun(true)
       return { success: true, message: `Already at latest version ${finalVersion}`, version: finalVersion }
     }

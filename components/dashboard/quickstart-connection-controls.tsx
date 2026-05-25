@@ -47,7 +47,7 @@ import {
 } from "@/components/ui/popover"
 import {
   Plug, Plus, Trash2, Loader2, AlertCircle, CheckCircle2,
-  Circle as CircleIcon,
+  Circle as CircleIcon, RefreshCw,
 } from "lucide-react"
 import {
   isBaseConnection, isConnectionEnabled,
@@ -90,6 +90,10 @@ export function QuickstartConnectionControls() {
   const [adding, setAdding] = useState<string | null>(null)
   const [resetting, setResetting] = useState(false)
   const [resetResult, setResetResult] = useState<
+    { ok: boolean; message: string } | null
+  >(null)
+  const [reconnecting, setReconnecting] = useState(false)
+  const [reconnectResult, setReconnectResult] = useState<
     { ok: boolean; message: string } | null
   >(null)
   const [popoverOpen, setPopoverOpen] = useState(false)
@@ -169,7 +173,7 @@ export function QuickstartConnectionControls() {
   const handleSelect = useCallback(
     (connectionId: string) => {
       // Single-select: clicking a row replaces the current selection.
-      // No-op if the same row is clicked twice — we don't want to
+      // No-op if the same row is clicked twice ��� we don't want to
       // accidentally clear the selection (other dashboard panels expect
       // a non-null connection while the engine is running).
       if (!connectionId || connectionId === selectedConnectionId) {
@@ -266,6 +270,44 @@ export function QuickstartConnectionControls() {
       setTimeout(() => setResetResult(null), 6000)
     }
   }, [resetting, loadConnections])
+
+  const handleReconnect = useCallback(async () => {
+    if (reconnecting) return
+    setReconnecting(true)
+    setReconnectResult(null)
+    try {
+      const body: Record<string, string> = {}
+      if (selectedConnectionId) body.connectionId = selectedConnectionId
+      const res = await fetch("/api/engine/reconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data?.success === false) {
+        setReconnectResult({
+          ok: false,
+          message: data?.error || data?.details || `Reconnect failed (HTTP ${res.status})`,
+        })
+      } else {
+        setReconnectResult({
+          ok: true,
+          message: data?.message || "Reconnected",
+        })
+        window.dispatchEvent(new CustomEvent("connections:refresh"))
+        window.dispatchEvent(new CustomEvent("quickstart:refresh"))
+        window.dispatchEvent(new CustomEvent("progressions:refresh"))
+      }
+    } catch (err) {
+      setReconnectResult({
+        ok: false,
+        message: err instanceof Error ? err.message : "Reconnect failed",
+      })
+    } finally {
+      setReconnecting(false)
+      setTimeout(() => setReconnectResult(null), 6000)
+    }
+  }, [reconnecting, selectedConnectionId])
 
   // ── render ─────────────────────────────────────────────────────────────
   return (
@@ -505,7 +547,41 @@ export function QuickstartConnectionControls() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* ── Inline result chip — auto-dismisses after 6s ─────────────── */}
+      {/* ── Reconnect / re-arm engine ─────────────────────────────────── */}
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={reconnecting}
+        onClick={handleReconnect}
+        className="h-7 text-[11px] px-2 gap-1.5"
+        title="Clear cooldowns, heal flags, restart stopped engines, and re-arm the global coordinator."
+      >
+        {reconnecting ? (
+          <Loader2 className="w-3 h-3 animate-spin" />
+        ) : (
+          <RefreshCw className="w-3 h-3" />
+        )}
+        Reconnect
+      </Button>
+
+      {/* ── Inline result chips — auto-dismiss after 6s ───────────────── */}
+      {reconnectResult && (
+        <span
+          className={`flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded ${
+            reconnectResult.ok
+              ? "bg-green-100 dark:bg-green-950/30 text-green-700 dark:text-green-400"
+              : "bg-red-100 dark:bg-red-950/30 text-red-700 dark:text-red-400"
+          }`}
+          role="status"
+        >
+          {reconnectResult.ok ? (
+            <CheckCircle2 className="w-3 h-3" />
+          ) : (
+            <AlertCircle className="w-3 h-3" />
+          )}
+          {reconnectResult.message}
+        </span>
+      )}
       {resetResult && (
         <span
           className={`flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded ${

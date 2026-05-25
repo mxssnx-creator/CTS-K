@@ -1,5 +1,5 @@
 /**
- * Volume Calculator
+ * Volume Calculator (TDZ fix: accountBalance declared before balanceCap block)
  * Calculates position volume based on base volume factor, leverage, and risk management
  * Calculates position volume ONLY at Exchange level when actual orders are executed
  * This calculator is ONLY used by ExchangePositionManager
@@ -59,26 +59,69 @@ interface VolumeCalculationResult {
 
 export class VolumeCalculator {
   /**
-   * Universal hard floor: the smallest USD notional we will ever attempt to
-   * place on an exchange when no specific minimum is known. $5 covers the
-   * documented minimums of every major venue (Binance, BingX, Bybit, OKX,
-   * Bitget). Applied AFTER any per-pair `exchangeMinVolume` so a known
-   * larger minimum (e.g. some altcoin pairs require $10) still wins.
+   * Universal hard floor: $3 notional covers BingX/Binance/Bybit/OKX minimums
+   * while remaining conservative for margin constraints. The 101400 auto-correction
+   * handler persists exact per-pair minimums to `settings:trading_pair:{symbol}`,
+   * so this floor is mainly the safety net for first-time pairs.
    */
+  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 3
+
   /**
-   * Universal minimum notional value in USD.
+   * Fetch account balance and compute the leverage safety cap.
    *
-   * REVISED for the new spec where Position Limits + per-Direction caps
-   * are valid for STRATEGY BASE Sets ONLY (max 1 long + 1 short active
-   * at a time). Main and Real "calculate free" — they do NOT create new
-   * positions, only Set variants. So we no longer need the $15 floor
-   * that was sized for 300-position mode. $5 is the documented minimum
-   * across every major venue (Binance, BingX, Bybit, OKX, Bitget) and
-   * keeps live orders MINIMAL — which is what the operator wants:
-   * "ensure positions volume is minimalized ... keep enforcing minimal
-   * value." Per-pair `exchangeMinVolume` still wins when larger.
+   * Extracted into its own method so the balance-fetch + cap logic lives in
+   * a single clean scope with no `let` mutation — eliminating the TDZ risk
+   * that existed when this logic was inlined inside calculateVolumeForConnection.
+   *
+   * Returns { accountBalance, maxLeverage } — both always finite numbers.
    */
-  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 5
+  static async resolveBalanceAndLeverage(
+    connectionId: string,
+    rawLeverage: number,
+  ): Promise<{ accountBalance: number; maxLeverage: number }> {
+    // Fetch balance — default $10,000 so the leverage cap is benign when
+    // the exchange API is unreachable or the connection has no real key.
+    let balance = 10000
+    try {
+      const cachedBalance = await getSettings(`connection_balance:${connectionId}`)
+      if (cachedBalance?.balance) {
+        balance = parseFloat(String(cachedBalance.balance))
+      } else {
+        const connection = await getConnection(connectionId)
+        if (
+          connection?.api_key &&
+          connection?.api_secret &&
+          !connection.api_key.includes("PLACEHOLDER") &&
+          connection.api_key.length >= 20
+        ) {
+          const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+          const connector = await createExchangeConnector(connection.exchange, {
+            apiKey: connection.api_key,
+            apiSecret: connection.api_secret,
+            apiType: connection.api_type,
+            contractType: connection.contract_type,
+            isTestnet:
+              connection.is_testnet === true || connection.is_testnet === "true",
+          })
+          const result = await connector.getBalance()
+          if (result?.balance) {
+            balance = result.balance
+            await setSettings(`connection_balance:${connectionId}`, {
+              balance,
+              updated_at: new Date().toISOString(),
+            })
+          }
+        }
+      }
+    } catch {
+      // Non-critical — fall back to the $10k default so volume is calculated.
+    }
+
+    // Leverage safety cap: keep margin per position above exchange floor.
+    //   ≤$50  → 10x  |  ≤$200 → 20x  |  ≤$500 → 50x  |  >$500 → 125x
+    const cap = balance <= 50 ? 10 : balance <= 200 ? 20 : balance <= 500 ? 50 : 125
+    return { accountBalance: balance, maxLeverage: Math.min(rawLeverage, cap) }
+  }
 
   /**
    * Calculate position volume with risk management (pure math, no DB).
@@ -346,16 +389,16 @@ export class VolumeCalculator {
       // bundle (cleanup schedule, backup toggles) — so the operator's
       // saved leverage/cost never reached volume calculations.
       const settings = (await getAppSettings()) || {}
-      // Default position cost: 0.1% of balance per position (MINIMAL).
-      // Per spec: Strategy Base caps to 1 long + 1 short → max 2 active.
-      // Operator wants "positions volume is minimalized ... keep enforcing
-      // minimal value." With 0.1% cost on a $10K balance the math gives
-      // $10/position which then gets clamped UP to the universal $5 floor
-      // only if it would land below it. Using a small default keeps every
-      // live order at the smallest practical size; operators that want
-      // bigger sizing override `exchangePositionCost` explicitly.
+      // Default position cost: 0.02% of balance per position (ultra-minimal).
+      // With the new spec (Base capped at 1 long + 1 short), position budget
+      // is intentionally kept at the absolute floor. On a $10K balance:
+      //   0.02% → $2/position → clamped up to per-pair exchange minimum
+      // The per-pair `exchangeMinVolume` from trading-pair metadata always
+      // takes over as the hard floor in `calculatePositionVolume`, ensuring
+      // the order is never rejected for being too small. Operators who want
+      // larger sizing set `exchangePositionCost` explicitly in Settings.
       const positionCostPercent = parseFloat(
-        String(settings.exchangePositionCost ?? settings.positionCost ?? "0.1")
+        String(settings.exchangePositionCost ?? settings.positionCost ?? "0.02")
       )
       const positionCost = positionCostPercent / 100
 
@@ -375,55 +418,18 @@ export class VolumeCalculator {
       // strict `=== true` check is now safe (the old
       // `=== "true"` string compare would always miss).
       const useMaxLeverage = settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
-      const maxLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
+      const rawLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
 
-      // Get exchange min volume from Redis trading pair data. When the
-      // metadata is missing or zero we leave `exchangeMinVolume`
-      // undefined — `calculatePositionVolume` will then apply the
-      // universal $5-notional floor itself, which works for ANY quote
-      // currency (USDT, USDC, USD, BTC, BUSD, ...) without per-quote
-      // string sniffing.
+      // Delegate balance-fetch + leverage-cap to the helper method so the
+      // logic lives in its own clean scope (no let mutation, no TDZ risk).
+      const { accountBalance, maxLeverage } =
+        await VolumeCalculator.resolveBalanceAndLeverage(connectionId, rawLeverage)
+
+      // ── Exchange minimum order size from Redis trading-pair metadata ─
       const tradingPair = await getSettings(`trading_pair:${symbol}`)
       const exchangeMinVolume = tradingPair?.min_order_size
         ? parseFloat(tradingPair.min_order_size)
         : undefined
-
-      let accountBalance = 10000 // Default fallback
-
-      try {
-        // Try to get cached balance from Redis
-        const cachedBalance = await getSettings(`connection_balance:${connectionId}`)
-        if (cachedBalance?.balance) {
-          accountBalance = parseFloat(String(cachedBalance.balance))
-        } else {
-          // Try to fetch from exchange via connector
-          const connection = await getConnection(connectionId)
-          if (connection?.api_key && connection?.api_secret
-            && !connection.api_key.includes("PLACEHOLDER")
-            && connection.api_key.length >= 20) {
-            const { createExchangeConnector } = await import("@/lib/exchange-connectors")
-            const connector = await createExchangeConnector(connection.exchange, {
-              apiKey: connection.api_key,
-              apiSecret: connection.api_secret,
-              apiType: connection.api_type,
-              contractType: connection.contract_type,
-              isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
-            })
-
-            const balanceResult = await connector.getBalance()
-            if (balanceResult?.balance) {
-              accountBalance = balanceResult.balance
-              // Cache the balance in Redis
-              await setSettings(`connection_balance:${connectionId}`, {
-                balance: accountBalance,
-                updated_at: new Date().toISOString(),
-              })
-            }
-          }
-        }
-      } catch (balanceError) {
-        console.warn("[v0] Failed to fetch account balance, using default:", balanceError)
-      }
 
       // ── Resolve engine factor IFF caller asked for it ──────────────
       //

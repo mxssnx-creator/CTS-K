@@ -608,7 +608,7 @@ export class PresetTradeEngine {
 
     try {
       // Fetch common indications from API
-      const response = await fetch(`http://localhost:3001/api/settings/indications/common?t=${Date.now()}`, {
+      const response = await fetch(`http://localhost:${process.env.PORT || "3002"}/api/settings/indications/common?t=${Date.now()}`, {
         headers: { "Content-Type": "application/json" },
       })
       

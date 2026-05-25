@@ -2,7 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
 import { updateConnection, initRedis, getConnection } from "@/lib/redis-db"
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
-import { notifySettingsChanged, detectChangedFields } from "@/lib/settings-coordinator"
+import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 
 export async function GET(
   request: NextRequest,
@@ -77,21 +77,12 @@ export async function PUT(
 
     await updateConnection(id, updated)
 
-    // Notify engine of settings change AND fast-path apply so operators
-    // don't have to wait for the next 3 s watcher tick.
-    const changedFields = detectChangedFields(connection, updated)
-    if (changedFields.length > 0) {
-      await notifySettingsChanged(id, changedFields, connection, updated)
-      try {
-        const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
-        await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
-      } catch (applyErr) {
-        console.warn(
-          `[v0] [Settings PUT] applyPendingChangesNow failed for ${id}:`,
-          applyErr instanceof Error ? applyErr.message : String(applyErr),
-        )
-      }
-    }
+    // Full propagation: notify + fast-path apply + recoordinate
+    // (start/stop/hot-reload as the new state dictates). See
+    // lib/connection-recoordinator.ts for the design rationale.
+    await recoordinateAfterSettingsChange(id, connection, updated, {
+      logTag: "PUT /settings",
+    })
 
     await SystemLogger.logConnection(`Updated settings`, id, "info")
 
@@ -135,20 +126,20 @@ export async function PATCH(
 
     await updateConnection(id, updated)
 
-    // Notify engine of settings change AND fast-path apply.
-    const changedFields = Object.keys(settings)
-    if (changedFields.length > 0) {
-      await notifySettingsChanged(id, ["connection_settings"])
-      try {
-        const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
-        await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
-      } catch (applyErr) {
-        console.warn(
-          `[v0] [Settings PATCH] applyPendingChangesNow failed for ${id}:`,
-          applyErr instanceof Error ? applyErr.message : String(applyErr),
-        )
-      }
-    }
+    // Full propagation. PATCH only ships a partial settings payload, so
+    // `detectChangedFields` (which compares top-level connection fields)
+    // would report zero changes — pass an explicit override listing the
+    // settings keys the caller touched, so the recoordinator knows
+    // something inside `connection_settings` actually changed.
+    await recoordinateAfterSettingsChange(
+      id,
+      { ...connection, connection_settings: current },
+      { ...connection, connection_settings: merged, updated_at: updated.updated_at },
+      {
+        logTag: "PATCH /settings",
+        changedFieldsOverride: Object.keys(settings).length > 0 ? ["connection_settings"] : [],
+      },
+    )
 
     await SystemLogger.logConnection(`Patched settings`, id, "info")
 

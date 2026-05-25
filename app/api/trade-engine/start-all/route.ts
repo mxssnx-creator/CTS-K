@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
-import { initRedis, getAllConnections, getSettings } from "@/lib/redis-db"
+import { initRedis, getAllConnections, getSettings, getRedisClient } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 
-export async function GET() {
+async function handleStartAll() {
   try {
     const coordinator = getGlobalTradeEngineCoordinator()
     
@@ -48,13 +48,28 @@ export async function GET() {
     const settings = (await getSettings("trade_engine_settings")) || {}
     const indicationInterval = settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 1
     const strategyInterval = settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1
-    const realtimeInterval = settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.2
+    const realtimeInterval = settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3
 
     const results = []
     let successCount = 0
 
     for (const connection of activeConnections) {
       try {
+        // Reset evaluated counters for fresh start
+        await initRedis()
+        const evalKeys = [
+          `strategies:${connection.id}:base:evaluated`,
+          `strategies:${connection.id}:main:evaluated`,
+          `strategies:${connection.id}:real:evaluated`,
+        ]
+        for (const key of evalKeys) {
+          try {
+            await getRedisClient().del(key)
+          } catch (delErr) {
+            console.warn(`[START-ALL] Failed to delete ${key}:`, delErr)
+          }
+        }
+
         await coordinator.startEngine(connection.id, {
           connectionId: connection.id,
           indicationInterval,
@@ -102,4 +117,12 @@ export async function GET() {
       { status: 500 }
     )
   }
+}
+
+export async function GET() {
+  return handleStartAll()
+}
+
+export async function POST() {
+  return handleStartAll()
 }
