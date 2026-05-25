@@ -141,26 +141,36 @@ function pushStep(position: LivePosition, step: string, ok: boolean, detail: str
  * Persist a LivePosition to Redis.
  *
  * Key layout:
- *   live:position:{id}         — full JSON, TTL 7 days
- *   live:positions:{connId}    — open-index list (lpush + dedup via LREM)
- *   live:closed:{connId}       — closed-archive list (lpush, capped at 2000)
+ *   live:position:{id}              — full JSON, TTL 7 days
+ *   live:positions:{connId}         — open-index List (lpush + dedup via LREM)
+ *   live:closed:{connId}            — closed-archive List (lpush, capped at 2000)
+ *   real:active_positions:{connId}  — SADD Set of Real-stage active position IDs
+ *   real:active_positions:{connId}:meta  — HSET: {positionId} → JSON meta
  *
  * The function is idempotent: repeated calls for the same position ID are
- * safe because the list dedup (LREM → LPUSH) prevents duplicates.
+ * safe because the List dedup (LREM → LPUSH) and SADD prevent duplicates.
+ *
+ * Real-active index invariant:
+ *   A position is in the real:active_positions Set iff:
+ *     - It has a setKey (i.e. it originated from a Real Set), AND
+ *     - Its status is NOT one of: closed | rejected | cancelled | error
+ *   On every savePosition call, membership is adjusted atomically so the
+ *   set never contains stale entries for positions that have been closed.
  */
 async function savePosition(position: LivePosition): Promise<void> {
   if (!position?.id) return
   try {
     const client = getRedisClient()
-    const key   = `live:position:${position.id}`
-    const connId = position.connectionId || position.connection_id || ""
-    const TTL   = 7 * 24 * 60 * 60 // 7 days
+    const key    = `live:position:${position.id}`
+    const connId = position.connectionId || (position as any).connection_id || ""
+    const TTL    = 7 * 24 * 60 * 60 // 7 days
 
     await client.set(key, JSON.stringify(position), { EX: TTL } as any)
 
     if (connId) {
-      const isClosed = position.status === "closed" || position.status === "rejected" || position.status === "cancelled"
-      const openIdx  = `live:positions:${connId}`
+      const isClosed = position.status === "closed" || position.status === "rejected" ||
+                       position.status === "cancelled" || position.status === "error"
+      const openIdx   = `live:positions:${connId}`
       const closedIdx = `live:closed:${connId}`
 
       if (isClosed) {
@@ -177,6 +187,44 @@ async function savePosition(position: LivePosition): Promise<void> {
         // Prevent unbounded list growth — keep at most 500 open entries.
         await client.ltrim(openIdx, 0, 499).catch(() => {})
         await client.expire(openIdx, TTL).catch(() => {})
+      }
+
+      // ── Real-active dedicated index ────────────────────────────────────
+      // A position is "Real-active" when it has a setKey (originated from a
+      // Real Set evaluated by StrategyCoordinator) and is not in a terminal
+      // state. This Set is queried directly by syncWithExchange and
+      // reconcileLivePositions so they can work on the focused subset of
+      // positions that require Set-level coordination, without scanning the
+      // entire open-positions list.
+      const realActiveKey  = `real:active_positions:${connId}`
+      const realActiveMetaKey = `real:active_positions:${connId}:meta`
+      const hasSetKey = !!String(position.setKey || "").trim()
+
+      if (hasSetKey) {
+        if (isClosed) {
+          // Remove from the real-active Set and wipe its meta entry.
+          await Promise.all([
+            client.srem(realActiveKey, position.id).catch(() => {}),
+            client.hdel(realActiveMetaKey, position.id).catch(() => {}),
+          ])
+        } else {
+          // Upsert into the real-active Set + refresh meta hash field.
+          const meta = JSON.stringify({
+            setKey:          String(position.setKey || ""),
+            parentSetKey:    String(position.parentSetKey || ""),
+            symbol:          String(position.symbol || ""),
+            direction:       String(position.direction || ""),
+            pseudoPositionId: String(position.pseudoPositionId || ""),
+            status:          String(position.status || ""),
+            createdAt:       position.createdAt ?? Date.now(),
+          })
+          await Promise.all([
+            client.sadd(realActiveKey, position.id).catch(() => {}),
+            client.hset(realActiveMetaKey, position.id, meta).catch(() => {}),
+            client.expire(realActiveKey, TTL).catch(() => {}),
+            client.expire(realActiveMetaKey, TTL).catch(() => {}),
+          ])
+        }
       }
     }
   } catch (err) {
@@ -1124,7 +1172,7 @@ function priceDrifted(current: number | undefined, desired: number): boolean {
  * decide whether to persist the position).
  */
 
-// ── System-close-only flag, micro-cached ─────────────────────────────
+// ── System-close-only flag, micro-cached ───��─────────────────────────
 //
 // Reconcile fans out across every live position; without this cache
 // each position would HGETALL `app_settings:*` to read one boolean.
@@ -3289,6 +3337,116 @@ export async function getClosedLivePositions(
   }
 }
 
+// ── Real-active position meta type (stored in the meta hash) ─────────────────
+export type RealActivePositionMeta = {
+  setKey:          string
+  parentSetKey:    string
+  symbol:          string
+  direction:       string
+  pseudoPositionId: string
+  status:          string
+  createdAt:       number
+}
+
+/**
+ * Load the dedicated Real-active positions index for a connection.
+ *
+ * This is the fast alternative to `getLivePositions()` for the coordination
+ * paths that only care about Real-stage positions (syncWithExchange,
+ * reconcileLivePositions per-position loop, SL/TP re-arm). It operates
+ * in two Redis round-trips:
+ *
+ *   RTT 1: SMEMBERS real:active_positions:{connId}
+ *     → set of position IDs (typically 1–10 entries, not 500)
+ *
+ *   RTT 2: parallel MGET live:position:{id} for each member
+ *     → full LivePosition JSON for each active Real position
+ *
+ * Stale members (position JSON missing or already terminal) are pruned from
+ * the Set automatically so the index stays tight.
+ *
+ * Returns two things:
+ *   positions — full LivePosition objects for all Real-active positions
+ *   metas     — lightweight meta map (positionId → RealActivePositionMeta)
+ *               for callers that only need symbol/direction/setKey without
+ *               deserializing the full position
+ */
+export async function getRealActivePositions(connectionId: string): Promise<{
+  positions: LivePosition[]
+  metas:     Map<string, RealActivePositionMeta>
+}> {
+  await initRedis()
+  const client = getRedisClient()
+  const empty = { positions: [] as LivePosition[], metas: new Map<string, RealActivePositionMeta>() }
+
+  try {
+    const realActiveKey     = `real:active_positions:${connectionId}`
+    const realActiveMetaKey = `real:active_positions:${connectionId}:meta`
+
+    // RTT 1: get all member IDs from the real-active Set.
+    const ids = ((await client.smembers(realActiveKey).catch(() => [])) || []) as string[]
+    if (ids.length === 0) return empty
+
+    // RTT 2: parallel MGET for full position JSON + all meta hash fields
+    // in one concurrent fan-out window. The meta hash gives us lightweight
+    // symbol/direction/setKey data even if the full JSON fetch fails.
+    const [raws, metaAll] = await Promise.all([
+      Promise.all(ids.map((id) => client.get(`live:position:${id}`).catch(() => null))),
+      client.hgetall(realActiveMetaKey).catch(() => ({})) as Promise<Record<string, string>>,
+    ])
+
+    const positions: LivePosition[] = []
+    const metas = new Map<string, RealActivePositionMeta>()
+    const staleIds: string[] = []
+
+    for (let i = 0; i < ids.length; i++) {
+      const id  = ids[i]
+      const raw = raws[i]
+
+      // Build meta from the hash (fast path — no JSON parse of full position).
+      const rawMeta = metaAll?.[id]
+      if (rawMeta) {
+        try { metas.set(id, JSON.parse(rawMeta as string) as RealActivePositionMeta) } catch { /* ignore */ }
+      }
+
+      if (!raw) {
+        // Position key expired or was never written — prune from index.
+        staleIds.push(id)
+        continue
+      }
+      try {
+        const pos: LivePosition = JSON.parse(raw as string)
+        const terminal = pos.status === "closed" || pos.status === "rejected" ||
+                         pos.status === "cancelled" || pos.status === "error"
+        if (terminal) {
+          // Closed positions that weren't removed on save (e.g. from a
+          // previous savePosition bug) — prune now.
+          staleIds.push(id)
+          continue
+        }
+        positions.push(pos)
+      } catch {
+        staleIds.push(id)
+      }
+    }
+
+    // Async prune stale members — fire-and-forget, never blocks the caller.
+    if (staleIds.length > 0) {
+      void Promise.all(staleIds.map((id) =>
+        Promise.all([
+          client.srem(realActiveKey, id).catch(() => {}),
+          client.hdel(realActiveMetaKey, id).catch(() => {}),
+        ])
+      ))
+    }
+
+    return { positions, metas }
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} getRealActivePositions error:`, err instanceof Error ? err.message : String(err))
+    return empty
+  }
+}
+
 /**
  * Compute aggregate stats across all live positions.
  */
@@ -3543,7 +3701,20 @@ async function orphanCloseExpiredPositions(
   if (MAX_HOLD_TIME_MS <= 0) return
 
   try {
-    const allOpen = await getLivePositions(connectionId)
+    // Use the Real-active index for the max-hold sweep: positions created from
+    // Real Sets are the ones most likely to have long hold times because they
+    // follow a Set-determined entry and need coordinated exit. Non-Real
+    // positions (simulated, adopted orphans) are included via getLivePositions
+    // in the merged list below.
+    const [realActiveResult, allOpenBase] = await Promise.all([
+      getRealActivePositions(connectionId),
+      getLivePositions(connectionId),
+    ])
+    const realActiveIds = new Set<string>(realActiveResult.positions.map((p) => p.id))
+    const allOpen = [
+      ...realActiveResult.positions,
+      ...allOpenBase.filter((p) => !realActiveIds.has(p.id)),
+    ]
     const expired = allOpen.filter((p) => {
       if (p.status !== "open" && p.status !== "filled" && p.status !== "partially_filled") return false
       if ((p.executedQuantity ?? 0) <= 0) return false
@@ -3699,11 +3870,41 @@ export async function reconcileLivePositions(
       return summary
     }
 
-    // Load live-positions index (single Redis round-trip, filtered in-memory)
-    const allOpen = await getLivePositions(connectionId)
-    const openPositions = allOpen.filter(
-      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
+    // ── Load open positions: Real-active index + full open scan ─────────────
+    // The Real-active index (real:active_positions:{connId}) is a compact SADD
+    // Set maintained by savePosition() that contains ONLY the IDs of positions
+    // originating from Real Sets. Loading it first gives us a focused list of
+    // ~1–10 positions that need Set-level reconciliation, without scanning the
+    // full open-positions list (up to 500 entries across all stages).
+    //
+    // We still load the full getLivePositions() list so non-Real positions
+    // (simulated paper-only, adopted orphans, manually-created) also get
+    // reconciled. The two lists are merged with Real-active positions placed
+    // FIRST so the per-position loop prioritises coordination-critical ones.
+    const [realActiveResult, allOpen] = await Promise.all([
+      getRealActivePositions(connectionId),
+      getLivePositions(connectionId),
+    ])
+
+    // Build the Real-active position ID set for O(1) dedup below.
+    const realActiveIds = new Set<string>(realActiveResult.positions.map((p) => p.id))
+
+    // Merge: Real-active first, then all remaining open positions that are not
+    // already in the Real-active set (avoids duplicates in the loop).
+    const openPositionsMerged: LivePosition[] = [
+      ...realActiveResult.positions,
+      ...allOpen.filter(
+        (p) =>
+          !realActiveIds.has(p.id) &&
+          (p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed"),
+      ),
+    ]
+    const openPositions = openPositionsMerged
+
+    console.log(
+      `${LOG_PREFIX} [reconcile] conn=${connectionId} realActive=${realActiveResult.positions.length} totalOpen=${openPositions.length}`,
     )
+
     if (openPositions.length === 0 && !reconcileMode) {
       await orphanCloseExpiredPositions(connectionId, exchangeConnector, summary)
       return summary
@@ -4263,13 +4464,31 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
   }
 
   try {
-    // Previously each status filter triggered a full getLivePositions() scan,
-    // meaning we fetched the same open-positions index from Redis FOUR times
-    // just to bucket by status. Load once, then filter in memory.
-    const allOpen = await getLivePositions(connectionId)
-    const openPositions = allOpen.filter(
-      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
-    )
+    // ── Load open positions: Real-active index first, then full scan ────────
+    // Mirror the reconcileLivePositions load strategy: Real-active positions
+    // (SADD Set, typically 1–10 entries) are loaded via getRealActivePositions
+    // in parallel with the full open-positions scan. Real-active positions are
+    // placed first in the loop so SL/TP re-arming and close-detection happen
+    // on Set-coordinated positions before lower-priority ones.
+    const [realActiveResult_sync, allOpen_base] = await Promise.all([
+      getRealActivePositions(connectionId),
+      getLivePositions(connectionId),
+    ])
+    const realActiveIds_sync = new Set<string>(realActiveResult_sync.positions.map((p) => p.id))
+
+    // Full merged list used for the status-breakdown log (same shape as before).
+    const allOpen = [
+      ...realActiveResult_sync.positions,
+      ...allOpen_base.filter((p) => !realActiveIds_sync.has(p.id)),
+    ]
+    const openPositions = [
+      ...realActiveResult_sync.positions,
+      ...allOpen_base.filter(
+        (p) =>
+          !realActiveIds_sync.has(p.id) &&
+          (p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed"),
+      ),
+    ]
 
     // ── Observability heartbeat ───────────────────────────────────────
     // Previously this function ran silently when there were zero
@@ -5237,4 +5456,5 @@ export default {
   syncLiveFromPseudo,
   getClosedLivePositions,
   processSimulatedPositions,
+  getRealActivePositions,
 }
