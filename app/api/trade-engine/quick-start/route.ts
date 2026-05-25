@@ -750,10 +750,11 @@ export async function POST(request: Request) {
       real: toNumber(await client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0)),
     }
     
-    // Pseudo positions by type
+    // Pseudo positions by type — Real stage counts are active/open validated only (reconciled)
     const basePseudoPositions = await client.scard(`base_pseudo:${connectionId}`).catch(() => 0)
     const mainPseudoPositions = await client.scard(`main_pseudo:${connectionId}`).catch(() => 0)
     const realPseudoPositions = await client.scard(`real_pseudo:${connectionId}`).catch(() => 0)
+    const realPseudoActive = realPseudoPositions
     
     // Live positions (real exchange positions)
     const livePositionsCount = await client.scard(`positions:${connectionId}:live`).catch(() => 0)
@@ -797,22 +798,23 @@ export async function POST(request: Request) {
        strategyCounts,
        strategyEvaluated,
       
-      // Pseudo positions by type
-      pseudoPositions: {
-        base: basePseudoPositions,
-        baseByIndicationType: {
-          direction: await client.scard(`base_pseudo:${connectionId}:direction`).catch(() => 0),
-          move: await client.scard(`base_pseudo:${connectionId}:move`).catch(() => 0),
-          active: await client.scard(`base_pseudo:${connectionId}:active`).catch(() => 0),
-          optimal: await client.scard(`base_pseudo:${connectionId}:optimal`).catch(() => 0),
-        },
-        main: mainPseudoPositions,
-        real: realPseudoPositions,
-        // Cascade pipeline — NOT a sum. `total` is the final-stage (Real) count;
-        // Base/Main pseudos are intermediate filter stages of the SAME underlying
-        // pseudo-positions, so summing would multi-count the same entries.
-        total: realPseudoPositions,
-      },
+       // Pseudo positions by type
+       pseudoPositions: {
+         base: basePseudoPositions,
+         baseByIndicationType: {
+           direction: await client.scard(`base_pseudo:${connectionId}:direction`).catch(() => 0),
+           move: await client.scard(`base_pseudo:${connectionId}:move`).catch(() => 0),
+           active: await client.scard(`base_pseudo:${connectionId}:active`).catch(() => 0),
+           optimal: await client.scard(`base_pseudo:${connectionId}:optimal`).catch(() => 0),
+         },
+         main: mainPseudoPositions,
+         real: realPseudoPositions,
+         realActive: realPseudoActive,
+         realActiveOpenValidated: realPseudoActive,
+         // Cascade pipeline — NOT a sum. `total` and real* reflect only active/open validated Real-stage positions
+         // (closed/invalidated/mirrored ones are removed via reconciliation + closeOrInvalidateRealPseudo).
+         total: realPseudoPositions,
+       },
       
       // Live positions
       livePositions: livePositionsCount,
@@ -826,7 +828,7 @@ export async function POST(request: Request) {
     console.log(`${LOG_PREFIX}: === COMPREHENSIVE STATS ===`)
     console.log(`${LOG_PREFIX}: Symbols: ${symbols.length}, Prehistoric: ${prehistoricSymbols}`)
     console.log(`${LOG_PREFIX}: Indications - Direction: ${directionIndications}, Move: ${moveIndications}, Active: ${activeIndications}, Optimal: ${optimalIndications}`)
-    console.log(`${LOG_PREFIX}: Pseudo Positions - Base: ${basePseudoPositions}, Main: ${mainPseudoPositions}, Real: ${realPseudoPositions}`)
+    console.log(`${LOG_PREFIX}: Pseudo Positions - Base: ${basePseudoPositions}, Main: ${mainPseudoPositions}, Real(active/open validated Stage Real): ${realPseudoPositions}`)
     console.log(`${LOG_PREFIX}: Live Positions: ${livePositionsCount}, Cycle Duration: ${cycleDuration}ms`)
     
     return NextResponse.json({
