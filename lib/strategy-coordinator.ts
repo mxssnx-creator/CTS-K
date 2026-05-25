@@ -1909,28 +1909,29 @@ export class StrategyCoordinator {
       // PF/DDT still apply (just lowered), and normal strictness returns as soon
       // as real history accumulates.
       try {
-        const { isProductionEnvironment, getConnection: getConn } = await import("@/lib/redis-db")
+        const { getConnection: getConn } = await import("@/lib/redis-db")
         const { isTruthyFlag } = await import("@/lib/connection-state-utils")
-        if (isProductionEnvironment()) {
+        try {
           const conn = await getConn(this.connectionId).catch(() => null as any)
           const liveOn = isTruthyFlag(conn?.is_live_trade) || isTruthyFlag(conn?.live_trade_enabled)
           if (liveOn) {
             // Position count relaxation (already present)
             realMinPos = Math.max(1, Math.min(realMinPos, 3))
 
-            // PF bootstrap relaxation — the missing piece that broke "it used to work"
-            // Fresh synthetic Main sets commonly report PF 0.0–0.9. Lower the Real
-            // gate just enough for the first 1-3 cycles after a live quickstart.
+            // PF bootstrap relaxation — lower the Real gate slightly to allow first
+            // cycles to promote sets when live trading is explicitly enabled.
             const originalRealPF = metrics.minProfitFactor
             metrics.minProfitFactor = Math.min(originalRealPF, 0.75)
 
             if (originalRealPF !== metrics.minProfitFactor) {
               console.log(
-                `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (prod + live quickstart): ` +
+                `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (live quickstart): ` +
                 `relaxed minProfitFactor ${originalRealPF} → ${metrics.minProfitFactor} and posCount→${realMinPos} ` +
                 `to allow first Real→Live escalation while history builds.`
               )
             }
+          }
+        } catch { /* non-fatal */ }
           }
         }
       } catch { /* non-fatal */ }
