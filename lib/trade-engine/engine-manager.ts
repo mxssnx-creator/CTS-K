@@ -583,9 +583,10 @@ export class TradeEngineManager {
       // Phase 2: Load prehistoric data (NON-BLOCKING)
       const prehistoricCacheKey = `prehistoric_loaded:${this.connectionId}`
       const redisClient = getRedisClient()
-      const prehistoricCached = await redisClient.get(prehistoricCacheKey)
-      
-      if (prehistoricCached === "1") {
+      let prehistoricCached = await redisClient.get(prehistoricCacheKey)
+      let cacheHit = prehistoricCached === "1"
+
+      if (cacheHit) {
         await this.updateProgressionPhase("prehistoric_data", 15, "Using cached historical data")
         await setSettings(`trade_engine_state:${this.connectionId}`, {
           prehistoric_data_loaded: true,
@@ -633,8 +634,64 @@ export class TradeEngineManager {
             restoreErr instanceof Error ? restoreErr.message : String(restoreErr),
           )
         }
-      } else {
-        // Non-blocking prehistoric loading
+
+        // ── INTENSIVE PRODUCTION SELF-HEAL: VERIFY CACHE INTEGRITY ───────
+        // Auto-start / deploy recovery / monitor paths (production) trust the
+        // 24 h `prehistoric_loaded:{id}` marker and skip the one-time historic
+        // fill (ConfigSetProcessor full-range simulation + first-pass that
+        // creates deep historic position Sets, pos_history, and PF averages).
+        // If prior data was cleared (flush, migration, admin clear) but marker
+        // survived, engine advances to live_trading with empty Sets → "Prehistoric
+        // stuck in production", "Low DB Keys and Activity", "no base PF", "no pos
+        // counting". QuickStart deletes the marker every time (dev works).
+        //
+        // Fix: before trusting cache, verify the done flags + is_complete +
+        // historic PF sample exist. On failure, nuke marker + checkpoints +
+        // partial done flags and force the full background load. This makes
+        // production auto-start as robust as an explicit QuickStart while
+        // preserving the fast path when data is truly present.
+        try {
+          const [doneFlag, firstPass, isComplete, pfSample] = await Promise.all([
+            redisClient.get(`prehistoric:${this.connectionId}:done`),
+            redisClient.get(`prehistoric:${this.connectionId}:firstpass:done`),
+            redisClient.hget(`prehistoric:${this.connectionId}`, "is_complete"),
+            redisClient.hget(`prehistoric:${this.connectionId}`, "historic_avg_profit_factor"),
+          ])
+          const symbolsForCheck = await this.getSymbols()
+          const hasSymbols = symbolsForCheck.length > 0
+          const dataLooksComplete =
+            doneFlag === "1" && firstPass === "1" && isComplete === "1" && (pfSample != null || !hasSymbols)
+          if (!dataLooksComplete) {
+            console.warn(
+              `[v0] [Engine ${this.connectionId}] Stale prehistoric cache marker (done/firstpass/complete/PF missing or empty) — FORCING full prehistoric reload. This fixes production "stuck prehistoric / low keys / no activity" after deploys/migrations.`,
+            )
+            await redisClient.del(prehistoricCacheKey).catch(() => {})
+            // Clear incremental checkpoints so continuous prehistoric progression
+            // will replay the entire configured window instead of thinking it is caught up.
+            await Promise.allSettled(
+              symbolsForCheck.map((s: string) =>
+                redisClient.del(`prehistoric:checkpoint:${this.connectionId}:${s}`).catch(() => {}),
+              ),
+            )
+            // Wipe partial gates so the one-time load writes them cleanly at the end.
+            await Promise.allSettled([
+              redisClient.del(`prehistoric:${this.connectionId}:done`),
+              redisClient.del(`prehistoric:${this.connectionId}:firstpass:done`),
+            ])
+            cacheHit = false
+            prehistoricCached = null
+          }
+        } catch (verifyErr) {
+          console.warn(
+            `[v0] [Engine ${this.connectionId}] Prehistoric cache verification threw (treating as miss to guarantee correctness):`,
+            verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
+          )
+          cacheHit = false
+        }
+      }
+
+      if (!cacheHit) {
+        // Non-blocking prehistoric loading (fresh or forced after stale cache)
         await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
         this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
       }
@@ -647,15 +704,11 @@ export class TradeEngineManager {
       this.isRunning = true
 
       // ── Cache-hit fast path: arm live processors IMMEDIATELY ──────────
-      // When prehistoric data is already cached (prehistoric_loaded:{id}=1),
-      // the `:done` flag is already set and Sets are populated from the
-      // previous session. Waiting for the Prehistoric Progression's first
-      // pass callback would add unnecessary latency — the prehistoric loop
-      // still calls loadMarketDataForEngine() on every cycle, which is a
-      // full Redis scan that can block the realtime processor from starting
-      // for several seconds. Arm the live processors right here so indication
-      // / strategy / realtime cycles begin within the next scheduler tick.
-      const cacheHit = prehistoricCached === "1"
+      // `cacheHit` was computed and verified earlier (production self-heal
+      // checks done flags + is_complete + PF sample). When true, the one-time
+      // historic fill was skipped because data is present; we arm the live
+      // processors immediately. When false (or forced), the background load
+      // will run and the onFirstPassComplete callback will arm them later.
       if (cacheHit) {
         console.log(
           `[v0] [Engine ${this.connectionId}] Cache hit — arming live processors immediately (prehistoric data already complete)`,

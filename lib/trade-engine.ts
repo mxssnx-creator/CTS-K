@@ -395,7 +395,7 @@ export class GlobalTradeEngineCoordinator {
         connectionId,
         indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
         strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-        realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+        realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
       }
       await this.startEngine(connectionId, config)
     } catch (err) {
@@ -514,7 +514,7 @@ export class GlobalTradeEngineCoordinator {
             connectionId: connection.id,
             indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
             strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
           }
           
           await this.startEngine(connection.id, config)
@@ -679,7 +679,7 @@ export class GlobalTradeEngineCoordinator {
               engine_type: "main", // Main Trade Engine for indications, strategies, pseudo positions
               indicationInterval: settings.mainEngineIntervalMs ? Math.max(1, settings.mainEngineIntervalMs / 1000) : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? Math.max(1, settings.strategyUpdateIntervalMs / 1000) : 10,
-              realtimeInterval: settings.realtimeIntervalMs ? Math.max(1, settings.realtimeIntervalMs / 1000) : 3,
+              realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
             }
             
             await this.startEngine(connection.id, config)
@@ -772,7 +772,7 @@ export class GlobalTradeEngineCoordinator {
               engine_type: "main", // Main Trade Engine for indications, strategies, pseudo positions
               indicationInterval: settings.mainEngineIntervalMs ? Math.max(1, settings.mainEngineIntervalMs / 1000) : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? Math.max(1, settings.strategyUpdateIntervalMs / 1000) : 10,
-              realtimeInterval: settings.realtimeIntervalMs ? Math.max(1, settings.realtimeIntervalMs / 1000) : 3,
+              realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
             }
             
             await this.startEngine(connection.id, config)
@@ -959,7 +959,7 @@ export class GlobalTradeEngineCoordinator {
               connectionId,
               indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-              realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+              realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
 
             await this.startEngine(connectionId, config)
