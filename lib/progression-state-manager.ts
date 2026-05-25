@@ -867,30 +867,31 @@ export class ProgressionStateManager {
   }
 
   /**
-   * Ensure / resume the UNIQUE continuous progression for this connection.
+   * Ensure there is exactly ONE UNIQUE solid progression for this connection,
+   * matched to the *actual current* live settings and symbol count.
    *
-   * This is the key method for "one unique session / progress that is continuous on visiting".
+   * - Uses recoordinate logic internally for snapshot match.
+   * - If no active or the active one is for different state → archive old (stop previous), start fresh unique one.
+   * - If active one matches current live state → attach to it (keeps the progression unique, no new instance).
    *
-   * - If a valid active progression exists (engine_started=true and recent activity),
-   *   it RESUMES it: updates last_update / last_visited, keeps the SAME session_number and epoch.
-   *   All page refreshes, independent tab opens, etc. attach to this single ongoing progression.
-   * - If none (or stale), it starts a fresh one (via archive if needed).
-   *
-   * This avoids creating new overall progressions/instances on every visit/refresh.
-   * The progression remains "commonly unique" and continuous for the connection.
+   * This keeps "Just Unique": one solid unique progression per connection at any time.
+   * Page refreshes / independent opens attach to the current unique one when the live state matches.
+   * No concurrent multiple progressions/instances for the same connection.
    */
-  static async ensureUniqueContinuousProgression(
+  static async ensureJustUniqueProgression(
     connectionId: string
-  ): Promise<{ sessionNumber: number; epoch: number; isResumed: boolean }> {
+  ): Promise<{ sessionNumber: number; epoch: number; wasNew: boolean }> {
     try {
       await initRedis()
       const client = getRedisClient()
       if (!client) {
-        // Fallback: start new
         const epoch = Date.now()
         const session = await this.archiveAndStartNewProgression(connectionId, epoch)
-        return { sessionNumber: session, epoch, isResumed: false }
+        return { sessionNumber: session, epoch, wasNew: true }
       }
+
+      // First, make sure we are coordinated to actual current state
+      await this.recoordinateForActualOne(connectionId)
 
       const key = `progression:${connectionId}`
       const existing = await client.hgetall(key).catch(() => null)
@@ -898,40 +899,32 @@ export class ProgressionStateManager {
       const now = Date.now()
       const nowIso = new Date(now).toISOString()
 
-      // Heuristic for "active / continuous": recent last_update (< 10 minutes) and engine_started
-      const lastUpdateStr = existing?.last_update
-      const lastUpdateTs = lastUpdateStr ? new Date(lastUpdateStr).getTime() : 0
-      const isRecentlyActive = lastUpdateTs > 0 && (now - lastUpdateTs < 10 * 60 * 1000) // 10 min window
-      const engineWasStarted = existing?.engine_started === "true"
-
-      if (existing && Object.keys(existing).length > 0 && engineWasStarted && isRecentlyActive) {
-        // RESUME the existing unique continuous progression
+      if (existing && Object.keys(existing).length > 0 && existing.engine_started === "true") {
+        // There is already one unique active progression (recoordinate ensured it matches current live state)
         const sessionNumber = parseInt(existing.session_number || "1", 10)
         const epoch = Number(existing.epoch) || now
 
+        // Light attach: update activity timestamps, keep the same unique session/epoch
         await client.hset(key, {
           last_update: nowIso,
           last_visited: nowIso,
-          // Keep engine_started true for continuity across visits
           engine_started: "true",
         }).catch(() => {})
 
-        // Refresh TTL
         await client.expire(key, 7 * 24 * 60 * 60).catch(() => {})
 
         console.log(
-          `[v0] [Progression] Resumed continuous unique progression for ${connectionId} ` +
-            `(session=${sessionNumber}, epoch=${epoch}) — refresh / independent open attached`
+          `[v0] [Progression] Attached to existing unique progression for ${connectionId} ` +
+          `(session=${sessionNumber}, epoch=${epoch})`
         )
 
-        return { sessionNumber, epoch, isResumed: true }
+        return { sessionNumber, epoch, wasNew: false }
       }
 
-      // No active continuous progression → start fresh (this will archive old if present)
+      // No active unique progression (or it was cleaned by recoordinate) → start one
       const newEpoch = now
       const newSession = await this.archiveAndStartNewProgression(connectionId, newEpoch)
 
-      // Immediately mark as active for this visit
       await client.hset(key, {
         last_visited: nowIso,
         last_update: nowIso,
@@ -939,17 +932,16 @@ export class ProgressionStateManager {
       }).catch(() => {})
 
       console.log(
-        `[v0] [Progression] Started new unique progression for ${connectionId} ` +
-          `(session=${newSession}, epoch=${newEpoch}) — no prior continuous session found`
+        `[v0] [Progression] Started unique progression for ${connectionId} ` +
+        `(session=${newSession}, epoch=${newEpoch})`
       )
 
-      return { sessionNumber: newSession, epoch: newEpoch, isResumed: false }
+      return { sessionNumber: newSession, epoch: newEpoch, wasNew: true }
     } catch (error) {
-      console.error(`[v0] ensureUniqueContinuousProgression failed for ${connectionId}:`, error)
-      // Safe fallback
+      console.error(`[v0] ensureJustUniqueProgression failed for ${connectionId}:`, error)
       const fallbackEpoch = Date.now()
-      const fallbackSession = 1
-      return { sessionNumber: fallbackSession, epoch: fallbackEpoch, isResumed: false }
+      const fallbackSession = await this.archiveAndStartNewProgression(connectionId, fallbackEpoch).catch(() => 1)
+      return { sessionNumber: fallbackSession, epoch: fallbackEpoch, wasNew: true }
     }
   }
 }
