@@ -3096,9 +3096,20 @@ export class TradeEngineManager {
           }
         }
 
+        // Determine prehistoric progression timeout (minutes) from app settings.
+        // Operator-configurable: 5–25 minutes, default 10. Clamp for safety.
+        const rawTimeoutMinutes = Number(
+          appSettings?.prehistoric_progression_timeout_minutes ??
+            appSettings?.prehistoricProgressionTimeoutMinutes ??
+            10,
+        )
+        const timeoutMinutes = Math.max(5, Math.min(25, Number.isFinite(rawTimeoutMinutes) ? rawTimeoutMinutes : 10))
+        const timeoutMs = Math.round(timeoutMinutes * 60_000)
+
         const results = await withCycleDeadline(
           mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, replayOneSymbol),
           `Engine ${connId} prehistoric-progression`,
+          timeoutMs,
         )
 
         cycleCount++

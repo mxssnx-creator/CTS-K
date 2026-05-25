@@ -270,26 +270,48 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                 to adaptive idle backoff (up to 1s) until new data arrives.
               </p>
 
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <Label>Historical Range</Label>
-                  <span className="text-sm font-semibold tabular-nums">
-                    {settings.prehistoric_range_hours ?? 8}h
-                  </span>
-                </div>
-                <Slider
-                  value={[settings.prehistoric_range_hours ?? 8]}
-                  onValueChange={(v) => handleSettingChange("prehistoric_range_hours", v[0])}
-                  min={1}
-                  max={50}
-                  step={1}
-                />
-                <div className="flex justify-between text-[10px] text-muted-foreground">
-                  <span>1h</span>
-                  <span>Default 8h</span>
-                  <span>50h</span>
-                </div>
-              </div>
+               <div className="space-y-2">
+                 <div className="flex items-center justify-between">
+                   <Label>Historical Range</Label>
+                   <span className="text-sm font-semibold tabular-nums">
+                     {settings.prehistoric_range_hours ?? 8}h
+                   </span>
+                 </div>
+                 <Slider
+                   value={[settings.prehistoric_range_hours ?? 8]}
+                   onValueChange={(v) => handleSettingChange("prehistoric_range_hours", v[0])}
+                   min={1}
+                   max={50}
+                   step={1}
+                 />
+                 <div className="flex justify-between text-[10px] text-muted-foreground">
+                   <span>1h</span>
+                   <span>Default 8h</span>
+                   <span>50h</span>
+                 </div>
+
+                 {/* New UI control for Prehistoric Progression Timeout */}
+                 <div className="space-y-2 pt-2 border-t border-dashed border-border/40">
+                   <div className="flex items-center justify-between">
+                     <Label>Prehistoric Progression Timeout</Label>
+                     <span className="text-sm font-semibold tabular-nums">
+                       {settings.prehistoric_progression_timeout_minutes ?? 10} min
+                     </span>
+                   </div>
+                   <p className="text-xs text-muted-foreground">
+                     Maximum wall-clock time allowed for the prehistoric progression's per-cycle map operation.
+                     If exceeded, the progression cycle will time out and the engine will continue to run (prevents long-hangs).
+                     Range: 5–25 minutes. Default: 10 minutes.
+                   </p>
+                   <Slider
+                     value={[settings.prehistoric_progression_timeout_minutes ?? 10]}
+                     onValueChange={(v) => handleSettingChange("prehistoric_progression_timeout_minutes", v[0])}
+                     min={5}
+                     max={25}
+                     step={2.5}
+                   />
+                 </div>
+               </div>
             </div>
 
             {/* Cycle Pause — pause between engine cycles (indication / strategy / realtime).

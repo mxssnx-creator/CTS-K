@@ -382,6 +382,9 @@ const initialSettings: Settings = {
   leveragePercentage: 100, // 5-100 step 5, Default 100
   prehistoricDataDays: 5,
   prehistoric_range_hours: 8, // 1-50h, step 1, default 8
+  // New system setting: prehistoric_progression_timeout_minutes
+  // Range: 5-25 min, step 2.5, default 10
+  prehistoric_progression_timeout_minutes: 10,
   marketTimeframe: 1,
   tradeIntervalSeconds: 1,
   realPositionsIntervalSeconds: 0.3,
