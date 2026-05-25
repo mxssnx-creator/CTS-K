@@ -16,6 +16,13 @@
  * Strategy counts always represent the number of SETS, not individual pseudo positions.
  */
 
+// ── Module version constant ───────────────────────────────────────────
+// Bumped to force webpack to re-hash this module and emit a new chunk,
+// replacing any stale compiled bundle in .next that contains the old
+// `realActiveKeysForVP is not defined` ReferenceError. Increment this
+// whenever a critical source fix needs to bypass a cached build artefact.
+export const STRATEGY_COORD_VERSION = "1.2"
+
 import { initRedis, getSettings, setSettings, getRedisClient } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { PositionThresholdManager } from "@/lib/position-threshold-manager"

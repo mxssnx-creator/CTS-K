@@ -2766,6 +2766,28 @@ export class TradeEngineManager {
         const windowEndMs = Date.now()
         const windowStartMs = windowEndMs - rangeHours * 60 * 60 * 1000
 
+        // ── Prime prehistoric:{id} with symbols_total on every cycle ────
+        // The dashboard reads `prehistoric:{id}.symbols_total` to compute
+        // the progress denominator. If this is never written the route
+        // falls back to the hard-coded default `3` and the progress bar
+        // is meaningless. Write it upfront on every cycle so the UI always
+        // has an accurate denominator before any symbols complete.
+        try {
+          const primeClient = getRedisClient()
+          const prehistKey = `prehistoric:${connId}`
+          const existing = await primeClient.hget(prehistKey, "symbols_total").catch(() => null)
+          // Only overwrite when empty or smaller than current symbol count
+          // to avoid clobbering a mid-run count written by the later batch.
+          if (!existing || Number(existing) < symbols.length) {
+            await primeClient.hset(prehistKey, {
+              symbols_total: String(symbols.length),
+              range_hours: String(rangeHours),
+              updated_at: new Date().toISOString(),
+            }).catch(() => {})
+            await primeClient.expire(prehistKey, 7 * 24 * 60 * 60).catch(() => {})
+          }
+        } catch { /* non-critical */ }
+
         // ── Step A: Bulk-load market data ONCE per cycle (DEADLINE-WRAPPED) ──
         // `loadMarketDataForEngine` can take seconds on first boot with many
         // symbols. Without a deadline, a hung network call blocks the entire
@@ -2973,15 +2995,39 @@ export class TradeEngineManager {
           0,
         )
         const successCount = results.filter((r: any) => r && !r.error).length
+
+        // Accumulate cumulative per-cycle step/indication/strategy totals
+        // so the prehistoric hash stays up-to-date even across many short
+        // cycles.  These locals are declared at tick scope so each cycle
+        // contributes its delta; the HINCRBY on `progression:` maintains
+        // the authoritative lifetime aggregate.
+        const cumulativeSteps = results.reduce(
+          (acc: number, r: any) => acc + (Number(r?.stepsReplayed) || 0), 0,
+        )
+        const cumulativeCandles = cumulativeSteps // 1 step = 1 candle replayed
+        const processedSymbolsThisCycle = results
+          .filter((r: any) => r && !r.error && (Number(r?.stepsReplayed) || 0) > 0)
+          .map((r: any) => String(r.symbol))
+
         try {
           const telemetryClient = getRedisClient()
           const progKey = `progression:${connId}`
+          const prehistKey = `prehistoric:${connId}`
           const nowMs = Date.now()
-          await Promise.all([
+
+          // ── 1. Atomic counters on progression:{id} ──────────────────
+          const [newCycles, newReplaySteps, newIndTotal] = await Promise.all([
             telemetryClient.hincrby(progKey, "prehistoric_progression_cycles", 1),
             telemetryClient.hincrby(progKey, "prehistoric_replay_steps_total", stepsTotal),
             telemetryClient.hincrby(progKey, "prehistoric_indications_total", indTotal),
             telemetryClient.hincrby(progKey, "prehistoric_strategies_total", stratTotal),
+            // Mirror the "canonical" prehistoric_cycles_completed so both
+            // field names resolve correctly in the stats route which reads
+            // `prehistoric_cycles_completed`.
+            telemetryClient.hincrby(progKey, "prehistoric_cycles_completed", 1),
+            telemetryClient.hincrby(progKey, "prehistoric_candles_processed", cumulativeCandles),
+            telemetryClient.hincrby(progKey, "prehistoric_symbols_processed_count",
+              processedSymbolsThisCycle.length),
             telemetryClient.hset(progKey, {
               prehistoric_progression_last_cycle_at: String(nowMs),
               prehistoric_progression_last_cycle_ms: String(duration),
@@ -2989,8 +3035,60 @@ export class TradeEngineManager {
               prehistoric_progression_last_steps: String(stepsTotal),
               prehistoric_progression_last_indications: String(indTotal),
               prehistoric_progression_last_strategies: String(stratTotal),
+              prehistoric_current_symbol: processedSymbolsThisCycle[processedSymbolsThisCycle.length - 1] || "",
             }),
             telemetryClient.expire(progKey, 7 * 24 * 60 * 60),
+          ])
+
+          // ── 2. Snapshot writes on prehistoric:{id} ──────────────────
+          // The dashboard (route.ts + stats/route.ts) reads from this
+          // hash for ALL prehistoric counters. The engine-manager's new
+          // progression loop ONLY ever wrote to progression:{id} leaving
+          // prehistoric:{id} empty — which caused the dashboard to render
+          // 0/0 symbols, 0 candles, 0 cycles indefinitely.
+          const prehistHashRaw = await telemetryClient.hgetall(prehistKey).catch(() => null)
+          const prehistHash = (prehistHashRaw as Record<string, string> | null) || {}
+
+          // Accumulate cumulative step / candle / indication totals so
+          // back-to-back cycles don't overwrite each other's count — use
+          // the current stored value as a base and add the cycle delta.
+          const prevSymsProcessed = Math.max(
+            Number(prehistHash.symbols_processed || 0),
+            Number((await telemetryClient.hget(progKey, "prehistoric_symbols_processed_count").catch(() => "0")) || 0),
+          )
+          const prevCandles = Number(prehistHash.candles_loaded || 0)
+          const prevIntervals = Number(prehistHash.intervals_processed || 0)
+          const prevMissing = Number(prehistHash.missing_intervals || 0)
+
+          // Build a deduplicated processed-symbols set by merging with SADD.
+          for (const sym of processedSymbolsThisCycle) {
+            await telemetryClient.sadd(`prehistoric:${connId}:symbols`, sym).catch(() => {})
+          }
+          const allSymsProcessed = await telemetryClient.scard(`prehistoric:${connId}:symbols`).catch(() => 0) || 0
+
+          await Promise.all([
+            telemetryClient.hset(prehistKey, {
+              // Identity
+              symbols_total:       String(symbols.length),
+              symbols_processed:   String(Math.max(allSymsProcessed, prevSymsProcessed + processedSymbolsThisCycle.length)),
+              // Counters — accumulate delta on top of stored value so
+              // each cycle contribution is preserved.
+              candles_loaded:      String(prevCandles + cumulativeCandles),
+              intervals_processed: String(prevIntervals + stepsTotal),
+              missing_intervals:   String(prevMissing),
+              // Cycle / progress
+              prehistoric_cycles:  String(Number(prehistHash.prehistoric_cycles || 0) + 1),
+              indications_total:   String(Number(prehistHash.indications_total || 0) + indTotal),
+              strategies_total:    String(Number(prehistHash.strategies_total || 0) + stratTotal),
+              // Status snapshot
+              current_symbol:      processedSymbolsThisCycle[processedSymbolsThisCycle.length - 1] || prehistHash.current_symbol || "",
+              last_cycle_at:       String(nowMs),
+              last_cycle_ms:       String(duration),
+              range_hours:         String(rangeHours),
+              updated_at:          new Date(nowMs).toISOString(),
+            }),
+            telemetryClient.expire(prehistKey, 7 * 24 * 60 * 60),
+            telemetryClient.expire(`prehistoric:${connId}:symbols`, 7 * 24 * 60 * 60),
           ])
         } catch { /* non-critical */ }
 

@@ -205,7 +205,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // Get detailed prehistoric progress tracking
     let prehistoricProgress = {
       symbolsProcessed: 0,
-      symbolsTotal: 3, // BTC, ETH, SOL
+      symbolsTotal: 0, // resolved from Redis; 0 = unknown (never render X/3 stale default)
       candlesLoaded: 0,
       candlesTotal: 0,
       indicatorsCalculated: 0,
@@ -239,11 +239,34 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
             prehistoricData.total_duration_ms || prehistoricData.duration || 0,
           )
 
-          // symbolsTotal from the hash wins over the hard-coded 3 default so
-          // multi-symbol quick-starts render the correct denominator.
+          // symbolsTotal resolution — priority order:
+          //   1. prehistoric:{id}.symbols_total  (written by engine-manager on every tick)
+          //   2. SCARD of prehistoric:{id}:symbols (deduplicated processed-symbol set)
+          //   3. trade_engine_state symbols / active_symbols array length
+          // Never fall back to a magic constant — 0 = "unknown" which the UI
+          // can render as "loading…" instead of the misleading "X/3" stale default.
           const hashSymbolsTotal = Number(prehistoricData.symbols_total || 0)
-          if (hashSymbolsTotal > 0) {
-            prehistoricProgress.symbolsTotal = hashSymbolsTotal
+
+          // Derive symbols total from the engine state's symbols array when
+          // the prehistoric hash hasn't been primed yet (very early in startup).
+          let engineSymbolsTotal = 0
+          if (engineState && typeof engineState === "object") {
+            const es = engineState as Record<string, any>
+            if (Array.isArray(es.symbols)) {
+              engineSymbolsTotal = es.symbols.length
+            } else if (Array.isArray(es.active_symbols)) {
+              engineSymbolsTotal = es.active_symbols.length
+            } else if (typeof es.active_symbols === "string") {
+              try {
+                const parsed = JSON.parse(es.active_symbols)
+                if (Array.isArray(parsed)) engineSymbolsTotal = parsed.length
+              } catch { /* ignore */ }
+            }
+          }
+
+          const resolvedTotal = Math.max(hashSymbolsTotal, processedSet.length, engineSymbolsTotal)
+          if (resolvedTotal > 0) {
+            prehistoricProgress.symbolsTotal = resolvedTotal
           }
 
           // symbolsProcessed — canonical source of truth, in priority order:
@@ -263,10 +286,9 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
             processed = Array.isArray(legacyCompleted) ? legacyCompleted.length : 0
           }
           if (processed === 0 && prehistoricProgress.currentSymbol) processed = 1
-          prehistoricProgress.symbolsProcessed = Math.min(
-            processed,
-            prehistoricProgress.symbolsTotal,
-          )
+          prehistoricProgress.symbolsProcessed = prehistoricProgress.symbolsTotal > 0
+            ? Math.min(processed, prehistoricProgress.symbolsTotal)
+            : processed
 
           // isComplete → either explicit flag, `:done` marker, or all symbols processed.
           const isComplete =

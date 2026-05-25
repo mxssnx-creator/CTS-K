@@ -185,8 +185,15 @@ export async function GET(
     // Secondary: progression hash mirror fields
     // Tertiary: trade_engine_state fields (config_set_*)
     const historicSymbolsProcessed = pick(
+      // Primary: direct hash field written by both engine-manager and
+      // config-set-processor on every symbol completion.
       n(prehistoricHash.symbols_processed),
+      // Secondary: SCARD of the per-connection processed-symbols SADD set.
+      // This is the most reliable deduplicated count because SADD is
+      // idempotent across both progression paths.
       prehistoricSymbolCount,
+      // Tertiary: engine progression hash mirror — written by the
+      // hincrby in startPrehistoricProgression on each productive cycle.
       n(progHash.prehistoric_symbols_processed_count),
       n(es.config_set_symbols_processed)
     )
@@ -224,22 +231,42 @@ export async function GET(
     )
     const historicIndicatorsCalculated = pick(
       n(prehistoricHash.indicators_calculated),
+      // The engine-manager progression loop writes `indications_total` to
+      // prehistoric:{id} on every cycle — use it when the legacy
+      // `indicators_calculated` field is absent (fresh installs).
+      n(prehistoricHash.indications_total),
+      // Progression hash mirror: `prehistoric_indications_total` is
+      // written by both the engine-manager loop (hincrby) and the
+      // config-set-processor path.
+      n(progHash.prehistoric_indications_total),
       n(es.config_set_indication_results)
     )
     const historicCyclesCompleted = pick(
+      // Primary: the canonical prehistoric_cycles_completed counter written
+      // by ProgressionStateManager.incrementPrehistoricCycle on every
+      // config-set-processor symbol pass.
       n(progHash.prehistoric_cycles_completed),
+      // Secondary: the engine-manager's startPrehistoricProgression loop
+      // writes `prehistoric_progression_cycles` (one per full cycle over
+      // all symbols) and mirrors it to `prehistoric_cycles_completed` above.
+      // Keep this as an explicit fallback in case only one path ran.
+      n(progHash.prehistoric_progression_cycles),
+      // Tertiary: the `prehistoric:{id}` hash now tracks
+      // `prehistoric_cycles` written directly by the progression loop.
+      n(prehistoricHash.prehistoric_cycles),
       n(es.config_set_symbols_processed),
-      // Tertiary: use the number of symbols processed as a minimum
-      // non-zero cycle count — each symbol constitutes one prehistoric
-      // cycle even if the dedicated `prehistoric_cycles_completed`
-      // counter was never written (e.g. the increment call silently
-      // failed). This prevents P-Cycles from showing 0 when 4 symbols
-      // have clearly been processed (Frames and Indicators are non-zero).
+      // Final: use symbols processed as a floor so the UI shows a
+      // non-zero cycle count whenever symbols have clearly been processed.
       historicSymbolsProcessed
     )
+    // Check the `:done` key that the engine's prehistoric loop sets on
+    // first-pass completion (both the legacy path and the new progression loop).
+    let prehistoricDoneMarker: string | null = null
+    try { prehistoricDoneMarker = await client.get(`prehistoric:${connectionId}:done`).catch(() => null) } catch { /* non-critical */ }
     const historicIsComplete =
       prehistoricHash.is_complete === "1" ||
-      progHash.prehistoric_phase_active === "false" && historicSymbolsProcessed > 0 ||
+      String(prehistoricDoneMarker) === "1" ||
+      (progHash.prehistoric_phase_active === "false" && historicSymbolsProcessed > 0) ||
       es.prehistoric_data_loaded === true ||
       es.prehistoric_data_loaded === "1"
     const historicProgressPercent = historicIsComplete
