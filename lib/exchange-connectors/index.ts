@@ -46,6 +46,18 @@ export async function createExchangeConnector(
     )
   }
 
+  // DEV/TEST: prefer simulated connector when API key is a placeholder or FORCE_SIMULATED set
+  try {
+    const forceSim = process.env.FORCE_SIMULATED === "1" || process.env.NODE_ENV === "development"
+    const keyStr = String(credentials.apiKey || "")
+    if (forceSim || keyStr.includes("PLACEHOLDER") || keyStr === "") {
+      const { SimulatedConnector } = await import("./simulated-connector")
+      return new SimulatedConnector(credentials, "simulated")
+    }
+  } catch (e) {
+    // ignore and fall back to normal creation
+  }
+
   switch (normalizedExchange) {
     case "simulated": {
       const { SimulatedConnector } = await import("./simulated-connector")
