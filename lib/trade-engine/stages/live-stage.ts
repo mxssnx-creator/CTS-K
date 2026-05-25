@@ -341,11 +341,12 @@ async function fetchCurrentPrice(symbol: string, connId?: string): Promise<numbe
       if (price > 0) return price
     }
 
-    // Fallback: bare market_data:{symbol} key (legacy writer).
-    const raw = await client.get(`market_data:${normSym}`).catch(() => null)
-    if (raw) {
-      const parsed = JSON.parse(raw as string)
-      const p = parseFloat(String(parsed?.close ?? parsed?.price ?? parsed?.last ?? 0))
+    // Fallback: bare market_data:{symbol} key — written as a Redis HASH by
+    // market-data-loader via hmset(). Must use hgetall(), NOT get(), because
+    // Redis returns WRONGTYPE error / null when get() is called on a hash key.
+    const hashRaw = await client.hgetall(`market_data:${normSym}`).catch(() => null)
+    if (hashRaw && typeof hashRaw === "object") {
+      const p = parseFloat(String((hashRaw as any).close ?? (hashRaw as any).price ?? (hashRaw as any).last ?? 0))
       if (p > 0) return p
     }
     return 0
@@ -1835,7 +1836,31 @@ export async function executeLivePosition(
     // `processSimulatedPositions` sweep walking Redis market_data
     // and force-closing on SL/TP cross or max-hold-time expiry.
     if (!isLiveTradeEnabled) {
-      const simEntryPrice = livePosition.entryPrice || realPosition.entryPrice || 0
+      // Dedup guard: if a simulated (or real) position is already open for this
+      // symbol+direction, do NOT create another one. The reconcile sweep and the
+      // `processSimulatedPositions` closer are responsible for lifecycle — we just
+      // need to avoid creating hundreds of redundant positions per cycle.
+      const existingSim = await findOpenLivePositionByDir(
+        connectionId,
+        realPosition.symbol,
+        realPosition.direction,
+      )
+      if (existingSim) {
+        // Already have an open simulated position — skip this cycle silently.
+        livePosition.status = "rejected"
+        livePosition.statusReason = `Simulated dedup — open position ${existingSim.id} already exists for ${realPosition.symbol} ${realPosition.direction}`
+        return livePosition
+      }
+
+      // Resolve the entry price for simulation. The upstream coordinator
+      // supplies _cachedMarketPrice which is fetched via hgetall before
+      // calling executeLivePosition. If that read returned 0 (timing —
+      // market data hash not yet written) we do a fresh fetchCurrentPrice
+      // call here so simulated positions always record a real price.
+      let simEntryPrice = livePosition.entryPrice || realPosition.entryPrice || 0
+      if (simEntryPrice <= 0) {
+        simEntryPrice = await fetchCurrentPrice(realPosition.symbol, connectionId)
+      }
       const simQty = realPosition.quantity || 0
       livePosition.executedQuantity = simQty
       livePosition.remainingQuantity = 0

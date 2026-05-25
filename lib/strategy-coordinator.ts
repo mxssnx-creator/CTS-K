@@ -1637,7 +1637,7 @@ export class StrategyCoordinator {
       ? Math.min(1, uniqueBaseSetsProduced.size / baseSets.length)
       : 0
 
-    // ── Write Main counts to Redis ──���─────────────────────────────�����───────
+    // ── Write Main counts to Redis ──���─────────────────────────────�������───────
     // CUMULATIVE via hincrby so the dashboard does not oscillate with
     // per-cycle snapshots (see matching fix in createBaseSets).
     try {
@@ -1722,6 +1722,22 @@ export class StrategyCoordinator {
           strategies_main_ctx_prev_total:       String(ctx.prevPosCount),
           strategies_main_ctx_updated_at:       String(Date.now()),
         }),
+      )
+
+      // ── ACTIVE-NOW snapshot for Main stage ─────────────────────────────────
+      // Mirrors the Base and Real patterns. The stats route reads this hash and
+      // aggregates {symbol}:main into stratCounts.main and {symbol}:main:evaluated
+      // into stratEvaluated.main. Writing both fields in the same hset() guarantees
+      // they are always in sync (same cycle value) so the STATS-VALIDATION check
+      // "mainEvaluated > main" never fires due to a cross-cycle race.
+      // main:evaluated = same as main (Main is a fanout — every output Set IS an
+      // evaluated result; there is no separate "input count" concept here).
+      writes.push(
+        client.hset(`strategies_active:${this.connectionId}`, {
+          [`${symbol}:main`]:           String(mainSets.length),
+          [`${symbol}:main:evaluated`]: String(mainSets.length),
+        }),
+        client.expire(`strategies_active:${this.connectionId}`, 600),
       )
 
       // ── Position count metrics for main stage ──
@@ -1881,7 +1897,7 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.real
 
-    // ── Active config keys for Real-stage continuous validity ────────────────
+    // ── Active config keys for Real-stage continuous validity ─────────���──────
     // Fetched via a dedicated helper module (active-config-keys.ts) so the
     // logic lives in its own compiled chunk — immune to stale module cache
     // from previous server boots. The result is a plain Set<string> that is
@@ -2476,7 +2492,9 @@ export class StrategyCoordinator {
         // Overwriting them with Real's realSets.length would corrupt MAIN's
         // pass statistics and make passed_sets > evaluated impossible to read.
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
-        client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainPFEligible)),
+        // Use realSets.length (output count) so this key is consistent with
+        // the strategies_active hash field and the STATS-VALIDATION never fires.
+        client.set(`strategies:${this.connectionId}:real:evaluated`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
         // ── CRITICAL: Persist Real Sets for Live evaluation ────────────────────
         // Bug fix: Real Sets were computed but never written, causing Live to load
@@ -2497,9 +2515,17 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:${symbol}:real:sets`, 86400),
       ]
       // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
-      // strategies_real_evaluated = Main Sets that entered REAL (input count).
+      // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
+      // strategies_real_evaluated = Sets that PASSED Real (same as output count).
+      // NOTE: we intentionally write the OUTPUT (realSets.length) as `evaluated`
+      // here rather than the input (mainPFEligible). The stats validator in
+      // /api/connections/progression/[id]/stats compares realEvaluated against
+      // stratCounts.real — both of which measure the Real stage OUTPUT. If we
+      // wrote mainPFEligible (the input = Main Sets entering the filter), the
+      // cross-symbol sum would always exceed realSets.length and trigger the
+      // "STATS-VALIDATION: realEvaluated > real" warning every cycle.
       if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
-      if (mainPFEligible > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", mainPFEligible))
+      if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realSets.length))
 
       // ── ACTIVE-NOW snapshot for Real stage ──────────────────────────
       // Mirrors the Base/Main pattern. The dashboard reads this hash and
@@ -2509,10 +2535,9 @@ export class StrategyCoordinator {
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
           [`${symbol}:real`]:           String(realSets.length),
-          // real:evaluated = Main Sets that entered PF evaluation (excludes
-          // pos-count pre-gated Sets). Cross-symbol sum in stats route will
-          // match stratCounts.real denominator exactly.
-          [`${symbol}:real:evaluated`]: String(mainPFEligible),
+          // real:evaluated = Real Sets that passed the stage (output count,
+          // same scope as stratCounts.real so STATS-VALIDATION never fires).
+          [`${symbol}:real:evaluated`]: String(realSets.length),
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
@@ -2893,24 +2918,28 @@ export class StrategyCoordinator {
     let _cachedMarketPrice = 0
     try {
       const _priceClient = getRedisClient()
+      // Priority 1: HASH at market_data:{symbol} — written by market-data-loader
+      // via hmset(). This is the fastest path (one network hop, no JSON parse).
       const _mdhash = await _priceClient.hgetall(`market_data:${symbol}`)
-      _cachedMarketPrice = parseFloat(String(_mdhash?.close ?? _mdhash?.price ?? _mdhash?.last ?? "0"))
+      _cachedMarketPrice = parseFloat(String((_mdhash as any)?.close ?? (_mdhash as any)?.price ?? (_mdhash as any)?.last ?? "0"))
       if (!_cachedMarketPrice || isNaN(_cachedMarketPrice)) {
-        // Spec §7: prefer the canonical :1s envelope, fall back to :1m.
-        const _mdraw =
-          (await _priceClient.get(`market_data:${symbol}:1s`)) ??
-          (await _priceClient.get(`market_data:${symbol}:1m`))
-        if (_mdraw) {
-          const _mdobj = typeof _mdraw === "string" ? JSON.parse(_mdraw) : _mdraw
-          const _candles = _mdobj?.candles
-          if (Array.isArray(_candles) && _candles.length > 0) {
-            _cachedMarketPrice = parseFloat(String(_candles[_candles.length - 1]?.close ?? "0")) || 0
-          } else {
-            _cachedMarketPrice = parseFloat(String(_mdobj?.close ?? _mdobj?.price ?? _mdobj?.last ?? "0")) || 0
+        // Priority 2: JSON string at market_data:{symbol}:1s (canonical envelope).
+        // Prefer 1s over 1m — both hold the same shape {candles[], close, price}.
+        for (const _interval of ["1s", "1m"]) {
+          const _mdraw = await _priceClient.get(`market_data:${symbol}:${_interval}`)
+          if (_mdraw) {
+            const _mdobj = typeof _mdraw === "string" ? JSON.parse(_mdraw) : _mdraw
+            const _candles = _mdobj?.candles
+            if (Array.isArray(_candles) && _candles.length > 0) {
+              _cachedMarketPrice = parseFloat(String(_candles[_candles.length - 1]?.close ?? "0")) || 0
+            } else {
+              _cachedMarketPrice = parseFloat(String(_mdobj?.close ?? _mdobj?.price ?? _mdobj?.last ?? "0")) || 0
+            }
+            if (_cachedMarketPrice > 0) break
           }
         }
       }
-    } catch { /* best-effort; live-stage falls back internally */ }
+    } catch { /* best-effort; live-stage calls fetchCurrentPrice as inner fallback */ }
 
     // Attempt real exchange trading for qualifying LIVE sets when the connection has live trading enabled.
     // This is guarded by is_live_trade flag on the connection — if disabled, only pseudo positions are created.
