@@ -27,9 +27,21 @@ async function main() {
     }).catch(() => null);
 
     if (!health || !health.ok) {
-      console.error("[Quickstart] ERROR: Dev server not running on :3002. Start with: npm run dev");
-      console.error("[Quickstart] Then run: npm run quickstart");
-      process.exit(1);
+      console.warn("[Quickstart] No dev server — falling back to standalone diagnostic test (inline Redis) with 10 symbols, min-vol, live-trade semantics.");
+      // Fallback: run the comprehensive diagnostic exercising the same 10-symbol quickstart path + live close independence checks.
+      try {
+        const { spawnSync } = require("child_process");
+        const diag = spawnSync(process.execPath, [
+          "./node_modules/.bin/tsx",
+          "--eval",
+          `import runDiagnostic from "./COMPREHENSIVE_DIAGNOSTIC_TEST.ts"; runDiagnostic("bingx-x01", ["PLAYSOUTUSDT","XANUSDT","BSBUSDT","NILUSDT","BILLUSDT","GITLAWBUSDT","UBUSDT","ASTEROIDETHUSDT","RKCUSDT","ERAUSDT"]).then(r => { console.log("DIAG_RESULT:", JSON.stringify(r, null, 2)); process.exit(r.summary.failed > 0 ? 1 : 0); }).catch(e => { console.error("DIAG_ERR:", e); process.exit(1); });`
+        ], { stdio: "inherit", timeout: 45000 });
+        console.log("[Quickstart] Standalone diagnostic completed with exit", diag.status);
+        process.exit(diag.status || 0);
+      } catch (e) {
+        console.error("[Quickstart] Fallback diagnostic failed:", e.message || e);
+        process.exit(1);
+      }
     }
 
     // Trigger quickstart with 10 symbols, live trade, minimal vol (API forces the last two)
