@@ -70,6 +70,23 @@ export async function runComprehensiveDiagnostic(
       })
       return result
     }
+
+    // Ensure engine is running for this connection so diagnostic observes live pipeline
+    try {
+      const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+      const { getConnection } = await import("@/lib/redis-db")
+      const coordinator = getGlobalTradeEngineCoordinator()
+      const conn = await getConnection(connectionId)
+      if (conn) {
+        // Attempt to start any missing engines for this single connection
+        await coordinator.startMissingEngines([conn])
+        // Give the engine a short moment to initialize and run at least one cycle
+        await new Promise((r) => setTimeout(r, 1200))
+      }
+    } catch (e) {
+      // non-fatal for diagnostics — log and continue checks
+      console.warn("[DIAG] Failed to start engine for diagnostic:", e)
+    }
     const symbols: string[] = Array.isArray(symbol) ? symbol : [symbol]
     const primarySymbol = symbols[0] || "BTCUSDT"
     result.symbol = primarySymbol
