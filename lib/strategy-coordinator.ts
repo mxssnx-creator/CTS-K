@@ -1911,27 +1911,23 @@ export class StrategyCoordinator {
       try {
         const { getConnection: getConn } = await import("@/lib/redis-db")
         const { isTruthyFlag } = await import("@/lib/connection-state-utils")
-        try {
-          const conn = await getConn(this.connectionId).catch(() => null as any)
-          const liveOn = isTruthyFlag(conn?.is_live_trade) || isTruthyFlag(conn?.live_trade_enabled)
-          if (liveOn) {
-            // Position count relaxation (already present)
-            realMinPos = Math.max(1, Math.min(realMinPos, 3))
+        const conn = await getConn(this.connectionId).catch(() => null as any)
+        const liveOn = isTruthyFlag(conn?.is_live_trade) || isTruthyFlag(conn?.live_trade_enabled)
+        if (liveOn) {
+          // Position count relaxation (already present)
+          realMinPos = Math.max(1, Math.min(realMinPos, 3))
 
-            // PF bootstrap relaxation — lower the Real gate slightly to allow first
-            // cycles to promote sets when live trading is explicitly enabled.
-            const originalRealPF = metrics.minProfitFactor
-            metrics.minProfitFactor = Math.min(originalRealPF, 0.75)
+          // PF bootstrap relaxation — lower the Real gate slightly to allow first
+          // cycles to promote sets when live trading is explicitly enabled.
+          const originalRealPF = metrics.minProfitFactor
+          metrics.minProfitFactor = Math.min(originalRealPF, 0.75)
 
-            if (originalRealPF !== metrics.minProfitFactor) {
-              console.log(
-                `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (live quickstart): ` +
-                `relaxed minProfitFactor ${originalRealPF} → ${metrics.minProfitFactor} and posCount→${realMinPos} ` +
-                `to allow first Real→Live escalation while history builds.`
-              )
-            }
-          }
-        } catch { /* non-fatal */ }
+          if (originalRealPF !== metrics.minProfitFactor) {
+            console.log(
+              `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (live quickstart): ` +
+              `relaxed minProfitFactor ${originalRealPF} → ${metrics.minProfitFactor} and posCount→${realMinPos} ` +
+              `to allow first Real→Live escalation while history builds.`
+            )
           }
         }
       } catch { /* non-fatal */ }
