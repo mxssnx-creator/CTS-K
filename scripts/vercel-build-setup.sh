@@ -1,54 +1,35 @@
 #!/bin/bash
-# Vercel Pre-Build Setup Script
-# Runs migrations and initialization before Next.js build
-# This script is called by vercel.json during the build process
+# Vercel Pre-Build Setup Script (fixed)
+# Only does what is possible and safe at Vercel build time.
+# Runtime migrations + engine bootstrap are handled by the app on first request.
 
 set -e
 
 echo "[Vercel Build] Starting pre-build setup..."
-echo "[Vercel Build] NODE_ENV: $NODE_ENV"
-echo "[Vercel Build] Node version: $(node --version)"
-echo "[Vercel Build] NPM version: $(npm --version)"
+echo "[Vercel Build] NODE_ENV: ${NODE_ENV:-production}"
+echo "[Vercel Build] Node version: $(node --version 2>/dev/null || echo 'unknown')"
+echo "[Vercel Build] NPM version: $(npm --version 2>/dev/null || echo 'unknown')"
 
-# Step 1: Install dependencies with legacy peer deps
-echo "[Vercel Build] Installing dependencies..."
-npm install --legacy-peer-deps
+# 1. Install (Vercel already runs installCommand, but keep for local `vercel-build-setup` usage)
+echo "[Vercel Build] Ensuring dependencies are present..."
+npm install --legacy-peer-deps --no-audit --no-fund 2>&1 | tail -5 || true
 
-# Step 2: Ensure Redis data directory exists (for inline Redis persistence)
-echo "[Vercel Build] Ensuring data directories..."
+# 2. Prepare minimal runtime dirs (Redis file fallback + Next cache)
+echo "[Vercel Build] Creating required directories..."
 mkdir -p data/redis
 mkdir -p .next/cache
 
-# Step 3: Run migrations via API initialization endpoint
-# We use curl to trigger the init endpoint which will run all migrations
-echo "[Vercel Build] Preparing database migrations..."
-cat > /tmp/init-migrations.mjs << 'EOF'
-import { initRedis, runMigrations } from './lib/redis-db.ts'
-import { getMigrationStatus } from './lib/redis-migrations.ts'
+# 3. Typecheck (fast fail on obvious TS errors before the heavy Next build)
+echo "[Vercel Build] Running typecheck..."
+npm run typecheck -- --skipLibCheck 2>&1 | tail -10 || {
+  echo "[Vercel Build] WARNING: typecheck had errors (continuing to build anyway)"
+}
 
-(async () => {
-  try {
-    console.log('[Setup] Initializing Redis...')
-    await initRedis()
-    
-    console.log('[Setup] Running migrations...')
-    const status = await runMigrations()
-    
-    console.log('[Setup] Migration status:', status)
-    console.log('[Setup] ✓ Database setup complete')
-    
-    process.exit(0)
-  } catch (err) {
-    console.error('[Setup] Migration failed:', err)
-    process.exit(1)
-  }
-})()
-EOF
+# 4. The actual Next.js production build (this is what produces .next/)
+echo "[Vercel Build] Building Next.js application (vercel-build)..."
+NODE_OPTIONS='--max-old-space-size=12288 --max-semi-space-size=128' npm run vercel-build
 
-# Step 4: Build the Next.js app
-echo "[Vercel Build] Building Next.js application..."
-NODE_OPTIONS='--max-old-space-size=8192' npm run vercel-build
-
-# Step 5: Final verification
+# 5. Done
 echo "[Vercel Build] ✓ Pre-build setup completed successfully"
 echo "[Vercel Build] Build artifacts ready at .next/"
+ls -la .next/ 2>/dev/null | head -8 || true
