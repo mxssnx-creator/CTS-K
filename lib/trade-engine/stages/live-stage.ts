@@ -38,6 +38,20 @@ import {
   type LiveOrderTrace,
 } from "@/lib/live-order-logger"
 
+// ── Position ID counter for high-frequency scenarios ────────────────────────
+// Even at 1000 positions/sec, Date.now() granularity (milliseconds) causes
+// collisions. Using a process-wide counter avoids timestamp-based ID clashes.
+// Format: live:{connId}:{symbol}:{direction}:{milliseconds}:{nanoCounter}:{random}
+// The nanoCounter ensures uniqueness within the same millisecond, and the
+// random suffix provides defence-in-depth against counter wraparound at scale.
+let _positionIdCounter = 0n
+
+function generateLivePositionId(connectionId: string, symbol: string, direction: string): string {
+  const ms = BigInt(Date.now())
+  _positionIdCounter = (_positionIdCounter + 1n) & 0xFFFFFFFFn // 32-bit counter, wraparound OK
+  const random = Math.random().toString(36).slice(2, 10) // 8 chars base-36 ≈ 42 bits entropy
+  return `live:${connectionId}:${symbol}:${direction}:${ms.toString()}:${_positionIdCounter.toString()}:${random}`
+}
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 
 const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS = 10_000
@@ -1565,7 +1579,7 @@ export async function executeLivePosition(
     const stepIdx = Math.min(failures - 1, MARGIN_COOLDOWN_STEPS_MS.length - 1)
     const cooldownSec = Math.round((MARGIN_COOLDOWN_STEPS_MS[stepIdx] ?? MARGIN_COOLDOWN_MAX_MS) / 1000)
     const skipped: LivePosition = {
-      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      id: generateLivePositionId(connectionId, realPosition.symbol, realPosition.direction),
       connectionId,
       symbol: realPosition.symbol,
       direction: realPosition.direction,
@@ -1609,7 +1623,7 @@ export async function executeLivePosition(
   }
 
   const livePosition: LivePosition = {
-    id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+    id: generateLivePositionId(connectionId, realPosition.symbol, realPosition.direction),
     connectionId,
     symbol: realPosition.symbol,
     direction: realPosition.direction,
