@@ -469,6 +469,24 @@ export async function POST(request: Request) {
       await client.expire(`prehistoric:${connectionId}`, 86400)
     } catch { /* non-critical */ }
     console.log(`${LOG_PREFIX}: [3/4] Stored symbols in trade_engine_state: ${symbols.join(", ")}`)
+
+    // === DEV MODE COMPLETENESS FIX ===
+    // Immediately kick off prehistoric load for the exact quickstart symbols
+    // so that the full pipeline (prehistoric → indications → strategies base/main/real → real/live)
+    // is ready faster for Dev Mode testing (3-symbol minimal volume etc.).
+    // This makes "ReRun Dev Mode Test" show loaded data and non-zero counts much sooner.
+    if (symbols.length > 0) {
+      (async () => {
+        try {
+          const { SymbolDataProcessor } = await import('@/lib/symbol-data-processor')
+          const processor = new SymbolDataProcessor()
+          await processor.loadPrehistoricDataConcurrent(symbols, 'bingx')
+          console.log(`${LOG_PREFIX}: [3.5] Best-effort prehistoric load triggered for quickstart symbols: ${symbols.join(', ')}`)
+        } catch (e) {
+          console.warn(`${LOG_PREFIX}: Prehistoric preload for quickstart symbols failed (non-fatal):`, e)
+        }
+      })()
+    }
     
      const isAssigned = updated.is_assigned === "1" || updated.is_assigned === true
      const isMainEnabled = updated.is_enabled_dashboard === "1" || updated.is_enabled_dashboard === true
