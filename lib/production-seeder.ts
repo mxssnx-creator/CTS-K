@@ -1,0 +1,282 @@
+/**
+ * Production Seeder
+ * Seeds essential data for production mode: settings, connections, market data
+ */
+
+import { saveSettings } from "@/lib/settings-storage"
+import { saveConnection, saveAllConnections } from "@/lib/connection-manager"
+import { loadMarketDataForEngine } from "@/lib/market-data-loader"
+import { getPredefinedAsExchangeConnections } from "@/lib/connection-predefinitions"
+import { getRedisClient, initRedis } from "@/lib/redis-db"
+import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { setSettings } from "@/lib/redis-db"
+
+export interface ProductionSeedOptions {
+  seedSettings?: boolean
+  seedConnections?: boolean
+  seedMarketData?: boolean
+  seedProgression?: boolean
+  symbols?: string[]
+}
+
+/**
+ * Seed all essential production data
+ */
+export async function seedProductionData(options: ProductionSeedOptions = {}): Promise<void> {
+  console.log("[v0] [ProductionSeeder] Starting production data seeding...")
+  
+  try {
+    await initRedis()
+    const client = getRedisClient()
+    
+    // Seed default settings if none exist
+    if (options.seedSettings !== false) {
+      await seedDefaultSettings()
+    }
+    
+    // Seed predefined connections if none exist
+    if (options.seedConnections !== false) {
+      await seedPredefinedConnections()
+    }
+    
+    // Seed market data for trading
+    if (options.seedMarketData !== false) {
+      await seedMarketData(options.symbols)
+    }
+    
+    // Seed progression state
+    if (options.seedProgression !== false) {
+      await seedProgressionState()
+    }
+    
+    console.log("[v0] [ProductionSeeder] ✅ Production data seeding completed")
+  } catch (error) {
+    console.error("[v0] [ProductionSeeder] ❌ Failed to seed production data:", error)
+    throw error
+  }
+}
+
+/**
+ * Seed default application settings
+ */
+async function seedDefaultSettings(): Promise<void> {
+  try {
+    const client = getRedisClient()
+    const settingsKey = "app_settings"
+    
+    // Check if settings already exist
+    const existingSettings = await client.get(settingsKey)
+    if (existingSettings) {
+      console.log("[v0] [ProductionSeeder] Settings already exist, skipping...")
+      return
+    }
+    
+    // Default production settings
+    const defaultSettings = {
+      cyclePauseMs: 50,
+      mainEngineIntervalMs: 700,
+      presetEngineIntervalMs: 120000,
+      strategyUpdateIntervalMs: 10000,
+      realtimeIntervalMs: 300,
+      mainEngineEnabled: true,
+      presetEngineEnabled: true,
+      minimum_connect_interval: 200,
+      theme: "dark",
+      language: "en",
+      notifications_enabled: true,
+      default_leverage: 10,
+      default_volume: 100,
+      max_open_positions: 10,
+      max_drawdown_percent: 20,
+      daily_loss_limit: 1000,
+      main_symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
+      forced_symbols: [],
+      database_type: "redis",
+      restApiDelayMs: 50,
+      publicRequestDelayMs: 20,
+      privateRequestDelayMs: 100,
+      websocketTimeoutMs: 30000,
+      strategyMainMaxPseudoPositionsLong: 1,
+      strategyMainMaxPseudoPositionsShort: 1,
+      databaseLimitPerSecond: 10000,
+      databaseLimitPerMinute: 500000,
+      databaseLimitPerDay: 0,
+    }
+    
+    await saveSettings(defaultSettings)
+    console.log("[v0] [ProductionSeeder] ✅ Default settings seeded")
+  } catch (error) {
+    console.error("[v0] [ProductionSeeder] ❌ Failed to seed settings:", error)
+    throw error
+  }
+}
+
+/**
+ * Seed predefined exchange connections
+ */
+async function seedPredefinedConnections(): Promise<void> {
+  try {
+    const client = getRedisClient()
+    const connectionsKey = "all_connections"
+    
+    // Check if connections already exist
+    const existingConnections = await client.get(connectionsKey)
+    if (existingConnections) {
+      const connections = JSON.parse(existingConnections)
+      if (connections.length > 0) {
+        console.log("[v0] [ProductionSeeder] Connections already exist, skipping...")
+        return
+      }
+    }
+    
+    // Get predefined connections
+    const predefinedConnections = getPredefinedAsExchangeConnections()
+    
+    // Save them as actual connections (enabled=false by default)
+    await saveAllConnections(predefinedConnections)
+    
+    // Enable one connection for immediate trading (BingX X01)
+    if (predefinedConnections.length > 0) {
+      await client.set(connectionsKey, JSON.stringify([
+        {
+          ...predefinedConnections[0],
+          is_enabled: true,
+          is_active: true,
+          is_live_trade: true,
+        },
+        ...predefinedConnections.slice(1)
+      ]))
+    }
+    
+    console.log("[v0] [ProductionSeeder] ✅ Predefined connections seeded")
+  } catch (error) {
+    console.error("[v0] [ProductionSeeder] ❌ Failed to seed connections:", error)
+    throw error
+  }
+}
+
+/**
+ * Seed initial market data
+ */
+async function seedMarketData(symbols: string[] = []): Promise<void> {
+  try {
+    console.log("[v0] [ProductionSeeder] Seeding initial market data...")
+    
+    const targetSymbols = symbols.length > 0 ? symbols : [
+      "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
+      "DOGEUSDT", "LINKUSDT", "LTCUSDT", "THETAUSDT", "AVAXUSDT",
+      "MATICUSDT", "SOLUSDT", "UNIUSDT", "APTUSDT", "ARBUSDT"
+    ]
+    
+    // Load market data for engine
+    const loaded = await loadMarketDataForEngine(targetSymbols)
+    
+    if (loaded > 0) {
+      console.log(`[v0] [ProductionSeeder] ✅ Market data seeded for ${loaded} symbols`)
+    } else {
+      console.warn("[v0] [ProductionSeeder] ⚠ No market data loaded")
+    }
+  } catch (error) {
+    console.error("[v0] [ProductionSeeder] ❌ Failed to seed market data:", error)
+    throw error
+  }
+}
+
+/**
+ * Seed initial progression state
+ */
+async function seedProgressionState(): Promise<void> {
+  try {
+    console.log("[v0] [ProductionSeeder] Seeding progression state...")
+    
+    const client = getRedisClient()
+    
+    // Check if we already have progression state
+    const progressionKeys = await client.keys("progression:*")
+    if (progressionKeys.length > 0) {
+      console.log("[v0] [ProductionSeeder] Progression state already exists, skipping...")
+      return
+    }
+    
+    // Get all connections to create progression states for
+    const connections = await client.get("all_connections")
+    if (!connections) {
+      console.log("[v0] [ProductionSeeder] No connections found, skipping progression seeding")
+      return
+    }
+    
+    const connectionsArray = JSON.parse(connections)
+    
+    // Create initial progression state for each connection
+    for (const conn of connectionsArray) {
+      if (conn.is_enabled && conn.is_active) {
+        await ProgressionStateManager.archiveAndStartNewProgression(
+          conn.id,
+          Date.now()
+        )
+      }
+    }
+    
+    console.log("[v0] [ProductionSeeder] ✅ Progression state seeded")
+  } catch (error) {
+    console.error("[v0] [ProductionSeeder] ❌ Failed to seed progression state:", error)
+    throw error
+  }
+}
+
+/**
+ * Force reseed all production data (use with caution)
+ */
+export async function forceReseedProductionData(): Promise<void> {
+  console.log("[v0] [ProductionSeeder] Force reseeding all production data...")
+  
+  try {
+    await initRedis()
+    const client = getRedisClient()
+    
+    // Clear existing data
+    const keysToClear = [
+      "app_settings",
+      "all_connections",
+      ...(await client.keys("market_data:*")),
+      ...(await client.keys("progression:*")),
+      ...(await client.keys("trade_engine_state:*")),
+      ...(await client.keys("settings:*")),
+      ...(await client.keys("connection:*")),
+    ]
+    
+    if (keysToClear.length > 0) {
+      await client.del(...keysToClear)
+      console.log(`[v0] [ProductionSeeder] Cleared ${keysToClear.length} keys`)
+    }
+    
+    // Reseed everything
+    await seedProductionData({
+      seedSettings: true,
+      seedConnections: true,
+      seedMarketData: true,
+      seedProgression: true
+    })
+    
+    console.log("[v0] [ProductionSeeder] ✅ Force reseeding completed")
+  } catch (error) {
+    console.error("[v0] [ProductionSeeder] ❌ Force reseeding failed:", error)
+    throw error
+  }
+}
+
+/**
+ * Auto-seed on module load if in production mode
+ */
+if (process.env.NODE_ENV === "production") {
+  seedProductionData().catch(console.error)
+}
+
+export default {
+  seedProductionData,
+  seedDefaultSettings,
+  seedPredefinedConnections,
+  seedMarketData,
+  seedProgressionState,
+  forceReseedProductionData
+}
