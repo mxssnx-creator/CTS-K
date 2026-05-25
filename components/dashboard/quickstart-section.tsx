@@ -352,20 +352,39 @@ export function QuickstartSection() {
   })
 
   const [starting, setStarting] = useState(false)
-  const [isRunning, setIsRunning] = useState(false)
-  const [expanded, setExpanded] = useState(false)
+  // Persisted across reloads (via localStorage) so QuickStart (and by extension
+  // the whole site) restores the exact running/expanded/situation state of the
+  // current unique session instead of resetting.
+  const [isRunning, setIsRunning] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false
+    try { return localStorage.getItem("qs:isRunning") === "1" } catch { return false }
+  })
+  const [expanded, setExpanded] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false
+    try { return localStorage.getItem("qs:expanded") === "1" } catch { return false }
+  })
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [stats, setStats] = useState<LiveStats>(EMPTY_STATS)
   const [loadingStats, setLoadingStats] = useState(false)
 
   // Quickstart controls — how many top-volatile symbols to process (1-10)
   // and whether live exchange trading is currently enabled for the connection.
-  const [symbolCount, setSymbolCount] = useState<number>(10)
+  const [symbolCount, setSymbolCount] = useState<number>(() => {
+    if (typeof window === "undefined") return 10
+    try {
+      const v = localStorage.getItem("qs:symbolCount")
+      const n = v ? parseInt(v, 10) : 10
+      return Math.max(1, Math.min(10, n || 10))
+    } catch { return 10 }
+  })
   const [liveTradeActive, setLiveTradeActive] = useState<boolean>(false)
   const [liveTradeLoading, setLiveTradeLoading] = useState<boolean>(false)
   // Connection the quickstart actually bound to on last start (or the
   // component default) — used as the target for the Live toggle.
-  const [activeConnectionId, setActiveConnectionId] = useState<string>(connectionId ?? "")
+  const [activeConnectionId, setActiveConnectionId] = useState<string>(() => {
+    if (typeof window === "undefined") return ""
+    try { return localStorage.getItem("qs:activeConnectionId") || "" } catch { return "" }
+  })
 
   // ── Indication configuration Set-count snapshot (static enumeration) ─
   // Pulled from /api/indications/config-counts. Refreshed every 60s since it
@@ -875,6 +894,25 @@ export function QuickstartSection() {
     window.addEventListener("quickstart:refresh", handler)
     return () => window.removeEventListener("quickstart:refresh", handler)
   }, [loadSymbol, fetchStats, refreshLiveTradeStatus])
+
+  // Persist QuickStart UI session flags so page reloads restore the live
+  // "situation" (running/expanded/symbol count/target connection) instead
+  // of resetting the section.
+  useEffect(() => {
+    try { localStorage.setItem("qs:expanded", expanded ? "1" : "0") } catch {}
+  }, [expanded])
+  useEffect(() => {
+    try { localStorage.setItem("qs:symbolCount", String(symbolCount)) } catch {}
+  }, [symbolCount])
+  useEffect(() => {
+    try { localStorage.setItem("qs:isRunning", isRunning ? "1" : "0") } catch {}
+  }, [isRunning])
+  useEffect(() => {
+    try {
+      if (activeConnectionId) localStorage.setItem("qs:activeConnectionId", activeConnectionId)
+      else localStorage.removeItem("qs:activeConnectionId")
+    } catch {}
+  }, [activeConnectionId])
 
   const logColor = (type: string) => {
     switch (type) {

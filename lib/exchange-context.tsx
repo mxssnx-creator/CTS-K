@@ -16,14 +16,30 @@ interface ExchangeContextType {
 const ExchangeContext = createContext<ExchangeContextType | undefined>(undefined)
 
 export function ExchangeProvider({ children }: { children: ReactNode }) {
-  const [selectedExchange, setSelectedExchange] = useState<string | null>(null)
-  const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null)
+  // Seed from localStorage for unique session persistence across reloads.
+  // This ensures the complete site (QuickStart, selections, etc.) keeps the
+  // user's current situation instead of resetting to defaults.
+  const [selectedExchange, setSelectedExchange] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null
+    try { return localStorage.getItem("ex:selectedExchange") || null } catch { return null }
+  })
+  const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null
+    try { return localStorage.getItem("ex:selectedConnectionId") || null } catch { return null }
+  })
   const [activeConnections, setActiveConnections] = useState<any[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const loadingRef = useRef(false)
   const lastLoadRef = useRef(0)
   // Use a ref to read selectedConnectionId inside the callback without stale closure
   const selectedConnectionIdRef = useRef<string | null>(null)
+  // Seed ref immediately (sync, before mount effects) from persisted value
+  if (typeof window !== "undefined") {
+    try {
+      const persisted = localStorage.getItem("ex:selectedConnectionId")
+      if (persisted) selectedConnectionIdRef.current = persisted
+    } catch { /* ignore */ }
+  }
   const LOAD_COOLDOWN = 10000 // 10 seconds between refreshes
 
   const loadActiveConnections = useCallback(async (options?: { force?: boolean }) => {
@@ -101,6 +117,22 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
       }
     }
   }, [])
+
+  // Persist selection changes to localStorage so reloads restore the exact
+  // same session & situation (selected connection drives QuickStart etc.)
+  useEffect(() => {
+    try {
+      if (selectedExchange) localStorage.setItem("ex:selectedExchange", selectedExchange)
+      else localStorage.removeItem("ex:selectedExchange")
+    } catch { /* localStorage may be unavailable */ }
+  }, [selectedExchange])
+
+  useEffect(() => {
+    try {
+      if (selectedConnectionId) localStorage.setItem("ex:selectedConnectionId", selectedConnectionId)
+      else localStorage.removeItem("ex:selectedConnectionId")
+    } catch { /* localStorage may be unavailable */ }
+  }, [selectedConnectionId])
 
   const selectedConnection = activeConnections.find((connection: any) => connection.id === selectedConnectionId) || null
 
