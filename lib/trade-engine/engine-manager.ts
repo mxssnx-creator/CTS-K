@@ -738,9 +738,58 @@ export class TradeEngineManager {
       }
 
       if (!cacheHit) {
-        // Non-blocking prehistoric loading (fresh or forced after stale cache)
-        await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
-        this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
+        // ── PRODUCTION FAST-PATH FOR LIVE TRADING ─────────────────────────
+        // In production (Vercel serverless / cold starts / limited function lifetime)
+        // the full prehistoric load can never complete inside one invocation.
+        // This left stats stalling at "prehistoric_data" and prevented any
+        // new live positions from opening even when is_live_trade=1 and
+        // quickstart had enabled the connection.
+        //
+        // Fix: when running in production *and* the connection has live trade
+        // enabled, immediately mark prehistoric done (so the self-gating ticks
+        // become productive) and arm all processors. Historic set filling
+        // continues in the background via crons + the continuous prehistoric
+        // path. Live position adoption, mark sync, SL/TP healing, and any
+        // realtime signals that can fire will work immediately.
+        // This makes prod behavior match the user's expectation from dev/quickstart.
+        const { isProductionEnvironment } = await import("@/lib/redis-db")
+        const isProd = isProductionEnvironment()
+        let liveTradeOn = false
+        try {
+          const connData = await redisClient.hgetall(`connection:${this.connectionId}`).catch(() => ({} as any))
+          liveTradeOn = connData && (
+            connData.is_live_trade === "1" || connData.is_live_trade === true ||
+            connData.live_trade_enabled === "1" || connData.live_trade_enabled === true
+          )
+        } catch { /* non-fatal */ }
+
+        if (isProd && liveTradeOn) {
+          console.log(
+            `[v0] [Engine ${this.connectionId}] PRODUCTION + live_trade=1 → forcing prehistoric done + arming processors immediately. ` +
+            `Historic enrichment will backfill via crons. This fixes "stalling stats / no live positions" in prod.`
+          )
+          try {
+            await redisClient.set(`prehistoric:${this.connectionId}:done`, "1")
+            await redisClient.set(`prehistoric:${this.connectionId}:firstpass:done`, "1")
+            await redisClient.hset(`prehistoric:${this.connectionId}`, {
+              is_complete: "1",
+              data_source: "production-fast-path",
+              updated_at: new Date().toISOString(),
+            })
+            await redisClient.set(prehistoricCacheKey, "1", { EX: 86400 }).catch(() => {})
+          } catch (forceErr) {
+            console.warn(`[v0] [Engine] Failed to force prehistoric done in prod fast-path:`, forceErr)
+          }
+          // Arm processors right now (they will self-gate on the flags we just set)
+          this.startIndicationProcessor(config.indicationInterval)
+          this.startStrategyProcessor(config.strategyInterval)
+          this.startRealtimeProcessor(config.realtimeInterval)
+          cacheHit = true // treat as hit for the rest of startup
+        } else {
+          // Non-blocking prehistoric loading (fresh or forced after stale cache) — dev / non-live paths
+          await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
+          this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
+        }
       }
 
       // Mark engine as running BEFORE starting the self-scheduling processor
