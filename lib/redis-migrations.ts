@@ -1472,7 +1472,21 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
       last_prehistoric_repair: new Date().toISOString(),
     }).catch(() => {})
 
-    console.log(`[v0] [Migrations] [PROD-COVERAGE] Complete coverage repair finished for ${connSet.size} connections (including FULL prehistoric structures + logistics)`)
+    // Ensure uniqueness/solidity snapshot fields exist on progression hashes (for the new per-progress isolation)
+    for (const connId of connSet) {
+      const progKey = `progression:${connId}`
+      const hasSnapshot = await client.hget(progKey, "progress_settings_snapshot").catch(() => null)
+      if (!hasSnapshot) {
+        await client.hset(progKey, {
+          symbol_count: "0",
+          active_symbols_hash: "",
+          started_for_settings_version: new Date().toISOString(),
+          progress_settings_snapshot: JSON.stringify({ initialized_by: "prod_coverage", at: new Date().toISOString() }),
+        }).catch(() => {})
+      }
+    }
+
+    console.log(`[v0] [Migrations] [PROD-COVERAGE] Complete coverage repair finished for ${connSet.size} connections (including FULL prehistoric structures + logistics + per-progress uniqueness)`)
   } catch (err) {
     console.warn("[v0] [Migrations] [PROD-COVERAGE] Repair pass had non-fatal error (continuing):", err)
   }

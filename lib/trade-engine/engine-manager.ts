@@ -540,6 +540,17 @@ export class TradeEngineManager {
     try {
       // Ensure Redis is initialized before using it
       await initRedis()
+
+      // ── RE-COORDINATE FOR ACTUAL LIVE STATE (prevents stalling to old/different settings+symbols) ──
+      // Before starting anything, check if the existing progression (if any) was born for
+      // different settings / symbol count than what is live *right now*.
+      // If mismatch → previous running progress is stopped (via archive) and we start a fresh,
+      // unique, solid progression for the *actual* current configuration of this connection.
+      try {
+        await ProgressionStateManager.recoordinateForActualOne(this.connectionId)
+      } catch (recoordErr) {
+        console.warn("[v0] [Engine] Re-coordination check failed (continuing):", recoordErr)
+      }
       
       // ── Initialise / archive progression state ────────────────────────
       // `archiveAndStartNewProgression` handles both cases:
@@ -574,6 +585,42 @@ export class TradeEngineManager {
         active_symbols: symbols,
         updated_at: new Date().toISOString(),
       })
+
+      // ── SOLIDIFY THIS PROGRESSION WITH CURRENT ACTUAL STATE ─────────
+      // Immediately after starting a new progression, capture the *exact* live
+      // symbols + key settings that this run was started for.
+      // This makes the progress "Unique and Solid" for this (connection + settings + symbol count).
+      // Future re-coordination can compare against this snapshot.
+      try {
+        const redisClient = getRedisClient()
+        const symbolCount = symbols.length
+        const symbolsHash = symbols.sort().join("|") // simple deterministic hash
+        // Snapshot a minimal but useful slice of current connection settings
+        const connData = (await redisClient.hgetall(`connection:${this.connectionId}`).catch(() => ({}))) as Record<string, string>
+        const settingsSnapshot = {
+          symbol_count: symbolCount,
+          symbols_hash: symbolsHash,
+          is_live_trade: connData.is_live_trade || "0",
+          is_preset_trade: connData.is_preset_trade || "0",
+          live_volume_factor: connData.live_volume_factor || "1",
+          connection_method: connData.connection_method || "library",
+          updated_at: new Date().toISOString(),
+        }
+
+        await redisClient.hset(`progression:${this.connectionId}`, {
+          symbol_count: String(symbolCount),
+          active_symbols_hash: symbolsHash,
+          started_for_settings_version: new Date().toISOString(),
+          progress_settings_snapshot: JSON.stringify(settingsSnapshot),
+        }).catch(() => {})
+
+        console.log(
+          `[v0] [Engine] Progression solidified for ${this.connectionId}: ` +
+          `symbols=${symbolCount}, hash=${symbolsHash.slice(0, 16)}... (epoch=${this.epoch})`
+        )
+      } catch (snapErr) {
+        console.warn("[v0] [Engine] Could not write progression solidity snapshot:", snapErr)
+      }
 
       const loaded = await loadMarketDataForEngine(symbols)
       if (loaded === 0) {

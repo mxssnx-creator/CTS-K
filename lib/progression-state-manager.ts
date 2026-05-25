@@ -144,6 +144,14 @@ export interface ProgressionState {
   indicationsCount?: number
   strategiesCount?: number
 
+  // ── UNIQUENESS / SOLIDITY SNAPSHOT (prevents "stalling to different one") ──
+  // Captured at the exact moment this progression session was born.
+  // Makes every progress for a connection unique to its (settings + symbol list) at start time.
+  progressSettingsSnapshot?: Record<string, any>
+  symbolCount?: number
+  activeSymbolsHash?: string
+  startedForSettingsVersion?: string
+
   // ── Per-processor cycle counters (cumulative, hincrby) ─────────────
   // Each processor (indication / strategy / realtime) writes these
   // atomically on every tick. They survive engine restarts and are the
@@ -760,6 +768,14 @@ export class ProgressionStateManager {
         strategies_base_evaluated: "0",
         strategies_main_evaluated: "0",
         strategies_real_evaluated: "0",
+
+        // Uniqueness snapshot fields (filled by engine-manager immediately after start
+        // with the *actual* live settings + symbols for this specific progression run).
+        // This guarantees each connection's progress is solid and isolated to what it was started for.
+        symbol_count: "0",
+        active_symbols_hash: "",
+        started_for_settings_version: "",
+        progress_settings_snapshot: "{}",
       })
 
       console.log(
@@ -769,6 +785,84 @@ export class ProgressionStateManager {
     } catch (error) {
       console.error(`[v0] Failed to archive/start progression for ${connectionId}:`, error)
       return 1
+    }
+  }
+
+  /**
+   * Re-coordinate the progression for the *actual* current live state of the connection.
+   *
+   * If the active progression's snapshot (symbol count, settings hash, etc.) differs
+   * from what is currently live in `connection:${id}` + symbol list, this forces a
+   * clean stop of the previous running progress + starts a brand new unique one.
+   *
+   * Call this on settings change, symbol list edit, connection toggle, etc.
+   * Guarantees: previous progress is stopped (via archive + epoch bump), new one is
+   * solid for the actual current configuration.
+   */
+  static async recoordinateForActualOne(connectionId: string): Promise<void> {
+    try {
+      await initRedis()
+      const client = getRedisClient()
+      if (!client) return
+
+      const key = `progression:${connectionId}`
+      const existing = await client.hgetall(key).catch(() => null)
+      if (!existing || Object.keys(existing).length === 0) {
+        // No active progress — nothing to re-coordinate
+        return
+      }
+
+      // Resolve current live state
+      const connData = (await client.hgetall(`connection:${connectionId}`).catch(() => ({}))) as Record<string, string>
+      // Best effort: ask engine for current symbols (or fall back to stored)
+      let currentSymbols: string[] = []
+      try {
+        const state = (await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({}))) as Record<string, string>
+        if (state.symbols) currentSymbols = JSON.parse(state.symbols)
+      } catch {}
+      if (currentSymbols.length === 0) {
+        // fallback
+        const cd = connData as Record<string, string>
+        currentSymbols = (cd.active_symbols ? JSON.parse(cd.active_symbols) : [])
+      }
+
+      const liveSymbolCount = currentSymbols.length
+      const liveSymbolsHash = currentSymbols.sort().join("|")
+      const liveSnapshot = {
+        symbol_count: liveSymbolCount,
+        symbols_hash: liveSymbolsHash,
+        is_live_trade: connData.is_live_trade,
+        is_preset_trade: connData.is_preset_trade,
+        updated_at: new Date().toISOString(),
+      }
+
+      const storedSymbolCount = parseInt(existing.symbol_count || "0", 10)
+      const storedHash = existing.active_symbols_hash || ""
+
+      const mismatch = storedSymbolCount !== liveSymbolCount || storedHash !== liveSymbolsHash
+
+      if (mismatch) {
+        console.log(
+          `[v0] [Progression] Re-coordination needed for ${connectionId}: ` +
+          `stored symbols=${storedSymbolCount} vs live=${liveSymbolCount}. ` +
+          `Stopping previous progress and starting fresh for actual state.`
+        )
+
+        // Force archive + new start (this stops previous via the archive logic + new epoch)
+        const newEpoch = Date.now()
+        await this.archiveAndStartNewProgression(connectionId, newEpoch)
+
+        // Immediately solidify the new one with the *actual* live data
+        await client.hset(key, {
+          symbol_count: String(liveSymbolCount),
+          active_symbols_hash: liveSymbolsHash,
+          started_for_settings_version: new Date().toISOString(),
+          progress_settings_snapshot: JSON.stringify(liveSnapshot),
+          prehistoric_phase_active: "false",
+        }).catch(() => {})
+      }
+    } catch (err) {
+      console.warn(`[v0] [Progression] recoordinateForActualOne failed for ${connectionId}:`, err)
     }
   }
 }
