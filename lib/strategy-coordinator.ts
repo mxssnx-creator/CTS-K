@@ -1870,8 +1870,28 @@ export class StrategyCoordinator {
      // entry (axis Sets always have entries for synthetic tracking), it should
      // pass the gate and be evaluated on PF/DDT merit. This allows fresh
      // connections to start generating positions on cycle 1.
-     const realMinPos = this._coordinationSettings.realEvalPosCount
-     const beforePosGate = mainSets.length
+      let realMinPos = this._coordinationSettings.realEvalPosCount
+      const beforePosGate = mainSets.length
+
+      // ── Production + Live Trade relaxation for fresh quickstarts ─────
+      // After quickstart (10 symbols, minimal history), many Main sets have low
+      // entryCount / prevPos.count. Strict realMinPos (default 10) prevents any
+      // Real sets from being created → no live positions open in Production.
+      // When live trading is explicitly enabled in prod, temporarily lower the
+      // gate so the first qualifying sets can escalate to Live while history
+      // accumulates. The PF/DDT filter still applies.
+      try {
+        const { isProductionEnvironment, getConnection: getConn } = await import("@/lib/redis-db")
+        const { isTruthyFlag } = await import("@/lib/connection-state-utils")
+        if (isProductionEnvironment()) {
+          const conn = await getConn(this.connectionId).catch(() => null as any)
+          const liveOn = isTruthyFlag(conn?.is_live_trade) || isTruthyFlag(conn?.live_trade_enabled)
+          if (liveOn) {
+            // Fresh quickstart often has very low historic counts — allow at least a few positions
+            realMinPos = Math.max(1, Math.min(realMinPos, 3))
+          }
+        }
+      } catch { /* non-fatal */ }
      
      // Get real active keys for validation (moved outside try block for scope access)
      let realActiveKeysForVP: Set<string> = new Set()
