@@ -1637,7 +1637,7 @@ export class StrategyCoordinator {
       ? Math.min(1, uniqueBaseSetsProduced.size / baseSets.length)
       : 0
 
-    // ── Write Main counts to Redis ──���─────────────────────────────���───────
+    // ── Write Main counts to Redis ──���─────────────────────────────�����───────
     // CUMULATIVE via hincrby so the dashboard does not oscillate with
     // per-cycle snapshots (see matching fix in createBaseSets).
     try {
@@ -1808,8 +1808,9 @@ export class StrategyCoordinator {
           const quantity    = set.entryCount || 1
           const positionCost = entryPrice * quantity
 
+          const pseudoPosId = `pseudo-${this.connectionId}-${setKey}-${nowMs}`
           const pseudoPos = {
-            id: `pseudo-${this.connectionId}-${setKey}-${nowMs}`,
+            id: pseudoPosId,
             connectionId: this.connectionId,
             symbol,
             direction: set.direction || "long",
@@ -1818,19 +1819,32 @@ export class StrategyCoordinator {
             position_cost: positionCost,
             status: "open",
             position_level: "real",
+            // set_id: the unique Set identity used by Live stage for per-Set
+            // dedup and by syncLiveFromPseudo for pseudoPositionId scoping.
+            set_id: setKey,
             config_set_key: setKey,
             source_set_key: setKey,
+            // pseudoPositionId is propagated to RealPosition → LivePosition
+            // so syncLiveFromPseudo can filter by Set identity (Bug 6 fix).
+            pseudoPositionId: pseudoPosId,
             created_at: createdAtIso,
             profit_factor: set.avgProfitFactor || 0,
             confidence: set.avgConfidence || 0,
           }
 
-          // 3 writes per set, executed concurrently (one RTT window).
+          // 4 writes per set, executed concurrently (one RTT window):
+          //   1. Persist the pseudo position itself.
+          //   2. Add to the connection-wide pseudo positions set.
+          //   3. Record the set → posId mapping (dedup gate).
+          //   4. Register the setKey in active_config_keys so getActiveConfigKeys()
+          //      returns it — this is what realActiveKeysForVP reads, and it's
+          //      what keeps the Set's "active" status alive across cycles (Bug 2/5 fix).
           writeBatches.push(
             Promise.all([
               setSettings(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, pseudoPos),
               client.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id),
               setSettings(existingKey, { posId: pseudoPos.id, createdAt: nowMs }),
+              client.sadd(`pseudo_positions:${this.connectionId}:active_config_keys`, setKey),
             ]).catch((err) => {
               console.warn(`[StrategyFlow] Failed to create pseudo position for set ${setKey}:`, err)
             })
@@ -1934,14 +1948,31 @@ export class StrategyCoordinator {
 
     // P0-2: Real filter axes are PF-min + DDT-max ONLY. Confidence is
     // advisory metadata and is not part of the filter predicate.
-    // Mark status on mainSetsEligible for efficient tracking
+    // Mark status on mainSetsEligible for efficient tracking.
+    //
+    // BYPASS: Sets that currently have open live positions (status = "active"
+    // from a prior cycle or marked via _hasLivePositions) are NEVER filtered
+    // out by the PF/DDT gate. The position is already open on the exchange;
+    // ejecting the Set from realSets would orphan the live position and
+    // prevent the coordinated close/update path from finding it.
+    const _pfdGateKeys: Set<string> = (typeof realActiveKeysForVP !== "undefined" && realActiveKeysForVP instanceof Set)
+      ? realActiveKeysForVP
+      : new Set<string>()
     const realQualifying = mainSetsEligible.filter(
       (s) => {
         // Skip already-marked invalid (insufficient positions)
         if (s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")) {
           return false
         }
-        
+
+        // Active Sets — bypass PF/DDT gate while live position is open.
+        const parentKey = (s.parentSetKey ?? s.setKey).split("#")[0]
+        const isActiveSet = _pfdGateKeys.has(s.setKey) || _pfdGateKeys.has(parentKey) || (s as any)._hasLivePositions === true
+        if (isActiveSet) {
+          s.status = "active"
+          return true
+        }
+
         const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
                       s.avgDrawdownTime <= metrics.maxDrawdownTime
         if (passes) {
@@ -2097,6 +2128,25 @@ export class StrategyCoordinator {
     // operator's `maxRealSets` setting and apply it here. For now,
     // slice(0, Infinity) is a no-op.
     const realSets = realPostHedge.slice(0, this.config.maxRealSets ?? Infinity)
+
+    // ── Mark active Sets BEFORE any persistence (Bug 3 fix) ─────────────────
+    // A Set is "active" when it has an open live position tracked in the
+    // realActiveKeysForVP SMEMBERS set. Marking it here — immediately after
+    // realSets is finalized and BEFORE setSettings(realKey, ...) — ensures
+    // Redis always stores "active" instead of "valid_real" for these Sets.
+    // The downstream dashboard, Live stage, and the PF/DDT bypass all rely on
+    // reading `status = "active"` from the persisted Redis value.
+    {
+      const _activeMark: Set<string> = (typeof realActiveKeysForVP !== "undefined" && realActiveKeysForVP instanceof Set)
+        ? realActiveKeysForVP
+        : new Set<string>()
+      for (const s of realSets) {
+        const parentKey = (s.parentSetKey ?? s.setKey).split("#")[0]
+        if (_activeMark.has(s.setKey) || _activeMark.has(parentKey)) {
+          s.status = "active"
+        }
+      }
+    }
 
     // ── Real-stage tuner — per-variant adjustments from Base prev-pos ──
     //
@@ -2358,20 +2408,9 @@ export class StrategyCoordinator {
       // of PF/DDT evaluation. We count them from the full realSets list
       // plus those that might have been gated out by pos-count but have
       // active positions (they survive in mainSetsEligible with valid_real).
-      const realActiveCount = realSets.filter((s) => {
-        const parentKey = (s.parentSetKey ?? s.setKey).split("#")[0]
-        const _safeKeys = typeof realActiveKeysForVP !== "undefined" && realActiveKeysForVP instanceof Set ? realActiveKeysForVP : new Set<string>()
-        return _safeKeys.has(parentKey) || _safeKeys.has(s.setKey)
-      }).length
-      // Mark active Sets with the "active" status so downstream consumers
-      // (Live stage, dashboard) can identify continuously-valid open-position Sets.
-      for (const s of realSets) {
-        const parentKey = (s.parentSetKey ?? s.setKey).split("#")[0]
-        const _sk = typeof realActiveKeysForVP !== "undefined" && realActiveKeysForVP instanceof Set ? realActiveKeysForVP : new Set<string>()
-        if (_sk.has(parentKey) || _sk.has(s.setKey)) {
-          s.status = "active"
-        }
-      }
+      // Count active Sets — status was already set to "active" before setSettings()
+      // so we can simply count the Sets that are already marked.
+      const realActiveCount = realSets.filter((s) => s.status === "active").length
 
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),

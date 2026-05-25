@@ -124,47 +124,280 @@ interface FillRecord {
   feeAsset?: string
 }
 
-// ── Helper function stubs (defined in adjacent modules) ──────────────
-// live-stage.ts calls a set of helpers that live in the trade-engine
-// package.  They are declared here so TypeScript can type-check call sites
-// even when the defining modules are not yet wired up.
+// ── Helper functions (real implementations) ─────────────────────────
+// These helpers are intentionally defined as module-level functions
+// (not imported from a separate file) so they share the same module
+// scope as executeLivePosition, reconcileLivePositions, etc. and can
+// reference the Redis client + LivePosition type directly.
+
+/** Append a progression step to position.progression (bounded to 100 entries). */
 function pushStep(position: LivePosition, step: string, ok: boolean, detail: string): void {
-  /* live-stage progression helper — defined alongside stage pipeline */
+  if (!Array.isArray(position.progression)) position.progression = []
+  position.progression.push({ step, timestamp: Date.now(), success: ok, details: detail })
+  if (position.progression.length > 100) position.progression = position.progression.slice(-100)
 }
+
+/**
+ * Persist a LivePosition to Redis.
+ *
+ * Key layout:
+ *   live:position:{id}         — full JSON, TTL 7 days
+ *   live:positions:{connId}    — open-index list (lpush + dedup via LREM)
+ *   live:closed:{connId}       — closed-archive list (lpush, capped at 2000)
+ *
+ * The function is idempotent: repeated calls for the same position ID are
+ * safe because the list dedup (LREM → LPUSH) prevents duplicates.
+ */
 async function savePosition(position: LivePosition): Promise<void> {
-  /* stub — also exported from redis-db.ts */
+  if (!position?.id) return
+  try {
+    const client = getRedisClient()
+    const key   = `live:position:${position.id}`
+    const connId = position.connectionId || position.connection_id || ""
+    const TTL   = 7 * 24 * 60 * 60 // 7 days
+
+    await client.set(key, JSON.stringify(position), { EX: TTL } as any)
+
+    if (connId) {
+      const isClosed = position.status === "closed" || position.status === "rejected" || position.status === "cancelled"
+      const openIdx  = `live:positions:${connId}`
+      const closedIdx = `live:closed:${connId}`
+
+      if (isClosed) {
+        // Remove from open index, push to closed archive.
+        await client.lrem(openIdx, 0, position.id).catch(() => {})
+        await client.lpush(closedIdx, position.id).catch(() => {})
+        // Cap archive at 2000 entries.
+        await client.ltrim(closedIdx, 0, 1999).catch(() => {})
+      } else {
+        // Remove any stale duplicate then re-insert at head (LREM is O(N)
+        // but N is bounded to 500 open positions in practice).
+        await client.lrem(openIdx, 0, position.id).catch(() => {})
+        await client.lpush(openIdx, position.id).catch(() => {})
+        // Prevent unbounded list growth — keep at most 500 open entries.
+        await client.ltrim(openIdx, 0, 499).catch(() => {})
+        await client.expire(openIdx, TTL).catch(() => {})
+      }
+    }
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} savePosition error for ${position.id}:`, err instanceof Error ? err.message : String(err))
+  }
 }
-async function incrementMetric(connectionId: string, metric: string, delta?: number): Promise<void> {
-  /* stub */
+
+/** Increment a named metric counter in the per-connection progression hash. */
+async function incrementMetric(connectionId: string, metric: string, delta = 1): Promise<void> {
+  if (!connectionId || !metric) return
+  try {
+    const client = getRedisClient()
+    await client.hincrby(`progression:${connectionId}`, metric, delta)
+  } catch { /* non-critical */ }
 }
+
+/** Increment a per-symbol order metric (used for per-symbol fill/reject tracking). */
 async function incrementOrdersBySymbol(connectionId: string, symbol: string, side: string, metric: string): Promise<void> {
-  /* stub */
+  if (!connectionId || !symbol) return
+  try {
+    const client = getRedisClient()
+    await client.hincrby(`live_orders:${connectionId}:${symbol}`, `${side}_${metric}`, 1)
+  } catch { /* non-critical */ }
 }
+
+/**
+ * Acquire the per-(connId, symbol, direction) dedup lock using Redis SET NX.
+ *
+ * Returns the lock token (timestamp string) on success, or null when another
+ * entry for this symbol+direction is already in-flight.
+ * TTL is 300 s — a safety net for process death mid-execution.
+ */
 async function tryAcquireLock(connId: string, symbol: string, direction: string): Promise<string | null> {
-  /* stub */
-  return null
+  if (!connId || !symbol) return null
+  try {
+    const client = getRedisClient()
+    const lockKey = `live:lock:${connId}:${symbol}:${direction}`
+    const token   = String(Date.now())
+    const result  = await (client.set(lockKey, token, { NX: true, EX: 300 }) as any)
+    return result === "OK" ? token : null
+  } catch {
+    // Redis unreachable — fail open (allow the entry) to avoid permanent stall.
+    return String(Date.now())
+  }
 }
+
+/**
+ * Find the first open live position for (connId, symbol, side).
+ *
+ * "Open" means status is one of: open | filled | partially_filled | placed | simulated.
+ * Returns null when no such position exists.
+ */
 async function findOpenLivePositionByDir(connId: string, symbol: string, side: string): Promise<LivePosition | null> {
-  /* stub */
-  return null
+  if (!connId || !symbol) return null
+  try {
+    const client  = getRedisClient()
+    const normSym = symbol.toUpperCase().replace(/[-_]/g, "")
+    const OPEN_STATUSES = new Set(["open", "filled", "partially_filled", "placed", "simulated"])
+
+    // Use the open-index list maintained by savePosition.
+    const ids = ((await client.lrange(`live:positions:${connId}`, 0, 499).catch(() => [])) || []) as string[]
+    if (ids.length === 0) return null
+
+    const raws = await Promise.all(ids.map((id) => client.get(`live:position:${id}`).catch(() => null)))
+    for (const raw of raws) {
+      if (!raw) continue
+      try {
+        const pos: LivePosition = JSON.parse(raw as string)
+        if (!OPEN_STATUSES.has(pos.status ?? "")) continue
+        const posSide = (pos.direction === "short" || (pos as any).side === "short") ? "short" : "long"
+        if (String(pos.symbol || "").toUpperCase().replace(/[-_]/g, "") === normSym && posSide === side) {
+          return pos
+        }
+      } catch { /* malformed — skip */ }
+    }
+    return null
+  } catch {
+    return null
+  }
 }
+
+/**
+ * Fetch the current mark/last price for a symbol.
+ *
+ * Resolution order:
+ *   1. market_data:{symbol}:1s  →  candles[last].close
+ *   2. market_data:{symbol}:1m  →  candles[last].close
+ *   3. market_data:{symbol}     →  close | price | last fields
+ *   4. Returns 0 when no data is available.
+ */
 async function fetchCurrentPrice(symbol: string, connId?: string): Promise<number> {
-  /* stub */
-  return 0
+  if (!symbol) return 0
+  try {
+    const client  = getRedisClient()
+    const normSym = symbol.toUpperCase().replace(/[-_]/g, "")
+
+    const tryInterval = async (interval: string): Promise<number> => {
+      const raw = await client.get(`market_data:${normSym}:${interval}`).catch(() => null)
+      if (!raw) return 0
+      const parsed = JSON.parse(raw as string)
+      // Candle array: last element's close.
+      if (Array.isArray(parsed?.candles) && parsed.candles.length > 0) {
+        const last = parsed.candles[parsed.candles.length - 1]
+        const price = parseFloat(String(last?.close ?? last?.c ?? 0))
+        if (price > 0) return price
+      }
+      // Direct price fields.
+      const p = parseFloat(String(parsed?.close ?? parsed?.price ?? parsed?.last ?? 0))
+      return p > 0 ? p : 0
+    }
+
+    for (const interval of ["1s", "1m"]) {
+      const price = await tryInterval(interval)
+      if (price > 0) return price
+    }
+
+    // Fallback: bare market_data:{symbol} key (legacy writer).
+    const raw = await client.get(`market_data:${normSym}`).catch(() => null)
+    if (raw) {
+      const parsed = JSON.parse(raw as string)
+      const p = parseFloat(String(parsed?.close ?? parsed?.price ?? parsed?.last ?? 0))
+      if (p > 0) return p
+    }
+    return 0
+  } catch {
+    return 0
+  }
 }
-async function accumulateIntoLivePosition(connId: string, existing: LivePosition, real: any, price: number, connector: any): Promise<LivePosition> {
-  /* stub */
+
+/**
+ * Accumulate a new Real-Set entry into an existing live position (DCA / grid merge).
+ *
+ * Hard cap: MAX_ACCUMULATIONS_PER_POSITION. Above the cap the function
+ * returns the existing position unchanged.
+ *
+ * When below the cap it:
+ *   1. Computes the additional quantity from the new Real Set's entryCount.
+ *   2. Updates executedQuantity and recomputes the weighted-average entry price.
+ *   3. Registers the new setKey in accumulatedSetKeys to track lineage.
+ *   4. Marks the position as needing SL/TP re-arm (handled by the caller).
+ */
+async function accumulateIntoLivePosition(
+  connId: string,
+  existing: LivePosition,
+  real: any,
+  price: number,
+  connector: any,
+): Promise<LivePosition> {
+  const accumulated = Array.isArray(existing.accumulatedSetKeys) ? existing.accumulatedSetKeys : []
+  if (accumulated.length >= MAX_ACCUMULATIONS_PER_POSITION) {
+    return existing
+  }
+
+  const addQty = Math.max(1, Number(real?.entryCount || real?.quantity || 1))
+  const prevQty   = Number(existing.executedQuantity || existing.quantity || 0)
+  const prevEntry = Number(existing.averageExecutionPrice || existing.entryPrice || price)
+  const newQty    = prevQty + addQty
+  const newAvgEntry = newQty > 0 ? (prevQty * prevEntry + addQty * price) / newQty : prevEntry
+
+  const incomingSetKey = String(real?.setKey || real?.config_set_key || "")
+
+  existing.executedQuantity      = newQty
+  existing.quantity              = newQty
+  existing.averageExecutionPrice = newAvgEntry
+  existing.accumulatedSetKeys    = Array.from(new Set([...accumulated, incomingSetKey].filter(Boolean)))
+  existing.updatedAt             = Date.now()
+
+  pushStep(existing, "accumulate", true, `+${addQty} qty from setKey=${incomingSetKey} at price=${price}`)
   return existing
 }
-async function refreshLockTTL(connId: string, symbol: string, direction: string, ttlMs?: number): Promise<void> {
-  /* stub */
+
+/** Refresh the TTL on an in-flight dedup lock without releasing it. */
+async function refreshLockTTL(connId: string, symbol: string, direction: string, ttlMs = 300_000): Promise<void> {
+  if (!connId || !symbol) return
+  try {
+    const client  = getRedisClient()
+    const lockKey = `live:lock:${connId}:${symbol}:${direction}`
+    await client.expire(lockKey, Math.max(1, Math.round(ttlMs / 1000)))
+  } catch { /* non-critical */ }
 }
+
+/** Release the per-(connId, symbol, direction) dedup lock. */
 async function releaseLock(connId: string, symbol: string, direction: string): Promise<void> {
-  /* stub */
+  if (!connId || !symbol) return
+  try {
+    const client  = getRedisClient()
+    await client.del(`live:lock:${connId}:${symbol}:${direction}`)
+  } catch { /* non-critical */ }
 }
+
+// In-process cache so resolveMaxHoldMs doesn't hit Redis on every cycle call.
+const _maxHoldMsCache: Map<string, { value: number; at: number }> = new Map()
+
+/**
+ * Read the operator-configured max hold time for a connection, in milliseconds.
+ *
+ * Reads `maxHoldTimeMs` (preferred) or `maxHoldTimeHours` from app settings.
+ * Returns 0 when max-hold is disabled or unconfigured.
+ * Cached in-process for 30 seconds to avoid Redis round-trips on every tick.
+ */
 function resolveMaxHoldMs(connId: string): number {
-  /* stub */
-  return 0
+  const cached = _maxHoldMsCache.get(connId)
+  if (cached && Date.now() - cached.at < 30_000) return cached.value
+
+  // Return 0 synchronously (the async setting is refreshed in the background).
+  // The background refresh runs at most once per 30 s so we don't stack awaits.
+  void (async () => {
+    try {
+      const { getAppSettings } = await import("@/lib/redis-db")
+      const settings = await getAppSettings()
+      let ms = 0
+      if (settings.maxHoldTimeMs && Number(settings.maxHoldTimeMs) > 0) {
+        ms = Number(settings.maxHoldTimeMs)
+      } else if (settings.maxHoldTimeHours && Number(settings.maxHoldTimeHours) > 0) {
+        ms = Number(settings.maxHoldTimeHours) * 60 * 60 * 1000
+      }
+      _maxHoldMsCache.set(connId, { value: ms, at: Date.now() })
+    } catch { /* non-critical — keep prior cached value */ }
+  })()
+
+  return cached?.value ?? 0
 }
 
 /**
@@ -3527,6 +3760,16 @@ export async function reconcileLivePositions(
     //     drift the operator reported even under interleaved execution.
     // So we can fan the loop body out with bounded concurrency. Returns
     // a tiny per-position delta that the caller folds into `summary`.
+    //
+    // ── Multi-Set slot tracking (Bug 4 fix) ─────────────────────────
+    // The exchange holds ONE position per symbol+direction. When multiple
+    // Redis live positions share the same slot (from different Sets), only
+    // the FIRST gets full reconcile + close-detection. Subsequent ones on
+    // the same slot share the exchange data (mark price, PnL) but skip the
+    // "not in exchange map → externally closed" branch — they remain valid
+    // until explicitly closed by their own Set's signal.
+    const reconciledSlots = new Set<string>()
+
     type PosDelta = {
       reconciled: number
       updated: number
@@ -3538,6 +3781,8 @@ export async function reconcileLivePositions(
       const delta: PosDelta = { reconciled: 1, updated: 0, closed: 0, errors: 0, protectionRearmed: 0 }
       try {
         const mapKey = `${normSym(pos.symbol)}|${pos.direction}`
+        const slotAlreadyReconciled = reconciledSlots.has(mapKey)
+        reconciledSlots.add(mapKey)
         const exPos = exchangeMap.get(mapKey)
 
         if (exPos) {
@@ -3681,6 +3926,14 @@ export async function reconcileLivePositions(
             return delta
           }
 
+          await savePosition(pos)
+          delta.updated++
+        } else if (slotAlreadyReconciled) {
+          // Secondary Set on the same exchange slot — the exchange has ONE position
+          // for this symbol+direction (already reconciled above). This Redis entry
+          // represents a different Set contributing to the same position; it must
+          // not be treated as "externally closed" just because the slot was already
+          // processed. Simply save the propagated exchange data and move on.
           await savePosition(pos)
           delta.updated++
         } else {
@@ -4902,10 +5155,25 @@ export async function syncLiveFromPseudo(
     const trailingStopPrice = parseFloat(String(pseudoPos?.trailing_stop_price || "0"))
 
     const livePositions = await getLivePositions(connectionId)
+    // ── pseudoPositionId scoping (Bug 6 fix) ──────────────────────────────
+    // When pseudoPos.id is known, filter live positions to ONLY those that
+    // belong to the same pseudo position. This prevents a trailing-stop
+    // update for Set A from being applied to live positions from Sets B and C
+    // that happen to share the same symbol+direction.
+    const pseudoId = String(pseudoPos?.id || "").trim()
     const matches = livePositions.filter((p: any) => {
       const liveSide: "long" | "short" =
         p.direction === "short" || p.side === "short" ? "short" : "long"
-      return String(p.symbol || "").toUpperCase() === symbol && liveSide === side && p.status !== "closed"
+      if (String(p.symbol || "").toUpperCase() !== symbol || liveSide !== side || p.status === "closed") {
+        return false
+      }
+      // When both the pseudo ID and the live position's pseudoPositionId are
+      // known, they must match. If either is absent the filter is open
+      // (backwards-compatible with positions created before this field existed).
+      if (pseudoId && p.pseudoPositionId && p.pseudoPositionId !== pseudoId) {
+        return false
+      }
+      return true
     })
     if (matches.length === 0) return
 
