@@ -308,7 +308,7 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                      onValueChange={(v) => handleSettingChange("prehistoric_progression_timeout_minutes", v[0])}
                      min={5}
                      max={25}
-                     step={2.5}
+                     step={2.5 as any}
                    />
                  </div>
                </div>

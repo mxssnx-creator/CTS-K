@@ -50,6 +50,7 @@ interface Settings {
   leveragePercentage: number
   prehistoricDataDays: number
   prehistoric_range_hours: number // 1-50h, step 1, default 8
+  prehistoric_progression_timeout_minutes?: number // 5-25 min, step 2.5, default 10
   marketTimeframe: number
   tradeIntervalSeconds: number
   realPositionsIntervalSeconds: number

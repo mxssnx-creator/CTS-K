@@ -29,23 +29,43 @@ export class SimulatedConnector extends BaseExchangeConnector {
     return { success: true, orderId, filledQty: quantity, filledPrice }
   }
 
-  async placeStopOrder(symbol: string, side: "buy" | "sell", quantity: number, price: number, type: string): Promise<string | null> {
-    return `sim-stop-${Date.now()}`
+  async placeStopOrder(
+    symbol: string,
+    closeSide: "buy" | "sell",
+    quantity: number,
+    triggerPrice: number,
+    kind: "stop_loss" | "take_profit",
+    options: any = {},
+  ): Promise<{ success: boolean; orderId?: string; error?: string }> {
+    const id = `sim-stop-${Date.now()}`
+    return { success: true, orderId: id }
   }
 
   async getOrder(symbol: string, orderId: string): Promise<any> {
     return { success: true, orderId, status: "filled", filledQty: 0, avgPrice: 0 }
   }
 
+  async getOpenOrders(symbol?: string): Promise<any[]> {
+    return []
+  }
+
+  async getOrderHistory(symbol?: string, limit: number = 50): Promise<any[]> {
+    return []
+  }
+
   async getPosition(symbol: string): Promise<any> {
-    return { size: 0, entryPrice: 0 }
+    return { symbol, side: "long", contracts: 0, entryPrice: 0, currentPrice: 0, markPrice: 0, leverage: 1, marginType: "cross", unrealizedPnl: 0, realizedPnl: 0, liquidationPrice: 0, timestamp: Date.now() }
   }
 
   async getPositions(): Promise<any[]> {
     return []
   }
 
-  async closePosition(symbol: string, direction: string): Promise<{ success: boolean; error?: string }> {
+  async modifyPosition(symbol: string, leverage?: number, marginType?: "cross" | "isolated"): Promise<{ success: boolean; error?: string }> {
+    return { success: true }
+  }
+
+  async closePosition(symbol: string, positionSide?: "long" | "short"): Promise<{ success: boolean; error?: string }> {
     return { success: true }
   }
 
@@ -53,11 +73,35 @@ export class SimulatedConnector extends BaseExchangeConnector {
     return { success: true }
   }
 
-  async setLeverage(_symbol: string, _lev: number): Promise<void> {
-    return
+  async getDepositAddress(coin: string): Promise<{ address?: string; error?: string }> {
+    return { address: `sim-address-${coin}` }
   }
 
-  async setMarginType(_symbol: string, _type: string): Promise<void> {
-    return
+  async withdraw(coin: string, address: string, amount: number): Promise<{ success: boolean; txId?: string; error?: string }> {
+    return { success: true, txId: `sim-tx-${Date.now()}` }
+  }
+
+  async getTransferHistory(limit: number = 20): Promise<Array<{ type: string; coin: string; amount: number; timestamp: number }>> {
+    return []
+  }
+
+  async setLeverage(_symbol: string, _lev: number): Promise<{ success: boolean; error?: string }> {
+    return { success: true }
+  }
+
+  async setMarginType(_symbol: string, _type: string): Promise<{ success: boolean; error?: string }> {
+    return { success: true }
+  }
+
+  async setPositionMode(_hedgeMode: boolean): Promise<{ success: boolean; error?: string }> {
+    return { success: true }
+  }
+
+  async getTicker(symbol: string): Promise<{ bid: number; ask: number; last: number } | null> {
+    return { bid: 1, ask: 1.1, last: 1 }
+  }
+
+  async getOHLCV(symbol: string, timeframe: string = "1m", limit: number = 100): Promise<Array<{timestamp: number; open: number; high: number; low: number; close: number; volume: number}> | null> {
+    return []
   }
 }
