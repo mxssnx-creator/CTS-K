@@ -551,24 +551,26 @@ export class TradeEngineManager {
       } catch (recoordErr) {
         console.warn("[v0] [Engine] Re-coordination check failed (continuing):", recoordErr)
       }
-      
-      // ── Initialise / archive progression state ────────────────────────
-      // `archiveAndStartNewProgression` handles both cases:
-      //   • First start: creates a fresh hash with counters = 0.
-      //   • Restart / re-enable: stamps `ended_at` on the old hash,
-      //     snapshots it to `progression:{id}:history:{oldEpoch}` (7-day
-      //     TTL), then creates a clean new hash so this session's counters
-      //     start from zero. The `session_number` field increments so the
-      //     dashboard can show "Progression #N".
-      // This replaces the previous logic that silently preserved counters
-      // across restarts, making it impossible to distinguish sessions.
+
+      // ── ENSURE UNIQUE CONTINUOUS PROGRESSION (core of "one unique session on refresh / independent open") ──
+      // This is the key change:
+      // - Normal page refresh, opening the site in a new tab, or any visit → attaches to the
+      //   SAME ongoing unique progression (same session_number + epoch).
+      // - No new overall progression / instance is started on every visit.
+      // - The progression stays "commonly unique" and continuous.
+      // - Only recoordinate (above) or explicit user "new progression" actions create a new one.
       try {
-        await ProgressionStateManager.archiveAndStartNewProgression(
-          this.connectionId,
-          this.epoch,
+        const cont = await ProgressionStateManager.ensureUniqueContinuousProgression(this.connectionId)
+        this.epoch = cont.epoch   // reuse existing epoch for continuity across visits/refreshes
+        console.log(
+          `[v0] [Engine] Using ${cont.isResumed ? "resumed continuous" : "new"} unique progression ` +
+          `for ${this.connectionId} (session=${cont.sessionNumber}, epoch=${cont.epoch})`
         )
-      } catch (e) {
-        console.warn("[v0] [Engine] Failed to init progression state:", e)
+      } catch (ensureErr) {
+        console.warn("[v0] [Engine] ensureUniqueContinuousProgression failed, falling back:", ensureErr)
+        // Fallback to old behavior only if everything else fails
+        this.epoch = this.lockHandle?.epoch ?? Date.now()
+        await ProgressionStateManager.archiveAndStartNewProgression(this.connectionId, this.epoch).catch(() => {})
       }
 
       // Initialize engine state
