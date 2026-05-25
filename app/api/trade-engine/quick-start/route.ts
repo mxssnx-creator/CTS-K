@@ -478,9 +478,9 @@ export async function POST(request: Request) {
     if (symbols.length > 0) {
       (async () => {
         try {
-          const { SymbolDataProcessor } = await import('@/lib/symbol-data-processor')
-          const processor = new SymbolDataProcessor()
-          await processor.loadPrehistoricDataConcurrent(symbols, 'bingx')
+           const { SymbolDataProcessor } = await import('@/lib/symbol-data-processor')
+           const processor = new SymbolDataProcessor(connectionId)
+           await processor.loadPrehistoricDataConcurrent(symbols, 'bingx')
           console.log(`${LOG_PREFIX}: [3.5] Best-effort prehistoric load triggered for quickstart symbols: ${symbols.join(', ')}`)
         } catch (e) {
           console.warn(`${LOG_PREFIX}: Prehistoric preload for quickstart symbols failed (non-fatal):`, e)
