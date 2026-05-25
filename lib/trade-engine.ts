@@ -604,10 +604,28 @@ export class GlobalTradeEngineCoordinator {
   /**
    * Start engines for connections that should be running but don't have engines
    * Does NOT stop engines - leaves that to explicit user actions via dashboard toggles
+   * Respects pause state - does not start engines when coordinator is paused
    */
   async startMissingEngines(connections: any[]): Promise<number> {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
+
+      // ── Check if coordinator is paused ─────────────────────────────────
+      // If the global coordinator is paused, don't start any engines.
+      // They will resume when the coordinator is resumed.
+      const { getRedisClient, initRedis } = await import("@/lib/redis-db")
+      try {
+        await initRedis()
+        const client = getRedisClient()
+        const globalState = await client.hgetall("trade_engine:global")
+        if ((globalState as any)?.status === "paused") {
+          console.log("[v0] [Coordinator] Skipping startMissingEngines - coordinator is paused")
+          return 0
+        }
+      } catch (err) {
+        console.warn("[v0] [Coordinator] Could not check pause state:", err instanceof Error ? err.message : String(err))
+        // Continue anyway - non-critical
+      }
 
       // Self-heal: make sure the watchdog and metrics tracker are armed
       // before we start any new engines (otherwise any stalls on
@@ -619,10 +637,8 @@ export class GlobalTradeEngineCoordinator {
       // legitimately be (re-)started.
       this.pruneZombieManagers()
 
-      const { initRedis, getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
+      const { getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
-      
-      await initRedis()
       const enabledIds = new Set(connections.map(c => c.id))
       // Only count managers whose engine is actually running, not zombie Map entries from stale closures
       const runningIds = new Set(
@@ -840,6 +856,9 @@ export class GlobalTradeEngineCoordinator {
     this.isPaused = true
     this.isGloballyRunning = false
 
+    // Store which engines were running before pause (so resume can restore them)
+    const stateSnapshot: Record<string, boolean> = {}
+    
     // Stop ALL engine managers immediately
     const allConnectionIds = Array.from(this.engineManagers.keys())
     console.log(`[v0] [Coordinator] Stopping ${allConnectionIds.length} trade engine(s)...`)
@@ -848,12 +867,30 @@ export class GlobalTradeEngineCoordinator {
       try {
         const manager = this.engineManagers.get(connectionId)
         if (manager) {
-          await manager.stop()
-          console.log(`[v0] [Coordinator] ✓ Stopped engine for connection: ${connectionId}`)
+          const wasRunning = manager.isEngineRunning
+          stateSnapshot[connectionId] = wasRunning
+          if (wasRunning) {
+            await manager.stop()
+            console.log(`[v0] [Coordinator] ✓ Stopped engine for connection: ${connectionId}`)
+          }
         }
       } catch (error) {
         console.error(`[v0] [Coordinator] Failed to stop engine for connection ${connectionId}:`, error)
       }
+    }
+
+    // Store engine state snapshot in Redis for restore on resume
+    try {
+      const { getRedisClient } = await import("@/lib/redis-db")
+      const client = getRedisClient()
+      await client.hset("trade_engine:global", {
+        engine_state_snapshot: JSON.stringify(stateSnapshot),
+        engine_state_paused_at: new Date().toISOString(),
+      })
+      console.log("[v0] [Coordinator] Stored engine state snapshot for resume restoration")
+    } catch (err) {
+      console.warn("[v0] [Coordinator] Failed to store engine state snapshot:", err)
+      // Non-fatal - resume will just restart all enabled engines
     }
 
     console.log("[v0] [Coordinator] ✓ Global trade engine PAUSED - all engines stopped")
@@ -874,7 +911,7 @@ export class GlobalTradeEngineCoordinator {
     this.isGloballyRunning = true
 
     try {
-      const { initRedis, getAllConnections } = await import("@/lib/redis-db")
+      const { initRedis, getAllConnections, getRedisClient } = await import("@/lib/redis-db")
       const { loadSettingsAsync } = await import("@/lib/settings-storage")
 
       await initRedis()
@@ -893,22 +930,45 @@ export class GlobalTradeEngineCoordinator {
 
       console.log(`[v0] [Coordinator] Found ${validConnections.length} connections to resume`)
 
+      // Retrieve engine state snapshot from pause to respect individual states
+      let stateSnapshot: Record<string, boolean> = {}
+      try {
+        const client = getRedisClient()
+        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+        if (globalState && globalState.engine_state_snapshot) {
+          stateSnapshot = JSON.parse(globalState.engine_state_snapshot)
+          console.log("[v0] [Coordinator] Restored engine state snapshot from pause")
+        }
+      } catch (err) {
+        console.warn("[v0] [Coordinator] Failed to restore engine state snapshot:", err)
+        // Fall through - will restart all enabled engines (safe default)
+      }
+
       const settings = await loadSettingsAsync()
       let resumedCount = 0
 
-      // Restart engine for each connection
+      // Restart engines only if they were running before pause
       for (const connection of validConnections) {
         try {
-          const config: EngineConfig = {
-            connectionId: connection.id,
-            indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
-            strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
-          }
+          const connectionId = connection.id
+          const wasRunningBeforePause = stateSnapshot[connectionId]
+          
+          // Only restart if it was running before pause, OR if we have no snapshot (first time)
+          if (wasRunningBeforePause !== false) {
+            const config: EngineConfig = {
+              connectionId,
+              indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
+              strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
+              realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+            }
 
-          await this.startEngine(connection.id, config)
-          resumedCount++
-          console.log(`[v0] [Coordinator] ✓ Resumed: ${connection.name}`)
+            await this.startEngine(connectionId, config)
+            resumedCount++
+            const wasRunning = wasRunningBeforePause === true ? " (was running)" : " (no state record, defaulting to resume)"
+            console.log(`[v0] [Coordinator] ✓ Resumed: ${connection.name}${wasRunning}`)
+          } else {
+            console.log(`[v0] [Coordinator] ⊘ Skipped: ${connection.name} (was not running before pause)`)
+          }
         } catch (error) {
           console.error(`[v0] [Coordinator] Failed to resume engine for connection ${connection.id}:`, error)
         }
@@ -1117,7 +1177,45 @@ export class GlobalTradeEngineCoordinator {
               Number(state.last_processor_heartbeat) ||
               (state.last_processor_heartbeat ? new Date(state.last_processor_heartbeat).getTime() : 0) ||
               (state.last_indication_run ? new Date(state.last_indication_run).getTime() : 0)
-            if (lastHb === 0) continue // engine started but no heartbeat yet
+
+            // ── engine_alive TTL check ─────────────────────────────────
+            // The heartbeat timer writes `engine_alive:{connId}` with a
+            // 20s TTL every 10s. If this key is absent the engine is
+            // completely stalled (process death / event-loop hang). In
+            // that case synthesise a stale lastHb so the stall path fires.
+            try {
+              const { getRedisClient: _getRC } = await import("@/lib/redis-db")
+              const _rc = _getRC()
+              const aliveTs = await _rc.get(`engine_alive:${connectionId}`)
+              if (!aliveTs && lastHb > 0 && now - lastHb > STALL_THRESHOLD_MS) {
+                // engine_alive expired AND heartbeat is stale — confirmed stall
+                console.warn(`[v0] [Watchdog] engine_alive key expired for ${connectionId} — confirmed stall`)
+                // The existing stall path will handle escalation below.
+              }
+            } catch { /* best-effort */ }
+            if (lastHb === 0) {
+              // lastHb=0 can mean "engine just started, no heartbeat yet"
+              // OR "engine was running but Redis was down so heartbeats
+              // couldn't be written."  If the engine state shows it was
+              // running and we're past the stall threshold since
+              // `last_state_update`, treat as a stall.
+              const stateUpdatedAt = Number(state.last_state_update) || 0
+              if (stateUpdatedAt > 0 && now - stateUpdatedAt > STALL_THRESHOLD_MS) {
+                // Fall through to stall handling below — the engine was
+                // running but Red is back and heartbeats are zero.
+                console.warn(
+                  `[v0] [Watchdog] Engine ${connectionId} has zero heartbeats but shows running for ${Math.round((now - stateUpdatedAt) / 1000)}s — treating as stalled (Redis outage recovery)`,
+                )
+                // Synthesize a lastHb so the age check below fires
+                this.stallEscalation.set(connectionId, (this.stallEscalation.get(connectionId) ?? 0) + 1)
+                const manager = this.engineManagers.get(connectionId)
+                if (manager?.rearmIfStalled) {
+                  try { await manager.rearmIfStalled() } catch {}
+                }
+                continue
+              }
+              continue // engine started but no heartbeat yet
+            }
             const age = now - lastHb
             if (age > STALL_THRESHOLD_MS) {
               const consecutiveStalls = (this.stallEscalation.get(connectionId) ?? 0) + 1

@@ -19,6 +19,10 @@ import { EngineProgressionTestButton } from "./engine-progression-test-dialog"
 // QuickStart is already large; mounting it as a single child keeps
 // the header markup readable.
 import { QuickstartConnectionControls } from "./quickstart-connection-controls"
+// Collapsible options strip — Control Orders + PF mins + Volume Factor +
+// Block / DCA pos-count toggles. Lives directly below the connection
+// picker so the same `useExchange` connection drives every knob.
+import { QuickstartOptionsBar } from "./quickstart-options-bar"
 import { useExchange } from "@/lib/exchange-context"
 
 // ─── types ────────────────────────────────────────────────────────────────────
@@ -356,7 +360,7 @@ export function QuickstartSection() {
 
   // Quickstart controls — how many top-volatile symbols to process (1-10)
   // and whether live exchange trading is currently enabled for the connection.
-  const [symbolCount, setSymbolCount] = useState<number>(1)
+  const [symbolCount, setSymbolCount] = useState<number>(10)
   const [liveTradeActive, setLiveTradeActive] = useState<boolean>(false)
   const [liveTradeLoading, setLiveTradeLoading] = useState<boolean>(false)
   // Connection the quickstart actually bound to on last start (or the
@@ -903,6 +907,17 @@ export function QuickstartSection() {
           pollers (further down) pick the changes up immediately. */}
       <QuickstartConnectionControls />
 
+      {/* ── options strip ─────────────────────────────────────────────
+          Per-connection knobs the operator changes mid-run:
+            • Control Orders   — toggle live exchange order emission
+            • Profit Factor Mins (Base/Main/Real/Live) — stage gates
+            • Volume Factor    — live volume multiplier
+            • Strategies Pos. Counts — Block + DCA on/off
+          All knobs persist immediately to the active connection through
+          the same endpoints the Settings dialog uses, so changes round-
+          trip and hot-reload into the running engine. */}
+      <QuickstartOptionsBar />
+
       {/* ── compact header bar ─────────────────────────────────────────────── */}
       <div className="flex items-center gap-2 px-3 py-2 bg-primary/5 border-b border-primary/10">
         {/* status dot + label */}
@@ -1216,7 +1231,15 @@ export function QuickstartSection() {
           <MiniStat label="Ind Cycles"   value={fmt(stats.indicationCycles)}  />
           <MiniStat
             label="Indications"
-            value={fmt(stats.apIndications?.total?.sets ?? 0)}
+            value={fmt(
+              // Prefer the live "active sets" count (non-zero while engine
+              // is producing indications this cycle). Fall back to the
+              // cumulative total when the active hash is empty/expired so
+              // the tile never shows 0 while the engine is clearly running.
+              stats.apIndications?.total?.sets ||
+              stats.indicationsTotal ||
+              0
+            )}
             sub={
               stats.indicationsTotal > 0
                 ? `${fmt(stats.indicationsTotal)} total`
@@ -1464,7 +1487,11 @@ export function QuickstartSection() {
                     the previous total/cycle ratio expressed). */}
                 <MiniStat
                   label="Indications"
-                  value={fmt(stats.apIndications?.total?.sets ?? 0)}
+                  value={fmt(
+                    stats.apIndications?.total?.sets ||
+                    stats.indicationsTotal ||
+                    0
+                  )}
                   sub={
                     stats.indicationCycles > 0 && stats.indicationsTotal > 0
                       ? `${(stats.indicationsTotal / Math.max(stats.indicationCycles, 1)).toFixed(1)}/cyc`

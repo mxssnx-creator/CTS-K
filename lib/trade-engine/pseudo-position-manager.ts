@@ -4,7 +4,7 @@
  * NOW: 100% Redis-backed, no SQL
  */
 
-import { getRedisClient, getAppSettings, getSettingsVersionCachedSync, createPosition as redisCreatePosition } from "@/lib/redis-db"
+import { getRedisClient, getAppSettings, getSettings, getSettingsVersionCachedSync, createPosition as redisCreatePosition } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { emitPositionUpdate } from "@/lib/broadcast-helpers"
 import { StrategyConfigManager, type PseudoPosition as StrategyPseudoPosition } from "@/lib/strategy-config-manager"
@@ -39,10 +39,24 @@ export class PseudoPositionManager {
 
   // ── helpers ──────────────────────────────────────────────────────────
 
-  /** Redis set key that indexes every position id for this connection */
+  /** Redis set key that indexes every OPEN position id for this connection */
   private positionsSetKey(): string {
     return `pseudo_positions:${this.connectionId}`
   }
+
+  /**
+   * Redis set key that indexes position ids that have been CLOSED.
+   * Separate from positionsSetKey() which only tracks open positions.
+   * Used by getPositionContext() to read the closed-only window for
+   * Main-stage variant gating (prevLosses, lastWins/Losses, prevPosCount).
+   * Capped to CLOSED_INDEX_CAP newest entries via ltrim so it never
+   * grows unboundedly. TTL reset on each write.
+   */
+  private closedPositionsIndexKey(): string {
+    return `pseudo_positions:${this.connectionId}:closed_index`
+  }
+  private static readonly CLOSED_INDEX_CAP = 200
+  private static readonly CLOSED_INDEX_TTL = 7 * 24 * 60 * 60 // 7 days
 
   /**
    * Redis set key that indexes all currently-active configSetKeys for O(1) duplicate detection.
@@ -257,14 +271,39 @@ export class PseudoPositionManager {
         return null  // silent — one position per config set is expected, or direction cap reached
       }
 
-      // Calculate volume for this position
-      const volumeCalc = await VolumeCalculator.calculateVolumeForConnection(
-        this.connectionId,
-        params.symbol,
-        params.entryPrice,
-      )
+      // ── Volume calculation ──────────────────────────────────────────
+      const volumeCalc = await (async () => {
+        const settings = (await getAppSettings()) || {}
+        const positionCostPercent = parseFloat(
+          String(settings.exchangePositionCost ?? settings.positionCost ?? "0.1")
+        )
+        const positionCost = positionCostPercent / 100
+        const positionsAverage = (() => {
+          const raw = parseFloat(String(settings.positions_average ?? "2"))
+          return Number.isFinite(raw) && raw > 0 ? raw : 2
+        })()
+        const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))
+        const useMaxLeverage =
+          settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
+        const rawLeverage = useMaxLeverage
+          ? 125
+          : Math.round(125 * (leveragePercentage / 100))
+        const { accountBalance, maxLeverage } =
+          await VolumeCalculator.resolveBalanceAndLeverage(this.connectionId, rawLeverage)
+        const tradingPair = await getSettings(`trading_pair:${params.symbol}`)
+        const exchangeMinVolume = tradingPair?.min_order_size
+          ? parseFloat(tradingPair.min_order_size)
+          : undefined
+        return VolumeCalculator.calculatePositionVolume({
+          positionCost,
+          positionsAverage,
+          accountBalance,
+          currentPrice: params.entryPrice,
+          leverage: maxLeverage,
+          exchangeMinVolume,
+        })
+      })()
 
-      // Check if volume calculation succeeded and meets minimum requirements
       if (!volumeCalc.finalVolume || volumeCalc.finalVolume <= 0) {
         console.warn(
           `[v0] Cannot create position for ${params.symbol}: ` +
@@ -289,6 +328,8 @@ export class PseudoPositionManager {
 
       // Store position in Redis
       const id = nanoid()
+      // Generate unique tracking ID to identify system-created positions
+      const systemTrackingId = `sys-${this.connectionId}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
       const client = getRedisClient()
 
       const positionData: Record<string, string> = {
@@ -303,6 +344,8 @@ export class PseudoPositionManager {
         // list so historic-backfilled Sets stay continuously current.
         // When absent, `closePosition` falls back to parsing `config_set_key`.
         strategy_config_id: params.strategyConfigId || "",
+        // System tracking ID — marks this as a system-created position
+        system_tracking_id: systemTrackingId,
         entry_price: String(params.entryPrice),
         current_price: String(params.entryPrice),
         quantity: String(volumeCalc.finalVolume),
@@ -335,22 +378,28 @@ export class PseudoPositionManager {
         // High-water mark anchor for the ratchet. Long: highest price
         // seen since activation. Short: lowest price seen.
         trailing_anchor: "0",
-        status: "active",
+        status: "open",
         opened_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }
 
-      await client.hset(this.positionKey(id), positionData)
-      await client.sadd(this.positionsSetKey(), id)
+      // ── Atomic pipeline for all creation-side index writes ───────────
+      // Previously these were 4 separate awaits. A crash or concurrent
+      // caller between any two of them left the index in a partial state
+      // (hash exists but isn't in positionsSetKey, or configSetKey isn't
+      // marked active). A single pipeline with exec() ensures all writes
+      // land atomically from Redis's perspective — or none do.
+      const createPipeline = client.multi()
+      createPipeline.hset(this.positionKey(id), positionData)
+      createPipeline.sadd(this.positionsSetKey(), id)
       // Register this configSetKey as active for O(1) duplicate detection on next creation
-      await client.sadd(this.activeConfigKeysSetKey(), configSetKey)
+      createPipeline.sadd(this.activeConfigKeysSetKey(), configSetKey)
       // P0-4: Register this position id into the per-direction set so
       // `canCreatePosition` can enforce the spec cap
       // (`maxActiveBasePseudoPositionsPerDirection`, default 1) via O(1)
       // SCARD on the very next call. Removed on close.
-      await client.sadd(this.activeByDirectionKey(params.side), id)
-
-      console.log(`[v0] Created pseudo position ${id} for ${params.symbol} side=${params.side} vol=${volumeCalc.finalVolume}`)
+      createPipeline.sadd(this.activeByDirectionKey(params.side), id)
+      await createPipeline.exec()
 
       this.invalidateCache()
       await this.updateActivePositionsCount()
@@ -382,7 +431,7 @@ export class PseudoPositionManager {
         return this.activePositionsCache
       }
 
-      const positions = await this.listPositions({ status: "active" })
+      const positions = await this.listPositions({ status: "open" })
 
       // Sort by opened_at DESC
       positions.sort((a, b) => {
@@ -549,6 +598,10 @@ export class PseudoPositionManager {
       pipeline.srem(this.positionsSetKey(), positionId)
       if (configSetKey) {
         pipeline.srem(this.activeConfigKeysSetKey(), configSetKey)
+        // Clean up the atomic gate on close so a future position with the
+        // same config set key can be created immediately.
+        const gateKey = `pseudo:gate:${this.connectionId}:${configSetKey}`
+        pipeline.del(gateKey)
       }
       // P0-4: Free the per-direction slot so another position in the
       // same direction can open on the next cycle. Use the hash's
@@ -559,6 +612,18 @@ export class PseudoPositionManager {
       }
       // 7-day TTL on the closed hash for operator forensics.
       pipeline.expire(this.positionKey(positionId), 604800)
+      // ── Closed-positions index write (P-CTX-1) ───────────────────────
+      // getPositionContext() in strategy-coordinator needs to read CLOSED
+      // positions to compute prevPosCount / prevLosses / lastWins / lastLosses
+      // for the Main-stage variant gates. These positions are removed from
+      // positionsSetKey() above, so without this separate closed index the
+      // context window is always empty and only the default variant runs.
+      // We store the positionId in a Redis list (LPUSH = newest first),
+      // capped to CLOSED_INDEX_CAP entries via LTRIM and with a 7-day TTL.
+      const closedIndexKey = this.closedPositionsIndexKey()
+      pipeline.lpush(closedIndexKey, positionId)
+      pipeline.ltrim(closedIndexKey, 0, PseudoPositionManager.CLOSED_INDEX_CAP - 1)
+      pipeline.expire(closedIndexKey, PseudoPositionManager.CLOSED_INDEX_TTL)
 
       // ── Continuous Set update (in same pipeline) ──────────────────
       // The realtime processor reads the HEAD of each strategy-config's
@@ -569,6 +634,49 @@ export class PseudoPositionManager {
       // frozen at prehistoric-time. Entry serialisation goes through
       // the canonical static on StrategyConfigManager so writer and
       // reader never drift.
+      // ── PI history accumulator (atomic, in-pipeline) ────────────────
+      // Lifetime per (symbol × indicationType × direction) HASH that the
+      // strategy coordinator reads at Base creation to blend prev-PI PF
+      // into avgProfitFactor and at Real to tune size/leverage. Uses
+      // hincrby so concurrent closes never lose a count, and composes
+      // into the existing close pipeline so the whole transaction stays
+      // one round-trip.
+      try {
+        const { recordPosClosed } = await import("@/lib/pos-history")
+        const indicationType = String(
+          position.indication_type ||
+          position.signal_source     ||
+          StrategyConfigManager.extractIndicationType(configSetKey) ||
+          "unknown",
+        )
+        const directionRaw = side === "long" || side === "short" ? side : "long"
+        const drawdownPctOrPx = parseFloat(position.max_drawdown || "0")
+        const openedMs = new Date(
+          String(position.opened_at || position.entry_time || position.created_at || closedAtIso),
+        ).getTime()
+        const closedMs = new Date(closedAtIso).getTime()
+        const positionDurationMin =
+          Number.isFinite(openedMs) && Number.isFinite(closedMs) && closedMs > openedMs
+            ? (closedMs - openedMs) / 60000
+            : 0
+        // We don't track adverse-excursion duration separately — proxy
+        // with full position duration when there was a drawdown sample,
+        // 0 otherwise. Fine for cumulative averages.
+        const drawdownMinutes = drawdownPctOrPx > 0 ? positionDurationMin : 0
+        recordPosClosed({
+          connectionId: this.connectionId,
+          symbol: String(position.symbol || ""),
+          indicationType,
+          direction: directionRaw,
+          pnl,
+          drawdownMinutes,
+          pipeline,
+        })
+      } catch (posErr) {
+        // Non-critical; pos history is observability only.
+        console.warn(`[v0] [closePosition] recordPosClosed failed:`, posErr)
+      }
+
       if (configId) {
         const notional = entryPrice * quantity
         const resultPct = notional > 0 ? (pnl / notional) * 100 : 0
@@ -618,10 +726,23 @@ export class PseudoPositionManager {
       // Clear the per-tick price memo so a reused id can't be elided.
       this.lastWrittenPrice.delete(positionId)
 
-      console.log(`[v0] Closed position ${positionId}: ${reason} (PnL: ${pnl.toFixed(4)})`)
-
       this.invalidateCache()
       await this.updateActivePositionsCount()
+
+      // ── Progression counter (P3-1) ────────────────────────────────────
+      // Increment the connection-level totalTrades / successfulTrades counters
+      // so the dashboard "Test Count" tile reflects all closed pseudo positions
+      // (not just exchange-level live orders). `recordTrade` uses atomic
+      // hincrby so concurrent closes never lose a count.
+      try {
+        const { ProgressionStateManager } = await import(
+          "@/lib/progression-state-manager"
+        )
+        await ProgressionStateManager.recordTrade(this.connectionId, pnl >= 0, pnl)
+      } catch (recordErr) {
+        // Non-critical — counters will be slightly behind on failure.
+        console.warn(`[v0] [closePosition] recordTrade failed for ${positionId}:`, recordErr)
+      }
 
       // ── P1-2: Propagate close into BasePseudoPositionManager counters ──
       // Keeps Base-level win-rate / avg-profit / avg-loss / max-drawdown
@@ -674,7 +795,7 @@ export class PseudoPositionManager {
    * Get active position count
    */
   async getPositionCount(): Promise<number> {
-    const active = await this.listPositions({ status: "active" })
+    const active = await this.listPositions({ status: "open" })
     return active.length
   }
 
@@ -723,7 +844,7 @@ export class PseudoPositionManager {
     try {
       const allPositions = await this.listPositions()
 
-      const active = allPositions.filter(p => p.status === "active")
+      const active = allPositions.filter(p => p.status === "open")
       const closed = allPositions.filter(p => p.status === "closed")
       const activeLong = active.filter(p => p.side === "long").length
       const activeShort = active.filter(p => p.side === "short").length
@@ -809,12 +930,24 @@ export class PseudoPositionManager {
    * Two gates (both must pass):
    *   1. **Per-Set uniqueness** (pre-existing): exactly 1 active pseudo
    *      position per unique config combination (indType:dir:tp:sl:…).
-   *      O(1) via SISMEMBER on `activeConfigKeysSetKey`.
+   *      O(1) via SISMEMBER on `activeConfigKeysSetKey` — backed by a
+   *      5 s `SET NX EX` mutex gate (`gateKey`) so two concurrent
+   *      `createPosition` callers for the same configSetKey can't both
+   *      pass the gate simultaneously.
    *   2. **Per-direction cap** (P0-4): hard cap on concurrent pseudo
    *      positions PER DIRECTION (Long/Short) across ALL config Sets.
    *      Cap comes from the operator-tunable setting
    *      `maxActiveBasePseudoPositionsPerDirection` (default 1, spec).
    *      O(1) via SCARD on `activeByDirectionKey(side)`.
+   *
+   * STALE-LOCK FIX: The SET NX mutex TTL is only 5 s. If a process that
+   * acquired the gate and inserted into `activeConfigKeysSetKey` crashes
+   * without cleaning up, the gateKey expires but the SISMEMBER entry
+   * remains stale — permanently blocking future retries. Gate 1 defends
+   * against this SINK: when `isMember=true` AND the gate mutex is NOT
+   * held (our SET NX already succeeded), we remove the stale entry with
+   * Redis `SREM` before returning false. The next caller (a fresh tick)
+   * will see a clean set and proceed normally.
    *
    * Gate 2 is the new piece — previously only gate 1 existed, which
    * meant N distinct Sets could each hold 1 active long → N×1 longs
@@ -828,9 +961,29 @@ export class PseudoPositionManager {
   ): Promise<boolean> {
     try {
       const client = getRedisClient()
-      // Gate 1: Set-uniqueness (SISMEMBER).
+      // Gate 1: SET NX mutex (5 s TTL) + double-check via SISMEMBER.
+      // SISMEMBER + SADD was racy: both callers could see `false` before
+      // either added to the set, producing duplicate positions.
+      const gateKey = `pseudo:gate:${this.connectionId}:${configSetKey}`
+      const acquired = await client.set(gateKey, "1", { NX: true, EX: 5 })
+      if (!acquired) return false
+      // Second check: the Set may already contain the key from a prior run
+      // (the gate TTL expired but the Set entry persisted). Double-check.
       const isMember = await client.sismember(this.activeConfigKeysSetKey(), configSetKey)
-      if (isMember) return false
+      if (isMember) {
+        // STALE-LOCK REPAIR: The gate mutex expired (5 s TTL) but the
+        // key is still in the active set — this means the prior owner
+        // crashed without cleaning up. Remove the stale entry with SREM
+        // so future ticks are not permanently blocked for this configKey.
+        try {
+          await client.srem(this.activeConfigKeysSetKey(), configSetKey)
+        } catch { /* best-effort sink clearing */ }
+        // Release the gate so another tick on a different configKey
+        // (or the same configKey after the stale entry was removed)
+        // can proceed without waiting 5 s.
+        await client.del(gateKey).catch(() => {})
+        return false
+      }
 
       // Gate 2: per-direction cap (SCARD). When `side` is not supplied
       // (legacy callers), skip the per-direction gate to preserve
@@ -858,7 +1011,7 @@ export class PseudoPositionManager {
    * Get position count by direction
    */
   async getPositionCountByDirection(side: "long" | "short"): Promise<number> {
-    const positions = await this.listPositions({ status: "active", side })
+    const positions = await this.listPositions({ status: "open", side })
     return positions.length
   }
 

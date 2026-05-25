@@ -101,7 +101,7 @@ export async function POST(request: Request) {
       const exch = (c.exchange || "").toLowerCase()
       const hasCredentials = !!(c.api_key && c.api_secret && c.api_key.length >= 10 && c.api_secret.length >= 10)
       const isUserCreated = !(c.is_predefined === true || c.is_predefined === "1" || c.is_predefined === "true")
-      return exch === "bybit" && isUserCreated && hasCredentials
+      return false
     }) || allConnections.find((c: any) => {
       const exch = (c.exchange || "").toLowerCase()
       const hasCredentials = !!(c.api_key && c.api_secret && c.api_key.length >= 10 && c.api_secret.length >= 10)
@@ -109,20 +109,20 @@ export async function POST(request: Request) {
     }) || allConnections.find((c: any) => {
       const exch = (c.exchange || "").toLowerCase()
       const hasCredentials = !!(c.api_key && c.api_secret && c.api_key.length >= 10 && c.api_secret.length >= 10)
-      return exch === "bybit" && hasCredentials
+      return false
     }) || allConnections.find((c: any) => {
       const exch = (c.exchange || "").toLowerCase()
       // QuickStart startup relies on Main Connections assignment state.
       const isAssigned = c.is_assigned === "1" || c.is_assigned === true
-      const isBase = exch === "bingx" || exch === "bybit" || exch === "pionex" || exch === "orangex"
+      const isBase = exch === "bingx" || exch === "pionex" || exch === "orangex"
       return isBase && isAssigned
     })
     }  // ← close the body.connectionId preference block
 
     if (!connection) {
-      console.log(`${LOG_PREFIX}: No BingX/Bybit connections found in Main Connections`)
+      console.log(`${LOG_PREFIX}: No BingX connections found in Main Connections`)
       
-      await logProgressionEvent("global", "quickstart_no_connection", "warning", "No BingX/Bybit connections in Main Connections", {
+      await logProgressionEvent("global", "quickstart_no_connection", "warning", "No BingX connections in Main Connections", {
         totalConnections: allConnections.length,
         availableExchanges: [...new Set(allConnections.map((c: any) => c.exchange))],
       })
@@ -130,8 +130,8 @@ export async function POST(request: Request) {
       return NextResponse.json(
         { 
           success: false,
-          error: "No BingX/Bybit connections found in Main Connections",
-          message: "Add a BingX or Bybit connection to Main Connections first, then add API credentials in Settings",
+          error: "No BingX connections found in Main Connections",
+          message: "Add a BingX connection to Main Connections first, then add API credentials in Settings",
           availableConnections: allConnections.map((c: any) => ({ 
             name: c.name,
             id: c.id,
@@ -300,11 +300,23 @@ export async function POST(request: Request) {
     // PRIMARY: fetch most volatile symbol(s) from public exchange API (no auth required)
     if (symbols.length === 0) {
       try {
-        const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"
-        const topRes = await fetch(
-          `${baseUrl}/api/exchange/${exchangeName}/top-symbols?limit=${requestedCount}&t=${Date.now()}`,
-          { signal: AbortSignal.timeout(5000), cache: "no-store" }
-        )
+        const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || `http://localhost:${process.env.PORT || "3002"}`
+        // AbortSignal.timeout() is unreliable on Node.js < V20. Use a plain
+        // Promise.race so the timeout actually fires even when the built-in
+        // abort-controller integration is absent (Node 18 §fetch).
+        const FETCH_MS = 30000
+        const timeoutCtrl = new AbortController()
+        const FETCH_TIMEOUT = setTimeout(() => timeoutCtrl.abort(), FETCH_MS)
+        const topRes = await Promise.race([
+          fetch(
+            `${baseUrl}/api/exchange/${exchangeName}/top-symbols?limit=${requestedCount}&t=${Date.now()}`,
+            { signal: timeoutCtrl.signal, cache: "no-store" },
+          ),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`top-symbols fetch timed out after ${FETCH_MS} ms`)), FETCH_MS),
+          ),
+        ])
+        clearTimeout(FETCH_TIMEOUT)
         if (topRes.ok) {
           const topData = await topRes.json()
           // Prefer the new `symbolList` (string[]) when N>1; fall back to
@@ -359,6 +371,31 @@ export async function POST(request: Request) {
      // Step 3: QuickStart must assign + enable connection flow
      console.log(`${LOG_PREFIX}: [3/4] Updating connection state...`)
      
+     // ── Quickstart minimal-volume default ──────────────────────────
+     // QuickStart is intended to be a safe, low-risk way for an operator
+     // to dip a toe in: real exchange orders, but the SMALLEST possible
+     // notional per order. We pin `live_volume_factor` to the minimum
+     // allowed by `VolumeCalculator.calculatePositionVolume` (it clamps
+     // the factor to `[0.1, 10]` — anything ≤ 0.1 becomes 0.1).
+     //
+     // With factor=0.1, the Main-engine path scales the computed volume
+     // down 10× and then the per-pair `exchangeMinVolume` floor (or the
+     // universal $5 notional fallback) clamps it back UP — so the final
+     // order size is GUARANTEED to be the exchange's hard minimum.
+     // That's the smallest legal order the venue will accept; you
+     // cannot go below it without an immediate rejection.
+     //
+     // Why this is the right knob (vs `exchangePositionCost`):
+     //   - `exchangePositionCost` is a GLOBAL app-settings field that
+     //     would affect every connection. We only want to scope this
+     //     to the connection the operator just quick-started.
+     //   - `live_volume_factor` is a PER-CONNECTION override that the
+     //     calculator already honours via
+     //     `VolumeCalculator.resolveLiveEngine` (preferred over global).
+     //
+     // Operator can adjust this later via per-connection Live Volume
+     // Factor slider in Settings (range 0.1×–10×) once they're happy
+     // with how the engine is behaving.
      const updated = {
        ...connection,
        // Explicit quickstart assignment/enabling for engine processing.
@@ -374,6 +411,10 @@ export async function POST(request: Request) {
        is_active: "1",
        is_live_trade: "1",
        active_symbols: JSON.stringify(symbols),
+       // Force minimal per-order volume on every quickstart enable.
+       // Stored as a string because that's how the rest of the
+       // connection hash is encoded (parseFloat in volume-calculator).
+       live_volume_factor: "0.1",
        last_test_status: testPassed ? "success" : "failed",
        last_test_balance: testBalance,
        last_test_at: new Date().toISOString(),
@@ -381,7 +422,21 @@ export async function POST(request: Request) {
      }
      
      await updateConnection(connectionId, updated)
-     console.log(`${LOG_PREFIX}: [3/4] Connection state updated (assigned+enabled for quickstart).`)
+     console.log(`${LOG_PREFIX}: [3/4] Connection state updated (assigned+enabled, live_volume_factor=0.1 → exchange-minimum orders).`)
+     // Surface the minimal-volume policy in the progression log so the
+     // operator can confirm in the UI exactly which sizing knob was
+     // applied. Helpful when debugging "why are my orders so small?".
+     await logProgressionEvent(
+       connectionId,
+       "quickstart_minimal_volume",
+       "info",
+       "QuickStart applied minimal-volume policy: live_volume_factor=0.1 (exchange-minimum orders)",
+       {
+         live_volume_factor: "0.1",
+         note:
+           "Per-connection override. Order size will be clamped UP to the per-pair exchange minimum (or the universal $5 notional floor). Adjust via Settings → Connection → Live Volume Factor (0.1×–10×) when ready to scale.",
+       },
+     )
     
     // ALSO store in trade_engine_state for engine to find.
     // IMPORTANT: record the user-selected symbol count under
@@ -488,6 +543,20 @@ export async function POST(request: Request) {
             // Wipe progression-accumulator fields and stale prehistoric
             // completion markers (per-connection only — other connections unaffected).
             client.del(`prehistoric:${connectionId}:done`),
+            // ── Cache-marker invalidation (root-cause fix) ────────────────
+            // `prehistoric_loaded:{id}` is the 24-hour "skip prehistoric"
+            // marker engine-manager.ts checks at boot. If we leave it set,
+            // the next engine start hits the cache path, never re-runs the
+            // ConfigSetProcessor one-shot, never simulates closes, never
+            // populates `historic_avg_profit_factor` or `pos_history`, and
+            // immediately stamps `is_complete: 1` — producing the operator-
+            // reported symptoms: "no base PF value, no avg real positions
+            // value, historic progress ending too fast, no sets evaluated,
+            // realtime starting before historic completes". Every QuickStart
+            // press must force a fresh prehistoric run.
+            client.del(`prehistoric_loaded:${connectionId}`),
+            client.del(`prehistoric:${connectionId}:firstpass:done`),
+            client.del(`prehistoric:${connectionId}:symbols`), // Clear old processed symbols set
             client.hdel(`prehistoric:${connectionId}`,
               "is_complete",
               "completed_at",
@@ -495,6 +564,12 @@ export async function POST(request: Request) {
               "candles_loaded",
               "indicators_calculated",
               "total_duration_ms",
+              // Also wipe the historic PF aggregates so a stale cached
+              // value can't leak through to the dashboard between runs.
+              // ConfigSetProcessor recomputes these every prehistoric run.
+              "historic_avg_profit_factor",
+              "historic_avg_profit_factor_count",
+              "historic_avg_profit_factor_at",
             ).catch(() => 0),
             client.hdel(`progression:${connectionId}`,
               "real_active_pos_sum_x100",
@@ -562,7 +637,7 @@ export async function POST(request: Request) {
             engine_type: "main",
             indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
             strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
           })
           
           // Ensure connection is marked as live trade enabled

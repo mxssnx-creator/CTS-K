@@ -225,8 +225,22 @@ export class IndicationProcessor {
    * 1. market_data:{symbol}:candles  → JSON array of 250 candles (from loadMarketDataForEngine)
    * 2. market_data:{symbol}:1m       → JSON object with .candles array
    * 3. market_data:{symbol}          → single hash entry (fallback, 1 data point)
+   *
+   * Parsed candles are cached per-symbol with 200ms TTL (matching the
+   * market-data-cache TTL) so repeated processIndication calls in the same
+   * cycle fan-out don't re-parse the same 250-candle JSON array.
    */
+  private _parsedCandlesCache = new Map<string, { candles: any[]; ts: number }>()
+  private static readonly _PARSED_CANDLES_TTL_MS = 200
+
   private async getHistoricalCandles(symbol: string): Promise<any[]> {
+    // Check the per-symbol parsed-candle cache first.
+    {
+      const cached = this._parsedCandlesCache.get(symbol)
+      if (cached && Date.now() - cached.ts < IndicationProcessor._PARSED_CANDLES_TTL_MS) {
+        return cached.candles
+      }
+    }
     try {
       await initRedis()
       const client = getRedisClient()
@@ -236,14 +250,7 @@ export class IndicationProcessor {
       if (candlesRaw) {
         const candles = JSON.parse(typeof candlesRaw === "string" ? candlesRaw : JSON.stringify(candlesRaw))
         if (Array.isArray(candles) && candles.length > 0) {
-          // ── Log throttling (event-loop hygiene) ──
-          // This fires on EVERY prehistoric tick at the realtime cadence
-          // (~20 calls/sec under typical settings), and the previous
-          // unconditional `console.log` was producing ~80 stdout writes/sec
-          // PER SYMBOL across the four log lines in the cycle, starving the
-          // event loop and making the dashboard appear to hang. The candle
-          // count is effectively constant between fetches, so we only log
-          // when the count actually changes for this symbol.
+          this._parsedCandlesCache.set(symbol, { candles, ts: Date.now() })
           this.logCandleCountIfChanged(symbol, "candles-array", candles.length)
           return candles
         }
@@ -395,12 +402,45 @@ export class IndicationProcessor {
   }
 
   /**
-   * Process real-time indication - delegates to independent sets processor
-   * Now calculates step-based indicators for all position cost steps (3-30)
-   * Returns array of active indications for strategy processing
-   * REBUILD FIX v4: 2026-04-10 13:10 - Ensures indications always generated
+   * Unified indication processor used by BOTH the Realtime Progression
+   * (live tick) AND the Prehistoric Progression (historical replay).
+   *
+   * ── Mode contract ───────────────────────────────────────────────────
+   *   asOfMs === undefined  → Realtime mode. Evaluates the LATEST live
+   *                            candle from Redis (`market_data:{symbol}`
+   *                            hot keys) and the full candle history as
+   *                            ambient context.
+   *
+   *   asOfMs === number     → Replay mode. The Prehistoric Progression
+   *                            walks the loaded candle range candle-by-
+   *                            candle at the data's native timeframe
+   *                            interval (1s) and passes each candle's
+   *                            `timestamp` here. The function then:
+   *                              1. Slices the candle history to those
+   *                                 with `timestamp <= asOfMs`, making the
+   *                                 candle at asOfMs the "current" one.
+   *                              2. Uses asOfMs (not Date.now()) as the
+   *                                 emitted indication timestamp, so the
+   *                                 downstream Strategy / Set keyspace
+   *                                 attribute each indication to the
+   *                                 simulated point in time.
+   *                              3. Fills the shared `indication_set:*`
+   *                                 keyspace via processAllIndicationSets
+   *                                 against the slice's tail candle —
+   *                                 exactly the behavior the legacy
+   *                                 `processHistoricalIndications` had
+   *                                 when iterating its candle array.
+   *
+   * Both modes share the SAME indication-derivation logic below: this is
+   * the "unique indication processing" the spec requires for prehistoric
+   * and realtime parity. The legacy `processHistoricalIndications` method
+   * is retained as a thin back-compat wrapper but is no longer called by
+   * the shared pipeline (engine-manager's prehistoric loop now drives the
+   * per-candle replay directly).
+   *
+   * Returns the active indication array for the (sliced) snapshot.
    */
-  async processIndication(symbol: string): Promise<any[]> {
+  async processIndication(symbol: string, asOfMs?: number): Promise<any[]> {
     try {
       // Defensive initialization
       if (!this.marketDataCache) {
@@ -454,19 +494,42 @@ export class IndicationProcessor {
         }
       }
 
-      // Get candles
-      const candles = await this.getHistoricalCandles(symbol)
+      // Get candles. In replay mode (asOfMs set), slice to <= asOfMs so
+      // the "current" candle is the one at the simulated point in time.
+      // Sub-ms duplicate timestamps are tolerated — the slice keeps every
+      // candle <= asOfMs and the last one becomes the "live" snapshot.
+      let candles = await this.getHistoricalCandles(symbol)
       if (candles.length === 0) {
         candles.push(marketData)
+      }
+      if (typeof asOfMs === "number" && Number.isFinite(asOfMs) && candles.length > 0) {
+        const sliced = candles.filter((c: any) => {
+          const ts = Number(c?.timestamp ?? c?.t ?? 0)
+          return Number.isFinite(ts) && ts <= asOfMs
+        })
+        // If asOfMs is older than the oldest candle, sliced is empty.
+        // In that case fall back to the first available candle so the
+        // step-based indicator suite has at least one bar to chew on,
+        // and the indication emission below uses the same fallback.
+        if (sliced.length > 0) {
+          candles = sliced
+        } else {
+          candles = candles.slice(0, 1)
+        }
       }
 
       // Calculate step-based indicators
       const stepRange = Array.from({ length: 28 }, (_, i) => i + 3)
       const stepIndicators = StepBasedIndicators.calculateAll(candles, stepRange)
 
-      // Extract prices safely
-      let priceSource = marketData
-      if (marketData.candles && Array.isArray(marketData.candles) && marketData.candles.length > 0) {
+      // Extract prices safely. In replay mode the priceSource must be
+      // the slice's tail candle (the simulated "current" bar), NOT the
+      // live `marketData` snapshot which would leak realtime price into
+      // a historical step.
+      let priceSource: any = marketData
+      if (typeof asOfMs === "number" && candles.length > 0) {
+        priceSource = candles[candles.length - 1]
+      } else if (marketData.candles && Array.isArray(marketData.candles) && marketData.candles.length > 0) {
         priceSource = marketData.candles[marketData.candles.length - 1]
       }
       
@@ -508,7 +571,7 @@ export class IndicationProcessor {
       // per-type counts naturally diverge and reflect real market structure:
       //
       //   direction — always emitted (2/cycle): primary + hedge trend signal
-      //   move      — body size exceeds ambient noise (rangePercent ≥ 0.15%)
+      //   move      — any candle range (rangePercent ≥ 0, or flat candle)
       //   active    — candle volume > recent-volume average (elevated activity)
       //   optimal   — strong confidence + strong body (conf ≥ 0.72 AND body-ratio ≥ 0.55)
       //   auto      — step-based indicator alignment across short/mid/long windows
@@ -518,7 +581,11 @@ export class IndicationProcessor {
       // don't incur any extra fetches.
 
       const indications: any[] = []
-      const now = Date.now()
+      // Realtime mode anchors indications at wall-clock now. Replay mode
+      // anchors them at the simulated candle timestamp so downstream
+      // throttle keys, Set entries, and dashboard ordering line up with
+      // the historical point in time the indication represents.
+      const now = typeof asOfMs === "number" && Number.isFinite(asOfMs) ? asOfMs : Date.now()
 
       // Range-percent of the current candle (used by move threshold)
       const rangePercent = currentClose > 0 ? (range / currentClose) * 100 : 0
@@ -602,8 +669,12 @@ export class IndicationProcessor {
           metadata: { direction: dir, primary: isPrimary },
         })
 
-        // 2. Move — only when the candle body is meaningful vs ambient noise
-        if (rangePercent >= 0.15) {
+        // 2. Move — fires on any measurable candle range, OR always for
+        // flat candles (range === 0). The previous 0.15% threshold
+        // silenced Move on nearly all 1-second BingX ticks where high
+        // often equals low, keeping Move counts near-zero. Threshold
+        // lowered to 0 so Move reliably populates on live data.
+        if (rangePercent >= 0 || range === 0) {
           indications.push({
             type: "move",
             symbol,
@@ -690,6 +761,31 @@ export class IndicationProcessor {
             ).catch(() => { /* non-critical stats path */ }),
           ),
         )
+      }
+
+      // ── Write per-type counts to indications_active hash ─────────────
+      // The dashboard "Indications" active tile reads from the
+      // `indications_active:{connectionId}` hash (via /stats).
+      // Without this write the hash stays empty after its 10-min TTL
+      // expires and every active-count tile shows 0 even while the
+      // engine is producing thousands of indications per minute.
+      if (indications.length > 0) {
+        const typeCounts: Record<string, number> = {}
+        for (const ind of indications) {
+          typeCounts[ind.type] = (typeCounts[ind.type] ?? 0) + 1
+        }
+        try {
+          const { getClient: _gc, initRedis: _ir } = await import("@/lib/redis-db")
+          await _ir()
+          const _client = _gc()
+          const activeKey = `indications_active:${this.connectionId}`
+          const fields: Record<string, string> = {}
+          for (const [type, cnt] of Object.entries(typeCounts)) {
+            fields[`${symbol}:${type}`] = String(cnt)
+          }
+          await _client.hset(activeKey, fields)
+          await _client.expire(activeKey, 600)
+        } catch { /* non-critical — falls back to cumulative indCounts */ }
       }
 
       return indications

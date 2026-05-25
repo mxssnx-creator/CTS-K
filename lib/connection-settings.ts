@@ -4,7 +4,27 @@
  * Defaults are applied when connection is first used
  */
 
+// Deep-merge nested objects so partial updates don't clobber unrelated
+// nested fields. Returns a new object with recursively merged nested
+// sub-objects (strategy, indication, trading, advanced).
 import { getRedisClient } from "./redis-db"
+import { notifySettingsChanged } from "./settings-coordinator"
+
+function deepMergeSettings(
+  current: ConnectionSettings,
+  updates: Partial<ConnectionSettings>,
+): ConnectionSettings {
+  const result = { ...current }
+  for (const key of Object.keys(updates) as Array<keyof ConnectionSettings>) {
+    const val = updates[key]
+    if (val && typeof val === "object" && typeof result[key] === "object") {
+      result[key] = { ...(result[key] as any), ...val }
+    } else if (val !== undefined) {
+      ;(result as any)[key] = val
+    }
+  }
+  return result
+}
 
 export interface ConnectionSettings {
   connectionId: string
@@ -62,7 +82,7 @@ const DEFAULT_SETTINGS: Omit<ConnectionSettings, "connectionId"> = {
     autoStopAfterLoss: true,
   },
   advanced: {
-    slippageTolerance: 0.1,
+    slippageTolerance: 0.0006,
     executionSpeed: "normal",
     useTrailingStop: true,
     enableAutoExit: false,
@@ -102,29 +122,88 @@ export async function getConnectionSettings(connectionId: string): Promise<Conne
 
 /**
  * Update settings for a specific connection
+ * Also invalidates caches and notifies processors to reload configuration
  */
 export async function updateConnectionSettings(
   connectionId: string,
   settings: Partial<ConnectionSettings>
 ): Promise<ConnectionSettings> {
+  const lockKey = `settings:lock:${connectionId}`
+  const LOCK_TTL = 5
   try {
     const client = await getRedisClient()
     const key = `settings:connection:${connectionId}`
-    
-    // Get current settings
-    const current = await getConnectionSettings(connectionId)
-    
-    // Merge with updates
-    const updated: ConnectionSettings = {
-      ...current,
-      ...settings,
-      connectionId, // Ensure connectionId stays correct
+    // Acquire a short-lived write lock to prevent two concurrent saves
+    // from reading the same current value and losing each other's changes.
+    const locked = await client.set(lockKey, String(Date.now()), { NX: true, EX: LOCK_TTL })
+    if (!locked) {
+      // Another save is in-flight; retry once after a brief yield
+      await new Promise(r => setTimeout(r, 100))
+      const retryLocked = await client.set(lockKey, String(Date.now()), { NX: true, EX: LOCK_TTL })
+      if (!retryLocked) throw new Error("Another settings save is in progress")
     }
+    try {
+      // Get current settings
+      const current = await getConnectionSettings(connectionId)
+
+    // Deep-merge to preserve nested sub-objects when partial updates arrive
+    const updated = deepMergeSettings(current, settings)
     
     // Save to Redis
     await client.set(key, JSON.stringify(updated))
+    // Unify: write settings_change envelope so the engine-manager's 3s
+    // watcher picks up hot-reload or restart flags (previously only the
+    // dirty flag was set here — the envelope was written by a different
+    // code path leaving disjoint coverage).
+    const changed: string[] = []
+    for (const k of Object.keys(settings) as Array<keyof typeof settings>) {
+      if (settings[k] !== undefined) changed.push(k as string)
+    }
+    if (changed.length > 0) {
+      notifySettingsChanged(connectionId, changed, current as any, updated as any).catch(() => {})
+    }
+    
+    // ── CRITICAL: Invalidate all related caches ──────────────────────────────
+    // When settings change, we need to:
+    // 1. Clear any cached config in strategy processors
+    // 2. Notify the engine to reload settings
+    // 3. Force a config refresh on next tick
+    
+    try {
+      // Mark settings as dirty - processors should reload on next cycle
+      await client.set(`settings:dirty:${connectionId}`, "1", { EX: 300 }) // 5 min TTL
+      
+      // Clear any cached advanced configs for this connection
+      await client.del(`cached_config:${connectionId}`)
+      
+      // Invalidate strategy processor cache
+      await client.del(`strategy_processor_cache:${connectionId}`)
+      
+      // Force engine to reload connection state
+      const connKey = `connection:${connectionId}`
+      const connData = await client.hgetall(connKey)
+      if (connData && Object.keys(connData).length > 0) {
+        // Update last_settings_update timestamp to trigger engine refresh
+        await client.hset(connKey, {
+          last_settings_update: new Date().toISOString(),
+        })
+      }
+      
+      console.log(
+        `[v0] [Settings] Invalidated caches and marked dirty for ${connectionId} - processors will reload on next cycle`
+      )
+    } catch (cacheErr) {
+      console.warn(
+        `[v0] [Settings] Cache invalidation warning for ${connectionId}:`,
+        cacheErr instanceof Error ? cacheErr.message : String(cacheErr)
+      )
+      // Non-fatal - settings are saved even if cache invalidation fails
+    }
     
     return updated
+    } finally {
+      await client.del(lockKey).catch(() => {})
+    }
   } catch (error) {
     console.error(`Failed to update connection settings for ${connectionId}:`, error)
     throw error
@@ -163,15 +242,16 @@ export async function resetConnectionSettings(connectionId: string): Promise<Con
     connectionId,
     ...DEFAULT_SETTINGS,
   }
-  
   try {
     const client = await getRedisClient()
     const key = `settings:connection:${connectionId}`
     await client.set(key, JSON.stringify(newSettings))
+    // Notify running engines — reset is a full config change
+    await client.set(`settings:dirty:${connectionId}`, "1", { EX: 300 }).catch(() => {})
+    notifySettingsChanged(connectionId, ["strategy", "indication", "trading", "advanced"]).catch(() => {})
   } catch (error) {
     console.error(`Failed to reset connection settings for ${connectionId}:`, error)
   }
-  
   return newSettings
 }
 
@@ -183,6 +263,9 @@ export async function deleteConnectionSettings(connectionId: string): Promise<vo
     const client = await getRedisClient()
     const key = `settings:connection:${connectionId}`
     await client.del(key)
+    // Notify running engines so they fall back to defaults immediately
+    await client.set(`settings:dirty:${connectionId}`, "1", { EX: 300 }).catch(() => {})
+    notifySettingsChanged(connectionId, ["settings_deleted"]).catch(() => {})
   } catch (error) {
     console.error(`Failed to delete connection settings for ${connectionId}:`, error)
     throw error
@@ -194,22 +277,35 @@ export async function deleteConnectionSettings(connectionId: string): Promise<vo
  */
 export function validateConnectionSettings(settings: Partial<ConnectionSettings>): boolean {
   if (settings.strategy) {
-    if (settings.strategy.takeProfit <= 0 || settings.strategy.stopLoss <= 0 || settings.strategy.leverage <= 0) {
+    const s = settings.strategy
+    if (
+      !Number.isFinite(s.takeProfit) || !Number.isFinite(s.stopLoss) || !Number.isFinite(s.leverage) ||
+      s.takeProfit <= 0 || s.takeProfit > 100 ||
+      s.stopLoss <= 0 || s.stopLoss > 100 ||
+      s.leverage <= 0 || s.leverage > 125
+    ) {
       return false
     }
+    if (s.takeProfit <= s.stopLoss) return false
   }
-  
   if (settings.trading) {
-    if (settings.trading.maxPositions <= 0 || settings.trading.riskPerTrade <= 0) {
+    const t = settings.trading
+    if (
+      !Number.isFinite(t.maxPositions) || !Number.isFinite(t.riskPerTrade) ||
+      t.maxPositions <= 0 || t.maxPositions > 500 ||
+      t.riskPerTrade <= 0 || t.riskPerTrade > 100
+    ) {
       return false
     }
   }
-  
   if (settings.advanced) {
-    if (settings.advanced.slippageTolerance < 0 || settings.advanced.slippageTolerance > 1) {
+    const a = settings.advanced
+    if (
+      !Number.isFinite(a.slippageTolerance) ||
+      a.slippageTolerance < 0 || a.slippageTolerance > 1
+    ) {
       return false
     }
   }
-  
   return true
 }

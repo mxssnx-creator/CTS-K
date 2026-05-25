@@ -4,7 +4,9 @@
 import * as crypto from "crypto"
 import {
   BaseExchangeConnector,
+  type ExchangeCredentials,
   type ExchangeConnectorResult,
+  type ExchangeOrder,
   type PlaceOrderOptions,
 } from "./base-connector"
 import { safeParseResponse } from "@/lib/safe-response-parser"
@@ -35,13 +37,152 @@ import { safeParseResponse } from "@/lib/safe-response-parser"
  * - Hedge position mode
  */
 export class BingXConnector extends BaseExchangeConnector {
+  private timeOffset: number = 0 // milliseconds to adjust local time
+  private lastTimeSync: number = 0
+  // Re-sync every 60 s (down from 300 s). In serverless environments each
+  // request may be a fresh module instance so lastTimeSync resets to 0 and
+  // the first sync always fires — the interval only matters within a single
+  // long-lived instance (e.g. development server).
+  private timeSyncIntervalMs: number = 60_000
+  // Serialise the initial sync: if multiple signed requests fire concurrently
+  // before the first syncServerTime() resolves, they all await the SAME
+  // promise instead of each reading timeOffset=0 (stale) and all failing
+  // with "timestamp is invalid". Without this, up to N concurrent calls can
+  // all use offset=0 and all fail before any of their individual syncs
+  // complete — producing one 109400 error per call per cold start.
+  private syncPromise: Promise<void> | null = null
+
   constructor(credentials: ExchangeCredentials, exchange: string = "bingx") {
     super(credentials, exchange)
+    // Kick off the first time-sync immediately in the background so that
+    // the offset is ready by the time the first signed request fires.
+    // Errors are swallowed — the sync will be retried in syncServerTime().
+    this.syncPromise = this.syncServerTime().catch(() => { this.syncPromise = null })
   }
 
   private getBaseUrl(): string {
     return this.credentials.isTestnet ? "https://testnet-open-api.bingx.com" : "https://open-api.bingx.com"
   }
+
+  /**
+   * Synchronize local time with the BingX server. BingX enforces strict
+   * timestamp validation (±1000ms window); if the server time is drifted,
+   * all signed requests fail with "timestamp is invalid" (code=109400).
+   *
+   * This method fetches `/openApi/v1/public/time` once per session and
+   * computes the offset, then applies it to all future `getTimestamp()` calls.
+   * Re-syncs every 5 minutes to handle gradual clock drift.
+   */
+  private async syncServerTime(): Promise<void> {
+    if (Date.now() - this.lastTimeSync < this.timeSyncIntervalMs) {
+      return // recently synced within the throttle window
+    }
+    // If a sync is already in-flight (from the constructor kick-off or a
+    // concurrent call), wait for that one rather than issuing a second
+    // fetch in parallel. Importantly, once the in-flight promise resolves,
+    // lastTimeSync will be updated to the actual completion time, so any
+    // subsequent callers that sneak past the throttle check (before the
+    // in-flight sync updates lastTimeSync) are correctly serialised here.
+    if (this.syncPromise) {
+      await this.syncPromise
+      return
+    }
+
+    // Own the in-flight slot; clear it when done so future callers can
+    // trigger a fresh sync once the TTL expires.
+    this.syncPromise = (async () => {
+    try {
+      // NTP-style midpoint sync: capture local time around the request
+      // and assume symmetric latency. The previous implementation used
+      // Date.now() AFTER the await, which biased the offset by one
+      // round-trip — on a Vercel→BingX link that's typically 200-600 ms,
+      // and the venue enforces a strict ±1000 ms timestamp window. Once
+      // the cached offset drifts past that window every signed request
+      // fails with "timestamp is invalid" (code 109400), as observed in
+      // engine reconcile cycles. Midpoint estimation halves the worst-
+      // case error and keeps the offset well inside the window even on
+      // slow links.
+      const t0 = Date.now()
+      const response = await fetch(`${this.getBaseUrl()}/openApi/v1/public/time`, {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      })
+      const t1 = Date.now()
+      const data = await response.json()
+      if (data.code === 0 || data.code === "0") {
+        const serverTime = Number(data.data?.serverTime || data.serverTime || data.time || 0)
+        if (serverTime > 0) {
+          // Server reported its time at some point during [t0, t1].
+          // Best estimate: midpoint of the request window.
+          const localMidpoint = t0 + (t1 - t0) / 2
+          this.timeOffset = serverTime - localMidpoint
+          // Set lastTimeSync to the ACTUAL completion time (t1), not the
+          // time captured at the start of syncServerTime. Using an early
+          // timestamp shortened the effective throttle window by one RTT
+          // (typically 200-600 ms), causing spurious re-syncs.
+          this.lastTimeSync = t1
+          if (Math.abs(this.timeOffset) > 100) {
+            this.log(
+              `[v0] Server time sync: offset=${this.timeOffset.toFixed(0)}ms ` +
+                `(server=${serverTime}, localMid=${localMidpoint.toFixed(0)}, rtt=${t1 - t0}ms)`,
+            )
+          }
+        }
+      }
+    } catch (err) {
+      // Fall back to local time; worst case we'll hit timestamp errors
+      // and retry with a fresh sync.
+      this.log(`[v0] Failed to sync server time: ${String(err).slice(0, 80)}`)
+    } finally {
+      // Clear the in-flight slot once this sync completes (success or fail).
+      // Future callers will either pass the throttle check (if we just
+      // succeeded) or trigger a fresh sync (if we failed or enough time has
+      // elapsed). Without this, a failed sync would block future syncs forever.
+      this.syncPromise = null
+    }
+    })()
+
+    await this.syncPromise
+  }
+
+  /**
+   * Get the current timestamp, adjusted for server time drift.
+   * Returns local time + pre-computed offset from the last sync.
+   */
+  private getTimestamp(): number {
+    return Date.now() + this.timeOffset
+  }
+
+  /**
+   * Detects "timestamp is invalid" responses (BingX code 109400 with a
+   * timestamp-shaped message) and force-resyncs the server-time offset.
+   * Returns true if the caller should retry the request once.
+   *
+   * Two ways to hit this in production despite the up-front sync:
+   *  1) Multiple signed requests fire in the same tick before the first
+   *     `syncServerTime()` resolves; they all use a stale cached offset.
+   *  2) The local clock drifts between syncs (we re-sync every 5 min,
+   *     but a containers' clock can step on cgroup migration or VM
+   *     suspend/resume). The cached offset is then off by minutes.
+   *
+   * Force-resyncing on this exact error code recovers within one extra
+   * round-trip rather than blocking until the next 5-min interval.
+   */
+  private async resyncOnTimestampError(data: any): Promise<boolean> {
+    const code = String(data?.code ?? "")
+    const msg  = String(data?.msg ?? "").toLowerCase()
+    if (code === "109400" && msg.includes("timestamp")) {
+      // Force a fresh sync: clear both the throttle gate AND any in-flight
+      // shared promise so syncServerTime() issues a new HTTP call instead of
+      // coalescing onto the stale-offset promise that was already resolved.
+      this.lastTimeSync = 0
+      this.syncPromise = null
+      await this.syncServerTime()
+      return true
+    }
+    return false
+  }
+
 
   private getSignature(params: Record<string, any>): string {
     // Kept only for the one remaining helper that doesn't need the query
@@ -103,12 +244,14 @@ export class BingXConnector extends BaseExchangeConnector {
    */
   private toBingXSymbol(symbol: string): string {
     if (!symbol) return symbol
+    // Remove existing slash format (normalize to no-slash first)
+    let normalized = symbol.replace(/\//g, "")
     // Already hyphenated → nothing to do.
-    if (symbol.includes("-")) return symbol
+    if (normalized.includes("-")) return normalized
     // Spot still uses the plain BTCUSDT format on BingX.
-    if (this.credentials.apiType === "spot") return symbol
+    if (this.credentials.apiType === "spot") return normalized
 
-    const upper = symbol.toUpperCase()
+    const upper = normalized.toUpperCase()
     // Handle common quote assets; insert a dash before the quote.
     const quotes = ["USDT", "USDC", "BTC", "ETH", "USD"]
     for (const quote of quotes) {
@@ -122,6 +265,51 @@ export class BingXConnector extends BaseExchangeConnector {
   /** BingX returns `code` as a number on some endpoints and a string on others. */
   private isBingXSuccess(code: unknown): boolean {
     return code === 0 || code === "0"
+  }
+
+  /**
+   * Safe JSON parse that preserves orderId precision.
+   *
+   * BingX (and Binance) emit order IDs as JSON NUMBERS up to ~19 digits
+   * long, well beyond `Number.MAX_SAFE_INTEGER` (16 digits, max
+   * 9007199254740991). The default `response.json()` parses them as
+   * IEEE-754 doubles, silently losing the last 1-3 digits — e.g.
+   * `2055068855617294300` becomes the nearest representable double
+   * `2055068855617294336`. The cancellation pipeline then targets an
+   * orderId that doesn't exist on the venue, producing the observed
+   * `code=109400 "order not exist"`.
+   *
+   * Fix: read the body as text and quote-wrap every numeric value
+   * associated with an ID-bearing field BEFORE JSON.parse, so the IDs
+   * survive as strings. We deliberately target a curated whitelist of
+   * field names (orderId, orderID, id, clientOrderId, transactId,
+   * positionId) rather than every long number — prices/quantities are
+   * always safely within double precision and we want to keep them as
+   * numbers for ergonomic arithmetic at call sites.
+   */
+  private async safeJson(response: Response): Promise<any> {
+    const text = await response.text()
+    if (!text) return {}
+    // (?<="orderId":\s*) lookbehind then a bare numeric (one or more
+    // digits, possibly negative) → wrap in quotes. `g` so every
+    // occurrence in arrays is handled. Anchored on the next char so we
+    // don't accidentally wrap already-quoted strings (the negative
+    // lookahead `(?!")` is implicit because the regex requires a digit
+    // immediately after the colon-whitespace).
+    const idFields = ["orderId", "orderID", "id", "clientOrderId", "transactId", "positionId"]
+    const pattern = new RegExp(
+      `("(?:${idFields.join("|")})"\\s*:\\s*)(-?\\d+)(\\s*[,}\\]])`,
+      "g",
+    )
+    const safeText = text.replace(pattern, '$1"$2"$3')
+    try {
+      return JSON.parse(safeText)
+    } catch {
+      // If the regex transform broke parsing for an unexpected payload
+      // shape, fall back to the unmodified text — better to lose ID
+      // precision than to fail the whole response.
+      return JSON.parse(text)
+    }
   }
 
   getCapabilities(): string[] {
@@ -148,12 +336,15 @@ export class BingXConnector extends BaseExchangeConnector {
   }
 
   async getBalance(): Promise<ExchangeConnectorResult> {
-    const timestamp = Date.now()
-    const baseUrl = this.getBaseUrl()
-
-    this.log("Generating signature...")
-
     try {
+      // Sync server time before any signed request to prevent "timestamp is invalid" errors
+      await this.syncServerTime()
+
+      const timestamp = this.getTimestamp()
+      const baseUrl = this.getBaseUrl()
+
+      this.log("Generating signature...")
+
       // Validate credentials first
       if (!this.credentials.apiKey || !this.credentials.apiSecret) {
         throw new Error("API key and secret are required")
@@ -233,11 +424,48 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`Response status: ${response.status}`)
       this.log(`Response code: ${data.code}`)
 
-      // Check for error responses — BingX can return `code` as a number or string
+      // Check for error responses — BingX returns `code` as a number or string.
+      // On a timestamp error (code 109400 + "timestamp" in msg, or 100421)
+      // force-resync the server-time offset and retry once. resyncOnTimestampError
+      // already calls syncServerTime() internally; we must NOT call it again here
+      // or we waste a round-trip and risk the throttle preventing the second sync.
       if (!response.ok || !this.isBingXSuccess(data.code)) {
-        const errorMsg = data.msg || data.error || `HTTP ${response.status}: ${response.statusText}`
-        this.logError(`API Error (code ${data.code}): ${errorMsg}`)
-        throw new Error(errorMsg)
+        const isTimestampErr =
+          (String(data.code) === "100421") ||
+          (String(data.code) === "109400" &&
+            String(data.msg ?? "").toLowerCase().includes("timestamp"))
+
+        if (isTimestampErr) {
+          // Clear throttle + in-flight promise and perform a fresh sync.
+          // resyncOnTimestampError() is intentionally not used here because
+          // getBalance is not always called with a 109400 that has the
+          // "timestamp" substring — code 100421 is a separate "null timestamp"
+          // error. Handling both explicitly avoids the msg-matching gap.
+          this.lastTimeSync = 0
+          this.syncPromise = null
+          await this.syncServerTime()
+
+          // Rebuild signed request with corrected timestamp.
+          const { signature: retrySig, queryString: retryQs } =
+            this.signParams({ timestamp: this.getTimestamp() })
+          const retryUrlCorrect = `${baseUrl}${endpoint}?${retryQs}&signature=${retrySig}`
+          const retryResponse = await this.rateLimitedFetch(retryUrlCorrect, {
+            method: "GET",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey, "Content-Type": "application/json" },
+          })
+          const retryData = await this.safeJson(retryResponse)
+          if (!retryResponse.ok || !this.isBingXSuccess(retryData.code)) {
+            const retryErrMsg = retryData.msg || retryData.error || `HTTP ${retryResponse.status}`
+            this.logError(`API Error after resync (code ${retryData.code}): ${retryErrMsg}`)
+            throw new Error(retryErrMsg)
+          }
+          // Merge retry response into data so the balance-parse below works.
+          Object.assign(data, retryData)
+        } else {
+          const errorMsg = data.msg || data.error || `HTTP ${response.status}: ${response.statusText}`
+          this.logError(`API Error (code ${data.code}): ${errorMsg}`)
+          throw new Error(errorMsg)
+        }
       }
 
       this.log("Successfully retrieved account data")
@@ -337,6 +565,9 @@ export class BingXConnector extends BaseExchangeConnector {
     options: PlaceOrderOptions = {},
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
+      // Sync server time before any signed request to prevent timestamp errors
+      await this.syncServerTime()
+
       // ── Quantity sanity & formatting ─────────────────────────────────────
       // BingX rejects quantities that fall below the symbol step size, and in
       // many cases responds with its generic "this api is not exist" error
@@ -402,15 +633,19 @@ export class BingXConnector extends BaseExchangeConnector {
         side: side.toUpperCase(),
         type: orderType === "market" ? "MARKET" : "LIMIT",
         quantity: qtyStr,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       if (!isSpot) {
         if (hedgeMode) {
           params.positionSide = effectivePositionSide
         }
-        // reduceOnly is only meaningful on perp endpoints.
-        if (options.reduceOnly) {
+        // reduceOnly is only meaningful on perp endpoints — and on BingX
+        // hedge-mode accounts it is NOT allowed alongside positionSide
+        // (the venue rejects with code=109400). Hedge mode already implies
+        // the reduce-only semantic via positionSide+side opposition, so
+        // we suppress reduceOnly there. One-way mode still needs it.
+        if (options.reduceOnly && !hedgeMode) {
           params.reduceOnly = "true"
         }
         if (options.clientOrderId) {
@@ -438,9 +673,70 @@ export class BingXConnector extends BaseExchangeConnector {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
+        // First: handle "timestamp is invalid" (cached-offset drift)
+        // by force-resyncing the server-time offset and retrying once.
+        // Distinguished from the hedge-mode 109400 below by checking
+        // the message text. If we recovered, fall through to success
+        // path with the retry response.
+        if (await this.resyncOnTimestampError(data)) {
+          params.timestamp = this.getTimestamp()
+          const { signature: tsRetrySig, queryString: tsRetryQs } = this.signParams(params)
+          const tsRetryUrl = `${this.getBaseUrl()}${endpoint}?${tsRetryQs}&signature=${tsRetrySig}`
+          const tsRetryResp = await this.rateLimitedFetch(tsRetryUrl, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const tsRetryData = await this.safeJson(tsRetryResp)
+          if (this.isBingXSuccess(tsRetryData.code)) {
+            const info = tsRetryData.data?.order || tsRetryData.data || {}
+            const id = info.orderId || info.id || tsRetryData.data?.orderId
+            this.log(`✓ Order placed on retry (timestamp resync): ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined }
+          }
+          // Resync didn't fix it; fall through with the retry response
+          // so the operator sees the real underlying error.
+          Object.assign(data, tsRetryData)
+          if (this.isBingXSuccess(data.code)) {
+            const info = data.data?.order || data.data || {}
+            const id = info.orderId || info.id || data.data?.orderId
+            return { success: true, orderId: id ? String(id) : undefined }
+          }
+        }
+
+        // Special-case: 109400 "In the Hedge mode, the 'ReduceOnly' field
+        // can not be filled." A misrouted reduceOnly slipped through; strip
+        // it and retry once. Hedge mode's reduce-only semantic is carried
+        // by positionSide+side opposition, so the retry is still safe.
+        const reduceOnlyHedgeConflict =
+          String(data.code) === "109400" ||
+          /reduceonly.*hedge|hedge.*reduceonly/i.test(String(data.msg || ""))
+        if (reduceOnlyHedgeConflict && !isSpot && params.reduceOnly) {
+          this.log("Retrying order without reduceOnly (hedge-mode conflict 109400)")
+          delete params.reduceOnly
+          params.timestamp = this.getTimestamp()
+          const { signature: roRetrySig, queryString: roRetryQs } = this.signParams(params)
+          const roRetryUrl = `${this.getBaseUrl()}${endpoint}?${roRetryQs}&signature=${roRetrySig}`
+          const roRetryResp = await this.rateLimitedFetch(roRetryUrl, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const roRetryData = await this.safeJson(roRetryResp)
+          if (this.isBingXSuccess(roRetryData.code)) {
+            const info = roRetryData.data?.order || roRetryData.data || {}
+            const id = info.orderId || info.id || roRetryData.data?.orderId
+            this.log(`✓ Order placed on retry (hedge, no reduceOnly): ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined }
+          }
+          // Fall through with the retry's response so the operator sees
+          // the real underlying error rather than the 109400 we already
+          // worked around.
+          data.code = roRetryData.code
+          data.msg = roRetryData.msg
+        }
+
         // Special-case: 80014 "position side does not match" — the account is
         // in one-way mode but we sent a hedge-mode positionSide. Retry once
         // without positionSide so the order still goes through rather than
@@ -450,14 +746,14 @@ export class BingXConnector extends BaseExchangeConnector {
         if (sideMismatch && !isSpot && hedgeMode) {
           this.log("Retrying order without positionSide (detected one-way account)")
           delete params.positionSide
-          params.timestamp = Date.now()
+          params.timestamp = this.getTimestamp()
           const { signature: retrySig, queryString: retryQs } = this.signParams(params)
           const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}&signature=${retrySig}`
           const retryResp = await this.rateLimitedFetch(retryUrl, {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
-          const retryData = await retryResp.json()
+          const retryData = await this.safeJson(retryResp)
           if (this.isBingXSuccess(retryData.code)) {
             const info = retryData.data?.order || retryData.data || {}
             const id = info.orderId || info.id || retryData.data?.orderId
@@ -506,6 +802,9 @@ export class BingXConnector extends BaseExchangeConnector {
     options: PlaceOrderOptions = {},
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       const isSpot = this.credentials.apiType === "spot"
       if (isSpot) {
         // Spot has no native stop-market — let the base fallback handle it.
@@ -542,15 +841,26 @@ export class BingXConnector extends BaseExchangeConnector {
         // workingType=MARK_PRICE prevents wick-driven false triggers
         // on thin tickers; matches BingX's own UI default for SL/TP.
         workingType: "MARK_PRICE",
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       if (hedgeMode) params.positionSide = positionSide
-      if (options.reduceOnly !== false) params.reduceOnly = "true"
+      // BingX hedge-mode rule: `reduceOnly` is NOT allowed when
+      // `positionSide` is set — the venue rejects with
+      //   code=109400 "In the Hedge mode, the 'ReduceOnly' field can not
+      //   be filled."
+      // In hedge mode the positionSide=LONG/SHORT combined with the
+      // opposite `side` IS the reduce-only semantic (it can only close
+      // the matching side), so omitting reduceOnly is safe and correct.
+      // In one-way mode we still need reduceOnly to prevent the order
+      // from accidentally flipping the position to the opposite side.
+      if (!hedgeMode && options.reduceOnly !== false) {
+        params.reduceOnly = "true"
+      }
       if (options.clientOrderId) params.clientOrderId = options.clientOrderId
 
       this.log(
         `Placing ${orderType} ${closeSide} ${qtyStr} ${bingxSymbol} @ stop=${stopStr}` +
-          `${hedgeMode ? ` posSide=${positionSide}` : " [one-way]"} [reduceOnly]`,
+          `${hedgeMode ? ` posSide=${positionSide} [hedge, reduceOnly implicit]` : " [one-way, reduceOnly]"}`,
       )
 
       const endpoint = "/openApi/swap/v2/trade/order"
@@ -563,24 +873,78 @@ export class BingXConnector extends BaseExchangeConnector {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       // Same one-way retry logic as `placeOrder`: BingX returns 80014 when
       // a hedge-mode positionSide is sent to a one-way account.
+      // Also handles 109400 — defensive fallback in case `hedgeMode` was
+      // not propagated from the caller and `reduceOnly` ended up on a
+      // hedge-mode request anyway. Strip it and retry once.
       if (!this.isBingXSuccess(data.code)) {
+        // First: handle "timestamp is invalid" (cached-offset drift)
+        // by force-resyncing and retrying once. Same rationale as
+        // placeOrder; the engine fires many SL/TP placement requests
+        // in parallel during a reconcile sweep, and they all see the
+        // pre-sync stale offset.
+        if (await this.resyncOnTimestampError(data)) {
+          params.timestamp = this.getTimestamp()
+          const { signature: tsSig, queryString: tsQs } = this.signParams(params)
+          const tsUrl = `${this.getBaseUrl()}${endpoint}?${tsQs}&signature=${tsSig}`
+          const tsResp = await this.rateLimitedFetch(tsUrl, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const tsData = await this.safeJson(tsResp)
+          if (this.isBingXSuccess(tsData.code)) {
+            const info = tsData.data?.order || tsData.data || {}
+            return {
+              success: true,
+              orderId: String(info.orderId ?? info.orderID ?? ""),
+            }
+          }
+          Object.assign(data, tsData)
+        }
+
+        const reduceOnlyHedgeConflict =
+          String(data.code) === "109400" ||
+          /reduceonly.*hedge|hedge.*reduceonly/i.test(String(data.msg || ""))
+        if (reduceOnlyHedgeConflict && params.reduceOnly) {
+          this.log("Retrying stop order without reduceOnly (hedge-mode conflict 109400)")
+          delete params.reduceOnly
+          // Hedge mode requires positionSide; ensure it's present.
+          if (!params.positionSide) params.positionSide = positionSide
+          params.timestamp = this.getTimestamp()
+          const { signature: retrySig2, queryString: retryQs2 } = this.signParams(params)
+          const retryUrl2 = `${this.getBaseUrl()}${endpoint}?${retryQs2}&signature=${retrySig2}`
+          const retryResp2 = await this.rateLimitedFetch(retryUrl2, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const retryData2 = await this.safeJson(retryResp2)
+          if (this.isBingXSuccess(retryData2.code)) {
+            const info2 = retryData2.data?.order || retryData2.data || {}
+            return {
+              success: true,
+              orderId: String(info2.orderId ?? info2.orderID ?? ""),
+            }
+          }
+          // Fall through to the normal error path with the retry's response.
+          data.code = retryData2.code
+          data.msg = retryData2.msg
+        }
         const sideMismatch = String(data.code) === "80014"
           || /position.*side/i.test(String(data.msg || ""))
         if (sideMismatch && hedgeMode) {
           this.log("Retrying stop order without positionSide (one-way account)")
           delete params.positionSide
-          params.timestamp = Date.now()
+          params.timestamp = this.getTimestamp()
           const { signature: retrySig, queryString: retryQs } = this.signParams(params)
           const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}&signature=${retrySig}`
           const retryResp = await this.rateLimitedFetch(retryUrl, {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
-          const retryData = await retryResp.json()
+          const retryData = await this.safeJson(retryResp)
           if (this.isBingXSuccess(retryData.code)) {
             const info = retryData.data?.order || retryData.data || {}
             const id = info.orderId || info.id || retryData.data?.orderId
@@ -605,6 +969,9 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async cancelOrder(symbol: string, orderId: string): Promise<{ success: boolean; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       this.log(`Cancelling order ${orderId} for ${symbol}`)
 
       // Perp swap: DELETE /openApi/swap/v2/trade/order (no separate cancel path).
@@ -617,7 +984,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const params = {
         symbol: bingxSymbol,
         orderId,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -632,7 +999,7 @@ export class BingXConnector extends BaseExchangeConnector {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -660,7 +1027,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const params = {
         symbol: bingxSymbol,
         orderId,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -671,13 +1038,40 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return null
       }
 
-      return data.data
+      // Normalize the raw BingX order object to the ExchangeOrder interface
+      // so callers can rely on `filledQty`, `filledPrice`, and normalised
+      // `status` regardless of the underlying API version.
+      const raw = data.data
+      if (!raw) return null
+      const rawStatus = String(raw.status ?? raw.orderStatus ?? "").toUpperCase()
+      const normalizedStatus =
+        rawStatus === "FILLED"          ? "filled" :
+        rawStatus === "PARTIALLY_FILLED" ? "partially_filled" :
+        rawStatus === "CANCELED"         ? "cancelled" :
+        rawStatus === "CANCELLED"        ? "cancelled" :
+        rawStatus === "REJECTED"         ? "cancelled" :
+        rawStatus === "NEW"              ? "pending" :
+        rawStatus === "PENDING"          ? "pending" : "pending"
+
+      return {
+        orderId:     String(raw.orderId   ?? raw.clientOrderId ?? ""),
+        symbol:      String(raw.symbol    ?? ""),
+        side:        String(raw.side      ?? "").toLowerCase() as "buy" | "sell",
+        type:        "market",
+        quantity:    parseFloat(String(raw.origQty   ?? raw.quantity    ?? "0")),
+        price:       parseFloat(String(raw.price     ?? raw.avgPrice    ?? "0")),
+        status:      normalizedStatus as ExchangeOrder["status"],
+        filledQty:   parseFloat(String(raw.executedQty ?? raw.filledQty    ?? raw.cumQty ?? "0")),
+        filledPrice: parseFloat(String(raw.avgPrice    ?? raw.filledPrice  ?? "0")),
+        timestamp:   Number(raw.time       ?? raw.createTime ?? Date.now()),
+        updateTime:  Number(raw.updateTime ?? raw.time       ?? Date.now()),
+      }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch order: ${errorMsg}`)
@@ -693,7 +1087,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/openOrders" : "/openApi/swap/v2/trade/openOrders"
 
       const params: Record<string, any> = {
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       if (symbol) {
@@ -707,7 +1101,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -732,7 +1126,7 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const params: Record<string, any> = {
         limit,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       if (symbol) {
@@ -746,7 +1140,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -780,7 +1174,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`Fetching positions${symbol ? ` for ${symbol}` : ""} (${effectiveContractType})`)
 
       const params: Record<string, any> = {
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       if (symbol) {
@@ -802,7 +1196,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -831,7 +1225,7 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const params: Record<string, any> = {
         symbol: this.toBingXSymbol(symbol),
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       if (leverage) {
@@ -851,7 +1245,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -924,7 +1318,7 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const params: Record<string, string> = {
         coin,
-        timestamp: String(Date.now()),
+        timestamp: String(this.getTimestamp()),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -934,7 +1328,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -959,7 +1353,7 @@ export class BingXConnector extends BaseExchangeConnector {
         coin,
         address,
         amount: String(amount),
-        timestamp: String(Date.now()),
+        timestamp: String(this.getTimestamp()),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -970,7 +1364,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -993,7 +1387,7 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const params: Record<string, string> = {
         limit: String(limit),
-        timestamp: String(Date.now()),
+        timestamp: String(this.getTimestamp()),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -1003,7 +1397,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -1012,13 +1406,16 @@ export class BingXConnector extends BaseExchangeConnector {
       return Array.isArray(data.data) ? data.data : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
-      this.logError(`✗ Failed to fetch transfer history: ${errorMsg}`)
+      this.logError(`�� Failed to fetch transfer history: ${errorMsg}`)
       return []
     }
   }
 
   async setLeverage(symbol: string, leverage: number): Promise<{ success: boolean; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       const bingxSymbol = this.toBingXSymbol(symbol)
       this.log(`Setting leverage to ${leverage}x for ${bingxSymbol} on both sides`)
 
@@ -1029,19 +1426,31 @@ export class BingXConnector extends BaseExchangeConnector {
       // leverage-mismatch. Fire both LONG and SHORT side updates in parallel
       // so hedge-mode accounts have matching leverage on both sides.
       const updateForSide = async (side: "LONG" | "SHORT") => {
-        const params: Record<string, string> = {
+        const buildParams = (): Record<string, string> => ({
           symbol: bingxSymbol,
           side,
           leverage: String(leverage),
-          timestamp: String(Date.now()),
-        }
-        const { signature, queryString: signedQs } = this.signParams(params)
-        const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${signedQs}&signature=${signature}`
-        const response = await this.rateLimitedFetch(url, {
-          method: "POST",
-          headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          timestamp: String(this.getTimestamp()),
         })
-        const data = await response.json()
+        const sendOnce = async (params: Record<string, string>) => {
+          const { signature, queryString: signedQs } = this.signParams(params)
+          const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${signedQs}&signature=${signature}`
+          const response = await this.rateLimitedFetch(url, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          return this.safeJson(response)
+        }
+        let data = await sendOnce(buildParams())
+        // One-shot resync-and-retry on cached-offset drift. The
+        // first sync we do at the top of setLeverage is fine, but
+        // when the engine fires many setLeverage calls in parallel
+        // (one per symbol on adoption sweep), they all see the
+        // stale offset until the first response lands. The retry
+        // recovers without making the engine reschedule.
+        if (!this.isBingXSuccess(data?.code) && (await this.resyncOnTimestampError(data))) {
+          data = await sendOnce(buildParams())
+        }
         return { side, ok: this.isBingXSuccess(data.code), data }
       }
 
@@ -1073,25 +1482,31 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setMarginType(symbol: string, marginType: "cross" | "isolated"): Promise<{ success: boolean; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       const bingxSymbol = this.toBingXSymbol(symbol)
       this.log(`Setting margin type to ${marginType} for ${bingxSymbol}`)
 
-      const params: Record<string, string> = {
+      const buildParams = (): Record<string, string> => ({
         symbol: bingxSymbol,
         marginType: marginType === "cross" ? "CROSSED" : "ISOLATED",
-        timestamp: String(Date.now()),
-      }
-
-      const { signature, queryString: signedQs } = this.signParams(params)
-      // Perp: /openApi/swap/v2/trade/marginType (not v3).
-      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${signedQs}&signature=${signature}`
-
-      const response = await this.rateLimitedFetch(url, {
-        method: "POST",
-        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+        timestamp: String(this.getTimestamp()),
       })
-
-      const data = await response.json()
+      const sendOnce = async (params: Record<string, string>) => {
+        const { signature, queryString: signedQs } = this.signParams(params)
+        const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${signedQs}&signature=${signature}`
+        const response = await this.rateLimitedFetch(url, {
+          method: "POST",
+          headers: { "X-BX-APIKEY": this.credentials.apiKey },
+        })
+        return this.safeJson(response)
+      }
+      let data = await sendOnce(buildParams())
+      // Retry-once on cached-offset drift, same rationale as setLeverage.
+      if (!this.isBingXSuccess(data?.code) && (await this.resyncOnTimestampError(data))) {
+        data = await sendOnce(buildParams())
+      }
 
       if (!this.isBingXSuccess(data.code)) {
         // Margin-type-unchanged is not a real error on BingX; ignore code 101404.
@@ -1113,11 +1528,14 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setPositionMode(hedgeMode: boolean): Promise<{ success: boolean; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       this.log(`Setting position mode to ${hedgeMode ? "hedge" : "one-way"}`)
 
       const params: Record<string, string> = {
         dualSidePosition: String(hedgeMode),
-        timestamp: String(Date.now()),
+        timestamp: String(this.getTimestamp()),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -1129,7 +1547,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1171,7 +1589,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (data.code !== 0 && data.code !== "0") {
         return null
@@ -1244,7 +1662,7 @@ export class BingXConnector extends BaseExchangeConnector {
         return null
       }
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (data.code !== 0 && data.code !== "0") {
         // Silently return null to avoid log flooding
@@ -1273,7 +1691,7 @@ export class BingXConnector extends BaseExchangeConnector {
   }
 
   /**
-   * ── 1-second OHLCV (spec §7) ──────────────────────────────────────
+   * ── 1-second OHLCV (spec §7) ─────���────────────────────────────────
    *
    * Aggregates from BingX trade history. Spot uses
    * `/openApi/spot/v1/market/trades`, swap uses
@@ -1312,6 +1730,973 @@ export class BingXConnector extends BaseExchangeConnector {
       return aggregateTradesTo1sOHLCV(trades, startMs, endMs)
     } catch {
       return null
+    }
+  }
+
+  /**
+   * ─────────────────────────────────────────────────────────────────
+   * BINGX API SKILLS - Official implementation
+   * Source: https://github.com/BingX-API/api-ai-skills
+   * ──���──────────────────────────────────────────────────────────────
+   */
+
+  /**
+   * bingx-swap-market: Query perpetual futures market data
+   * 
+   * Returns market data for USDT-M perpetual futures including:
+   * - Price information (bid, ask, last price)
+   * - Depth (order book)
+   * - Klines (candle data)
+   * - Funding rate
+   * - Open interest
+   * 
+   * @param symbol - Trading pair (e.g., "BTC-USDT", "ETH-USDT")
+   * @returns Market data object
+   */
+  async getSwapMarketData(symbol: string): Promise<any> {
+    try {
+      this.log(`[bingx-swap-market] Fetching market data for ${symbol}`)
+      
+      const baseUrl = this.getBaseUrl()
+      const bingxSymbol = this.toBingXSymbol(symbol)
+      
+      // Get current ticker data
+      const tickerEndpoint = `/openApi/swap/v3/public/ticker?symbol=${bingxSymbol}`
+      const tickerResponse = await this.rateLimitedFetch(`${baseUrl}${tickerEndpoint}`)
+      
+      if (!tickerResponse.ok) {
+        throw new Error(`Failed to fetch ticker: HTTP ${tickerResponse.status}`)
+      }
+      
+      const tickerData = await tickerResponse.json()
+      
+      if (!this.isBingXSuccess(tickerData.code)) {
+        throw new Error(`API Error: ${tickerData.msg || 'Unknown error'}`)
+      }
+      
+      const ticker = Array.isArray(tickerData.data) ? tickerData.data[0] : tickerData.data
+      
+      this.log(`✓ Market data fetched for ${symbol}: price=${ticker?.lastPrice}, 24h change=${ticker?.priceChangePercent}%`)
+      
+      return {
+        success: true,
+        symbol: bingxSymbol,
+        lastPrice: Number.parseFloat(ticker?.lastPrice || "0"),
+        bidPrice: Number.parseFloat(ticker?.bidPrice || "0"),
+        askPrice: Number.parseFloat(ticker?.askPrice || "0"),
+        high24h: Number.parseFloat(ticker?.high24h || "0"),
+        low24h: Number.parseFloat(ticker?.low24h || "0"),
+        volume24h: Number.parseFloat(ticker?.volume || "0"),
+        quoteVolume24h: Number.parseFloat(ticker?.quoteVolume || "0"),
+        priceChangePercent: Number.parseFloat(ticker?.priceChangePercent || "0"),
+        fundingRate: Number.parseFloat(ticker?.fundingRate || "0"),
+        openInterest: Number.parseFloat(ticker?.openInterest || "0"),
+        timestamp: this.getTimestamp(),
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`[bingx-swap-market] Failed to fetch market data: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * bingx-swap-trade: Perpetual futures trading operations
+   * 
+   * Execute trading operations on USDT-M perpetual futures:
+   * - Place orders (market, limit, stop-loss, take-profit)
+   * - Cancel orders
+   * - Set leverage
+   * - Set margin mode (isolated/cross)
+   * - Manage position mode (one-way/hedge)
+   * 
+   * @param operation - Type of trading operation
+   * @param params - Operation-specific parameters
+   * @returns Trade operation result
+   */
+  async executeSwapTrade(operation: string, params: Record<string, any>): Promise<any> {
+    try {
+      this.log(`[bingx-swap-trade] Executing ${operation} with params: ${JSON.stringify(params).substring(0, 200)}`)
+      
+      switch (operation) {
+        // ─────── Order Placement ──────────
+        case "placeOrder":
+          return await this.placeOrder(
+            params.symbol,
+            params.side || "buy",
+            params.quantity,
+            params.price,
+            params.type || "limit",
+            params.options
+          )
+        
+        case "batchPlaceOrders":
+          return await this.batchPlaceOrders(params.orders)
+        
+        // ─────── Order Cancellation ──────────
+        case "cancelOrder":
+          return await this.cancelOrder(params.symbol, params.orderId)
+        
+        case "batchCancelOrders":
+          return await this.batchCancelOrders(params.symbol, params.orderIds)
+        
+        case "cancelAllOrders":
+          return await this.cancelAllOrders(params.symbol, params.type)
+        
+        case "setKillSwitch":
+          return await this.setKillSwitch(params.type, params.timeOut)
+        
+        // ─────── Position Management ──────────
+        case "closePosition":
+          return await this.closePosition(params.symbol, params.positionSide)
+        
+        case "closePositionById":
+          return await this.closePositionById(params.positionId)
+        
+        case "closeAllPositions":
+          return await this.closeAllPositions(params.symbol)
+        
+        case "adjustIsolatedMargin":
+          return await this.adjustIsolatedMargin(
+            params.symbol,
+            params.amount,
+            params.type,
+            params.positionSide,
+            params.positionId
+          )
+        
+        // ─────── Leverage & Mode Settings ──────────
+        case "setLeverage":
+          return await this.setLeverage(params.symbol, params.leverage)
+        
+        case "setMarginType":
+          return await this.setMarginType(params.symbol, params.marginType)
+        
+        case "setPositionMode":
+          return await this.setPositionMode(params.hedgeMode)
+        
+        case "getMarginMode":
+          return await this.getMarginMode(params.symbol)
+        
+        // ─────── Query Operations ──────────
+        case "getOpenOrder":
+          return await this.getOpenOrder(params.symbol, params.orderId, params.clientOrderId)
+        
+        case "getOrder":
+          return await this.getOrderDetails(params.symbol, params.orderId, params.clientOrderId)
+        
+        case "getOpenOrders":
+          return await this.getOpenOrders(params.symbol)
+        
+        case "getOrderHistory":
+          return await this.getOrderHistory(params.symbol, params.limit)
+        
+        case "getForceOrders":
+          return await this.getForceOrders(
+            params.symbol,
+            params.currency,
+            params.autoCloseType,
+            params.startTime,
+            params.endTime,
+            params.limit
+          )
+        
+        case "getTradeHistory":
+          return await this.getTradeHistory(
+            params.tradingUnit,
+            params.startTs,
+            params.endTs,
+            params.orderId,
+            params.currency
+          )
+        
+        default:
+          throw new Error(`Unknown operation: ${operation}`)
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`[bingx-swap-trade] Failed to execute ${operation}: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Close all open positions
+   * 
+   * Official API: POST /openApi/swap/v2/trade/closeAllPositions
+   * Rate limit: 5/s per UID; 2/s per IP
+   * 
+   * @param symbol - Optional: specific symbol to close positions for
+   * @returns Success status and list of closed position IDs
+   */
+  async closeAllPositions(symbol?: string): Promise<{ success: boolean; successful?: string[]; failed?: any[]; error?: string }> {
+    try {
+      this.log(`[API] Closing all positions${symbol ? ` for ${symbol}` : ""}`)
+      
+      const params: Record<string, any> = {
+        timestamp: this.getTimestamp(),
+      }
+      
+      if (symbol) {
+        params.symbol = this.toBingXSymbol(symbol)
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/closeAllPositions?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      this.log(`✓ Closed ${data.data?.success?.length || 0} positions`)
+      return {
+        success: true,
+        successful: data.data?.success || [],
+        failed: data.data?.failed || [],
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to close all positions: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Close a position by positionId
+   * 
+   * Official API: POST /openApi/swap/v1/trade/closePosition
+   * Rate limit: 5/s per UID; 2/s per IP
+   * 
+   * More efficient than closePosition() as it uses direct API endpoint
+   * 
+   * @param positionId - Position ID to close
+   * @returns Order ID generated and position ID
+   */
+  async closePositionById(positionId: string): Promise<{ success: boolean; orderId?: string; positionId?: string; error?: string }> {
+    try {
+      this.log(`[API] Closing position by ID: ${positionId}`)
+      
+      const params: Record<string, any> = {
+        positionId,
+        timestamp: this.getTimestamp(),
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v1/trade/closePosition?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const orderId = String(data.data?.orderId || data.data?.orderID || "")
+      const closedPositionId = String(data.data?.positionId || "")
+      
+      this.log(`✓ Position closed with order ID: ${orderId}`)
+      return {
+        success: true,
+        orderId,
+        positionId: closedPositionId,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to close position by ID: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Batch place multiple orders
+   * 
+   * Official API: POST /openApi/swap/v2/trade/batchOrders
+   * Rate limit: 5/s per UID; 3/s per IP
+   * 
+   * @param orders - Array of order objects (max 5 per request)
+   * @returns Array of placed orders and any failed orders
+   */
+  async batchPlaceOrders(orders: Array<{
+    symbol: string
+    side: "buy" | "sell"
+    type?: "market" | "limit"
+    quantity: number
+    price?: number
+    options?: PlaceOrderOptions
+  }>): Promise<{ success: boolean; orders?: any[]; errors?: any[]; error?: string }> {
+    try {
+      if (!Array.isArray(orders) || orders.length === 0) {
+        throw new Error("Orders must be a non-empty array")
+      }
+      
+      if (orders.length > 5) {
+        throw new Error("Maximum 5 orders per batch request")
+      }
+      
+      this.log(`[API] Batch placing ${orders.length} orders`)
+      
+      // Build individual order params
+      const batchOrders = orders.map(order => {
+        const isSpot = this.credentials.apiType === "spot"
+        const bingxSymbol = this.toBingXSymbol(order.symbol)
+        const roundedQty = Math.round((order.quantity) * 1e6) / 1e6
+        const qtyStr = roundedQty.toFixed(6).replace(/\.?0+$/, "")
+        
+        const orderObj: Record<string, any> = {
+          symbol: bingxSymbol,
+          side: order.side.toUpperCase(),
+          type: (order.type === "market" ? "MARKET" : "LIMIT"),
+          quantity: qtyStr,
+        }
+        
+        if (order.price && order.type !== "market") {
+          const priceRounded = Math.round(order.price * 1e8) / 1e8
+          orderObj.price = priceRounded.toFixed(8).replace(/\.?0+$/, "")
+        }
+        
+        if (!isSpot && order.options?.hedgeMode !== false) {
+          orderObj.positionSide = order.options?.positionSide || (order.side === "buy" ? "LONG" : "SHORT")
+        }
+        
+        return orderObj
+      })
+      
+      const params: Record<string, any> = {
+        batchOrders: JSON.stringify(batchOrders),
+        timestamp: this.getTimestamp(),
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/batchOrders?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const placedOrders = data.data?.orders || []
+      const failedOrders = data.data?.errors || []
+      
+      this.log(`✓ Batch orders: ${placedOrders.length} placed, ${failedOrders.length} failed`)
+      return {
+        success: true,
+        orders: placedOrders,
+        errors: failedOrders,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to batch place orders: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Batch cancel multiple orders
+   * 
+   * Official API: DELETE /openApi/swap/v2/trade/batchOrders
+   * Rate limit: 5/s per UID; 3/s per IP
+   * 
+   * @param symbol - Trading pair
+   * @param orderIds - Array of order IDs to cancel (max 10)
+   * @returns Arrays of successfully cancelled and failed orders
+   */
+  async batchCancelOrders(symbol: string, orderIds: string[]): Promise<{ success: boolean; successful?: any[]; failed?: any[]; error?: string }> {
+    try {
+      if (!Array.isArray(orderIds) || orderIds.length === 0) {
+        throw new Error("Order IDs must be a non-empty array")
+      }
+      
+      if (orderIds.length > 10) {
+        throw new Error("Maximum 10 orders per batch cancel")
+      }
+      
+      this.log(`[API] Batch cancelling ${orderIds.length} orders for ${symbol}`)
+      
+      const bingxSymbol = this.toBingXSymbol(symbol)
+      const params: Record<string, any> = {
+        symbol: bingxSymbol,
+        orderIdList: JSON.stringify(orderIds.map(id => Number(id))),
+        timestamp: this.getTimestamp(),
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/batchOrders?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "DELETE",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const succeeded = data.data?.success || []
+      const failed = data.data?.failed || []
+      
+      this.log(`✓ Batch cancel: ${succeeded.length} cancelled, ${failed.length} failed`)
+      return {
+        success: true,
+        successful: succeeded,
+        failed: failed,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to batch cancel orders: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Cancel all open orders for a symbol
+   * 
+   * Official API: DELETE /openApi/swap/v2/trade/allOpenOrders
+   * Rate limit: 5/s per UID; 2/s per IP
+   * 
+   * @param symbol - Optional: specific symbol, or omit to cancel all orders
+   * @param type - Optional: order type filter (LIMIT, MARKET, STOP_MARKET, etc.)
+   * @returns Arrays of cancelled and failed orders
+   */
+  async cancelAllOrders(symbol?: string, type?: string): Promise<{ success: boolean; successful?: any[]; failed?: any[]; error?: string }> {
+    try {
+      this.log(`[API] Cancelling all open orders${symbol ? ` for ${symbol}` : ""}${type ? ` (type: ${type})` : ""}`)
+      
+      const params: Record<string, any> = {
+        timestamp: this.getTimestamp(),
+      }
+      
+      if (symbol) {
+        params.symbol = this.toBingXSymbol(symbol)
+      }
+      
+      if (type) {
+        params.type = type
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/allOpenOrders?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "DELETE",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const succeeded = data.data?.success || []
+      const failed = data.data?.failed || []
+      
+      this.log(`✓ Cancelled all orders: ${succeeded.length} cancelled, ${failed.length} failed`)
+      return {
+        success: true,
+        successful: succeeded,
+        failed: failed,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to cancel all orders: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Set kill switch (cancel all after timeout)
+   * 
+   * Official API: POST /openApi/swap/v2/trade/cancelAllAfter
+   * Rate limit: 1/s per UID; 2/s per IP
+   * 
+   * Automatically cancels all open orders after timeout (useful for network protection)
+   * 
+   * @param type - "ACTIVATE" or "CLOSE"
+   * @param timeOut - Timeout in seconds (10-120)
+   * @returns Trigger time and status
+   */
+  async setKillSwitch(type: "ACTIVATE" | "CLOSE", timeOut?: number): Promise<{ success: boolean; triggerTime?: number; status?: string; error?: string }> {
+    try {
+      if (type === "ACTIVATE" && (!timeOut || timeOut < 10 || timeOut > 120)) {
+        throw new Error("timeOut must be between 10 and 120 seconds for ACTIVATE")
+      }
+      
+      this.log(`[API] Setting kill switch: ${type}${timeOut ? ` (${timeOut}s)` : ""}`)
+      
+      const params: Record<string, any> = {
+        type,
+        timestamp: this.getTimestamp(),
+      }
+      
+      if (timeOut) {
+        params.timeOut = timeOut
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/cancelAllAfter?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const triggerTime = data.data?.triggerTime || 0
+      const status = data.data?.status || "UNKNOWN"
+      
+      this.log(`✓ Kill switch ${type}: ${status}`)
+      return {
+        success: true,
+        triggerTime,
+        status,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to set kill switch: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Adjust isolated margin for a position
+   * 
+   * Official API: POST /openApi/swap/v2/trade/positionMargin
+   * Rate limit: 2/s per UID; 2/s per IP
+   * 
+   * @param symbol - Trading pair
+   * @param amount - Amount in USDT
+   * @param type - 1 to increase, 2 to decrease
+   * @param positionSide - Optional: LONG or SHORT
+   * @param positionId - Optional: position ID (used in separate isolated mode)
+   * @returns Adjustment result
+   */
+  async adjustIsolatedMargin(
+    symbol: string,
+    amount: number,
+    type: 1 | 2,
+    positionSide?: "LONG" | "SHORT",
+    positionId?: string
+  ): Promise<{ success: boolean; symbol?: string; amount?: number; type?: number; error?: string }> {
+    try {
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error("Amount must be a positive number")
+      }
+      
+      if (type !== 1 && type !== 2) {
+        throw new Error("Type must be 1 (increase) or 2 (decrease)")
+      }
+      
+      this.log(`[API] Adjusting margin for ${symbol}: ${type === 1 ? "+" : "-"}${amount} USDT`)
+      
+      const params: Record<string, any> = {
+        symbol: this.toBingXSymbol(symbol),
+        amount,
+        type,
+        timestamp: this.getTimestamp(),
+      }
+      
+      if (positionSide) {
+        params.positionSide = positionSide
+      }
+      
+      if (positionId) {
+        params.positionId = positionId
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/positionMargin?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      this.log(`✓ Margin adjusted for ${symbol}`)
+      return {
+        success: true,
+        symbol: data.data?.symbol,
+        amount: data.data?.amount,
+        type: data.data?.type,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to adjust margin: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Get margin mode for a symbol
+   * 
+   * Official API: GET /openApi/swap/v2/trade/marginType
+   * Rate limit: 2/s per UID; 2/s per IP
+   * 
+   * @param symbol - Trading pair
+   * @returns Margin mode (ISOLATED or CROSSED)
+   */
+  async getMarginMode(symbol: string): Promise<{ success: boolean; marginType?: string; error?: string }> {
+    try {
+      this.log(`[API] Querying margin mode for ${symbol}`)
+      
+      const params: Record<string, any> = {
+        symbol: this.toBingXSymbol(symbol),
+        timestamp: this.getTimestamp(),
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "GET",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const marginType = data.data?.marginType || "UNKNOWN"
+      this.log(`✓ Margin mode: ${marginType}`)
+      return {
+        success: true,
+        marginType,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to get margin mode: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Get single open order
+   * 
+   * Official API: GET /openApi/swap/v2/trade/openOrder
+   * Rate limit: 5/s per UID; 2/s per IP
+   */
+  async getOpenOrder(
+    symbol: string,
+    orderId?: string,
+    clientOrderId?: string
+  ): Promise<{ success: boolean; order?: any; error?: string }> {
+    try {
+      const params: Record<string, any> = {
+        symbol: this.toBingXSymbol(symbol),
+        timestamp: this.getTimestamp(),
+      }
+      
+      if (orderId) params.orderId = orderId
+      if (clientOrderId) params.clientOrderId = clientOrderId
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/openOrder?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "GET",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      return {
+        success: true,
+        order: data.data,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to get open order: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Get order details (any status)
+   * 
+   * Official API: GET /openApi/swap/v2/trade/order
+   * Rate limit: 30/s per UID; 2/s per IP
+   */
+  async getOrderDetails(
+    symbol: string,
+    orderId?: string,
+    clientOrderId?: string
+  ): Promise<{ success: boolean; order?: any; error?: string }> {
+    try {
+      const params: Record<string, any> = {
+        symbol: this.toBingXSymbol(symbol),
+        timestamp: this.getTimestamp(),
+      }
+      
+      if (orderId) params.orderId = orderId
+      if (clientOrderId) params.clientOrderId = clientOrderId
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/order?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "GET",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      return {
+        success: true,
+        order: data.data,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to get order: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Get force liquidation/ADL orders
+   * 
+   * Official API: GET /openApi/swap/v2/trade/forceOrders
+   * Rate limit: 10/s per UID; 2/s per IP
+   */
+  async getForceOrders(
+    symbol?: string,
+    currency?: string,
+    autoCloseType?: "LIQUIDATION" | "ADL",
+    startTime?: number,
+    endTime?: number,
+    limit?: number
+  ): Promise<{ success: boolean; orders?: any[]; error?: string }> {
+    try {
+      const params: Record<string, any> = {
+        timestamp: this.getTimestamp(),
+      }
+      
+      if (symbol) params.symbol = this.toBingXSymbol(symbol)
+      if (currency) params.currency = currency
+      if (autoCloseType) params.autoCloseType = autoCloseType
+      if (startTime) params.startTime = startTime
+      if (endTime) params.endTime = endTime
+      if (limit) params.limit = limit
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/forceOrders?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "GET",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      return {
+        success: true,
+        orders: Array.isArray(data.data) ? data.data : [],
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to get force orders: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Get trade fill history
+   * 
+   * Official API: GET /openApi/swap/v2/trade/allFillOrders
+   * Rate limit: 5/s per UID; 2/s per IP
+   */
+  async getTradeHistory(
+    tradingUnit: string,
+    startTs: number,
+    endTs: number,
+    orderId?: string,
+    currency?: string
+  ): Promise<{ success: boolean; trades?: any[]; error?: string }> {
+    try {
+      const params: Record<string, any> = {
+        tradingUnit,
+        startTs,
+        endTs,
+        timestamp: this.getTimestamp(),
+      }
+      
+      if (orderId) params.orderId = orderId
+      if (currency) params.currency = currency
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/allFillOrders?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "GET",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await this.safeJson(response)
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      return {
+        success: true,
+        trades: Array.isArray(data.data) ? data.data : [],
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to get trade history: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * bingx-swap-account: Query perpetual futures account information
+   * 
+   * Retrieve account data for USDT-M perpetual trading:
+   * - Account balance
+   * - Positions information
+   * - Open orders
+   * - Commission rates
+   * - Fund flow history
+   * 
+   * @param dataType - Type of account data to retrieve ("balance", "positions", "orders", "all")
+   * @returns Account information
+   */
+  async getSwapAccountInfo(dataType: string = "all"): Promise<any> {
+    try {
+      this.log(`[bingx-swap-account] Fetching account info: ${dataType}`)
+      
+      const result: any = {
+        success: true,
+        dataType,
+        timestamp: this.getTimestamp(),
+      }
+      
+      if (dataType === "balance" || dataType === "all") {
+        const balance = await this.getBalance()
+        if (balance.success) {
+          result.balance = {
+            total: balance.balance,
+            btcPrice: balance.btcPrice,
+            balances: balance.balances,
+          }
+          this.log(`✓ Balance: ${balance.balance.toFixed(4)} USDT`)
+        } else {
+          result.balanceError = balance.error
+        }
+      }
+      
+      if (dataType === "positions" || dataType === "all") {
+        const positions = await this.getPositions()
+        if (positions && Array.isArray(positions)) {
+          result.positions = positions
+          this.log(`✓ Positions: ${positions.length} open`)
+        } else {
+          result.positionsError = "Failed to fetch positions"
+        }
+      }
+      
+      if (dataType === "orders" || dataType === "all") {
+        const orders = await this.getOpenOrders()
+        if (orders && Array.isArray(orders)) {
+          result.openOrders = orders
+          this.log(`✓ Open Orders: ${orders.length}`)
+        } else {
+          result.ordersError = "Failed to fetch orders"
+        }
+      }
+      
+      return result
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`[bingx-swap-account] Failed to fetch account info: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
     }
   }
 }

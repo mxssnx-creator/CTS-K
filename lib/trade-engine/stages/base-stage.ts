@@ -19,7 +19,7 @@ export interface BasePosition {
   entryTime: number
   indicationSignal: "buy" | "sell" | "neutral"
   indicationStrength: number
-  status: "pending" | "active" | "closed"
+  status: "open" | "closed"
   sourceIndicationTimestamp: number
   createdAt: number
   updatedAt: number
@@ -48,22 +48,31 @@ export async function generateBasePositions(
   try {
     const connectionId = connection.id || connection.name
 
-    for (const indication of indications) {
-      // Count existing positions in each direction
-      const existingLong = await countExistingPositions(
-        client,
-        connectionId,
-        indication.symbol,
-        "long"
-      )
-      const existingShort = await countExistingPositions(
-        client,
-        connectionId,
-        indication.symbol,
-        "short"
-      )
+    // ── Parallel per-indication base-position generation ───────────────
+    //
+    // Each indication is fully independent (different symbol/direction
+    // keyspace) — the original sequential loop awaited 2 reads + up to
+    // 2 writes per indication, serialising the entire stage. We now:
+    //   1. Pipeline the existence-count reads for ALL indications.
+    //   2. Compute the open-position deltas synchronously.
+    //   3. Pipeline the storeBasePosition writes.
+    //
+    // This collapses the stage from O(N · RTT) into O(3 · RTT)
+    // regardless of N, which is the same shape as the engine-manager's
+    // per-symbol fan-out and is bounded by Promise.all's natural
+    // pipelining inside the Redis client.
+    const existenceCounts = await Promise.all(
+      indications.map(async (indication) => {
+        const [existingLong, existingShort] = await Promise.all([
+          countExistingPositions(client, connectionId, indication.symbol, "long"),
+          countExistingPositions(client, connectionId, indication.symbol, "short"),
+        ])
+        return { indication, existingLong, existingShort }
+      }),
+    )
 
-      // Generate LONG position if under limit
+    const writes: Promise<unknown>[] = []
+    for (const { indication, existingLong, existingShort } of existenceCounts) {
       if (existingLong < maxLong) {
         const longPosition: BasePosition = {
           id: `base:${connectionId}:${indication.symbol}:${Date.now()}:long`,
@@ -76,21 +85,17 @@ export async function generateBasePositions(
           entryTime: Date.now(),
           indicationSignal: indication.signal,
           indicationStrength: indication.strength,
-          status: "pending",
+          status: "open",
           sourceIndicationTimestamp: indication.timestamp,
           createdAt: Date.now(),
           updatedAt: Date.now(),
         }
-
         basePositions.push(longPosition)
-        await storeBasePosition(client, longPosition)
-
+        writes.push(storeBasePosition(client, longPosition))
         console.log(
           `${LOG_PREFIX} Created LONG base position ${longPosition.id} (strength: ${indication.strength.toFixed(2)})`
         )
       }
-
-      // Generate SHORT position if under limit
       if (existingShort < maxShort) {
         const shortPosition: BasePosition = {
           id: `base:${connectionId}:${indication.symbol}:${Date.now()}:short`,
@@ -103,28 +108,24 @@ export async function generateBasePositions(
           entryTime: Date.now(),
           indicationSignal: indication.signal,
           indicationStrength: indication.strength,
-          status: "pending",
+          status: "open",
           sourceIndicationTimestamp: indication.timestamp,
           createdAt: Date.now(),
           updatedAt: Date.now(),
         }
-
         basePositions.push(shortPosition)
-        await storeBasePosition(client, shortPosition)
-
+        writes.push(storeBasePosition(client, shortPosition))
         console.log(
           `${LOG_PREFIX} Created SHORT base position ${shortPosition.id} (strength: ${indication.strength.toFixed(2)})`
         )
       }
-
-      // If at limit, don't create more
       if (existingLong >= maxLong && existingShort >= maxShort) {
         console.log(
           `${LOG_PREFIX} Position limits reached for ${indication.symbol} (${existingLong}/${maxLong} long, ${existingShort}/${maxShort} short)`
         )
-        continue
       }
     }
+    if (writes.length > 0) await Promise.all(writes)
 
     console.log(`${LOG_PREFIX} Generated ${basePositions.length} base positions`)
     return basePositions
@@ -159,18 +160,48 @@ async function storeBasePosition(client: any, position: BasePosition): Promise<v
 }
 
 /**
- * Count existing positions in a direction
+ * Count OPEN (not closed) base positions in a direction.
+ *
+ * The direction index list (`base:positions:{connId}:{symbol}:{dir}`) is
+ * append-only and grows forever — using `llen` on it counted ALL-TIME entries,
+ * not just currently-open ones. After the first position was created the limit
+ * check `existingX >= maxX` was always true, permanently blocking new positions
+ * for that symbol+direction.
+ *
+ * Fix: scan the most-recent position IDs, fetch each record, and count only
+ * those whose `status` is "open". We cap the scan at `maxPosLimit + 1` entries
+ * so we never do more reads than necessary — if the first N positions are all
+ * open we already know the limit is reached without scanning further.
  */
 async function countExistingPositions(
   client: any,
   connectionId: string,
   symbol: string,
-  direction: "long" | "short"
+  direction: "long" | "short",
+  maxPosLimit: number = 10,
 ): Promise<number> {
   try {
-    const key = `base:positions:${connectionId}:${symbol}:${direction}`
-    const count = await client.llen(key).catch(() => 0)
-    return count || 0
+    const indexKey = `base:positions:${connectionId}:${symbol}:${direction}`
+    // Fetch at most (maxPosLimit + 1) most-recent IDs from the list (newest first).
+    const ids: string[] = ((await client.lrange(indexKey, 0, maxPosLimit).catch(() => [])) || []) as string[]
+    if (ids.length === 0) return 0
+
+    // Batch-fetch all position records in one pipeline round-trip.
+    const pipeline = client.multi()
+    for (const id of ids) pipeline.get(`base:position:${id}`)
+    const results = await pipeline.exec().catch(() => null)
+    if (!results) return 0
+
+    let openCount = 0
+    for (const r of results) {
+      const raw = Array.isArray(r) ? r[1] : r
+      if (!raw) continue
+      try {
+        const pos = JSON.parse(raw as string)
+        if (pos?.status === "open") openCount++
+      } catch { /* skip unparseable */ }
+    }
+    return openCount
   } catch (err) {
     console.warn(`${LOG_PREFIX} Error counting positions: ${err}`)
     return 0
@@ -185,7 +216,10 @@ export async function getBasePositions(connectionId: string): Promise<BasePositi
   const client = getRedisClient()
 
   try {
-    const keys = await client.keys(`base:position:${connectionId}:*`)
+    // Position IDs are "base:{connId}:{symbol}:{ts}:{dir}", so the stored key
+    // is "base:position:base:{connId}:..." — the "base:" id prefix must be
+    // included in the pattern or this scan always returns zero results.
+    const keys = await client.keys(`base:position:base:${connectionId}:*`)
     if (keys.length === 0) return []
 
     // Batch GETs into a single fan-out instead of a sequential await
@@ -272,7 +306,7 @@ export async function getBasePositionsByDirection(
  */
 export async function updateBasePositionStatus(
   positionId: string,
-  status: "pending" | "active" | "closed"
+  status: "open" | "closed"
 ): Promise<void> {
   await initRedis()
   const client = getRedisClient()

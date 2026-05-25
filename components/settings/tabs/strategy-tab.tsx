@@ -370,9 +370,103 @@ export function StrategyTab({ settings, handleSettingChange }: StrategyTabProps)
                   </div>
                 </div>
               </div>
-            </CardContent>
-          </Card>
-        </TabsContent>
+                </CardContent>
+              </Card>
+
+              {/* ── Stage Evaluation Position-Count Thresholds ─────────────── */}
+              {/*
+               * Per-stage minimum pseudo-position counts. Sets that haven't
+               * accumulated enough completed entries are SKIPPED at the
+               * evaluation gate (not promoted, not counted as failed), so
+               * fresh / warming-up sets re-enter on subsequent cycles once
+               * enough positions have closed.
+               *
+               * Stored as 0 in default settings → StrategyCoordinator
+               // applies the hardcoded defaults:
+               //   stageMinPosCountBase=0  →  default  15 (Base→Main)
+               //   stageMinPosCountMain=0  →  default  15 (Main→Real)
+               //   stageMinPosCountReal=0  →  default  10 (Real→Live)
+               //
+               // Write path: page.tsx Settings → connection_settings hash
+               // → StrategyCoordinator.loadAppPFThresholds() reads and snaps
+               // to the 5-step grid (5, 10, 15, 20, … 50).
+               */}
+              <Card>
+                <CardHeader>
+                  <CardTitle>Stage Evaluation Thresholds</CardTitle>
+                  <CardDescription>
+                    Minimum completed pseudo-positions before each stage validates PF + drawdown.
+                    Sets below the threshold are skipped (warming-up, not failed).
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="grid md:grid-cols-3 gap-4">
+                    {/* Base — not currently applied to base-stage, coord slot reserved */}
+                    <div className="space-y-2">
+                      <Label>Base → Main (min positions)</Label>
+                      <div className="flex items-center gap-3">
+                        <Slider
+                          min={0}
+                          max={50}
+                          step={5}
+                          value={[settings.stageMinPosCountBase ?? 0]}
+                          onValueChange={([v]) => handleSettingChange("stageMinPosCountBase", v)}
+                          className="flex-1"
+                        />
+                        <span className="text-sm font-semibold w-10 text-right">
+                          {(settings.stageMinPosCountBase ?? 0) === 0 ? "Default" : settings.stageMinPosCountBase}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        0 = coordinator default (15)
+                      </p>
+                    </div>
+
+                    {/* Main → Real */}
+                    <div className="space-y-2">
+                      <Label>Main → Real (min positions)</Label>
+                      <div className="flex items-center gap-3">
+                        <Slider
+                          min={0}
+                          max={50}
+                          step={5}
+                          value={[settings.stageMinPosCountMain ?? 0]}
+                          onValueChange={([v]) => handleSettingChange("stageMinPosCountMain", v)}
+                          className="flex-1"
+                        />
+                        <span className="text-sm font-semibold w-10 text-right">
+                          {(settings.stageMinPosCountMain ?? 0) === 0 ? "Default" : settings.stageMinPosCountMain}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        0 = coordinator default (15)
+                      </p>
+                    </div>
+
+                    {/* Real → Live */}
+                    <div className="space-y-2">
+                      <Label>Real → Live (min positions)</Label>
+                      <div className="flex items-center gap-3">
+                        <Slider
+                          min={0}
+                          max={50}
+                          step={5}
+                          value={[settings.stageMinPosCountReal ?? 0]}
+                          onValueChange={([v]) => handleSettingChange("stageMinPosCountReal", v)}
+                          className="flex-1"
+                        />
+                        <span className="text-sm font-semibold w-10 text-right">
+                          {(settings.stageMinPosCountReal ?? 0) === 0 ? "Default" : settings.stageMinPosCountReal}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        0 = coordinator default (10)
+                      </p>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
 
         <TabsContent value="auto">
           <AutoIndicationSettings />

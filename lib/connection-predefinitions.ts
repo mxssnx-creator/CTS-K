@@ -6,7 +6,6 @@ import { getBaseConnectionCredentials } from "@/lib/base-connection-credentials"
  * Includes API types, library names, and exchange-specific options.
  *
  * PRIMARY EXCHANGES (auto-created and enabled on initialization):
- * - Bybit (bybit-x03)
  * - BingX (bingx-x01)
  * - Pionex (pionex-x01)
  * - OrangeX (orangex-x01)
@@ -150,27 +149,6 @@ export const EXCHANGE_CONNECTION_METHODS: Record<string, string[]> = {
 
 // Base connection configurations - NO TESTNET (mainnet only for production)
 export const CONNECTION_PREDEFINITIONS: ConnectionPredefinition[] = [
-  {
-    id: "bybit-x03",
-    name: "Bybit X03",
-    displayName: "Bybit X03 (Perpetual Futures)",
-    description: "Bybit USDT Perpetual Futures with up to 100x leverage - Demo Mode for Testing. Use your Bybit account to generate API keys from https://www.bybit.com/en/user-service/my-api",
-    exchange: "bybit",
-    apiTypes: ["unified", "contract"],
-    apiType: "contract",
-    connectionMethod: "library",
-    connectionLibrary: "native",
-    libraryPackage: "pybit",
-    marginType: "cross",
-    positionMode: "hedge",
-    maxLeverage: 100,
-    contractType: "linear",
-    documentationUrl: "https://bybit-exchange.github.io/docs/v5/intro",
-    testnetSupported: false, // NO TESTNET - mainnet only
-    ccxtSupported: true,
-    apiKey: "", // User must enter their own credentials
-    apiSecret: "",
-  },
   {
     id: "bingx-x01",
     name: "BingX X01",

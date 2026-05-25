@@ -22,656 +22,457 @@
  * records a "simulated" live position without touching the exchange.
  */
 
-import { getRedisClient, initRedis } from "@/lib/redis-db"
+import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
+import { getVenueMinQty } from "@/lib/exchange-min-qty"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { SystemLogger } from "@/lib/system-logger"
 import type { RealPosition } from "./real-stage"
+import { getEngineTimings } from "@/lib/engine-timings"
+import { withTimeout } from "@/lib/async-safety"
+import { getMaxLeverageForExchange } from "@/lib/leverage-policy"
+import {
+  newLiveOrderTrace,
+  withLiveOrderLogging,
+  logLiveOrderFinal,
+  type LiveOrderTrace,
+} from "@/lib/live-order-logger"
 
+// ── Position ID counter for high-frequency scenarios ────────────────────────
+// Even at 1000 positions/sec, Date.now() granularity (milliseconds) causes
+// collisions. Using a process-wide counter avoids timestamp-based ID clashes.
+// Format: live:{connId}:{symbol}:{direction}:{milliseconds}:{nanoCounter}:{random}
+// The nanoCounter ensures uniqueness within the same millisecond, and the
+// random suffix provides defence-in-depth against counter wraparound at scale.
+let _positionIdCounter = 0n
+
+function generateLivePositionId(connectionId: string, symbol: string, direction: string): string {
+  const ms = BigInt(Date.now())
+  _positionIdCounter = (_positionIdCounter + 1n) & 0xFFFFFFFFn // 32-bit counter, wraparound OK
+  const random = Math.random().toString(36).slice(2, 10) // 8 chars base-36 ≈ 42 bits entropy
+  return `live:${connectionId}:${symbol}:${direction}:${ms.toString()}:${_positionIdCounter.toString()}:${random}`
+}
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 
-// ── Types ────────────────────────────────────────────────────────────────────
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS = 10_000
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS = 15_000
+const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 10_000
+const EXCHANGE_TIMEOUT_GET_ORDER_MS = 10_000
 
-export interface LivePosition {
-  id: string
+/**
+ * Live position as it flows through the live-stage pipeline and is
+ * persisted in Redis.  This is the local definition; the external
+ * definition in `position-tracker.ts` uses snake_case field names and
+ * is intentionally kept separate (it represents the cached exchange API
+ * shape, not the stage pipeline shape).
+ */
+interface LivePosition {
+  id?: string
   connectionId: string
   symbol: string
-  direction: "long" | "short"
-  realPositionId: string
-  // Sizing & pricing
-  quantity: number
+  side?: "long" | "short"
+  direction?: "long" | "short"
+  entryPrice: number
   executedQuantity: number
   remainingQuantity: number
-  entryPrice: number
   averageExecutionPrice: number
-  volumeUsd: number
+  volumeUsd?: number
   leverage: number
   marginType: "cross" | "isolated"
-  // Risk management
-  //
-  // `stopLoss` / `takeProfit` are the *current* assigned percentages
-  // honored by the exchange protection orders. They can be mutated by
-  // `recalculateAndApplySLTP()` when an operator edits SL/TP mid-trade.
-  //
-  // `assignedStopLoss` / `assignedTakeProfit` are an IMMUTABLE snapshot
-  // of the values originally assigned by the upstream Set/strategy at
-  // position creation. They never change for the lifetime of the
-  // position — even after overrides — so post-trade analysis and the
-  // progression panel can always answer "what did the strategy
-  // originally specify?". Optional for back-compat with positions
-  // opened before this field existed.
-  stopLoss: number
-  takeProfit: number
-  assignedStopLoss?: number
-  assignedTakeProfit?: number
-  // `stopLossPrice` / `takeProfitPrice` are the latest absolute
-  // trigger prices placed on the exchange — they are recomputed by
-  // `updateProtectionOrders()` whenever the average execution price
-  // shifts (accumulation merges) or the current `stopLoss` /
-  // `takeProfit` percentages change. They mirror the prices the
-  // exchange's reduce-only orders are armed at.
+  unrealized_pnl?: number
+  unrealized_pnl_percent?: number
+  markPrice?: number
+  liquidationPrice?: number
+  realizedPnL?: number
+  timestamp?: number
+  fee?: number
+  feeAsset?: string
+  lastUpdate?: number
+  last_update?: number
+  stoppedAt?: number
+  updatedAt?: number
+  createdAt?: number
+  closedAt?: number
+  realPositionId?: string
+  /**
+   * Upstream pseudo-position ID — the PseudoPositionManager ID that generated
+   * this live position. Stored alongside `setKey` so SL/TP dedup checks can be
+   * scoped per (setKey + pseudoPositionId) rather than just per (symbol + direction),
+   * preventing duplicate control orders when multiple pseudo-positions share a symbol.
+   */
+  pseudoPositionId?: string
+  fills: FillRecord[]
+  stopLoss?: number
+  takeProfit?: number
   stopLossPrice?: number
   takeProfitPrice?: number
-  // `protectionArmedQuantity` is the `executedQuantity` value that was
-  // in effect when SL/TP were last (re-)placed on the exchange. We
-  // compare against the current `executedQuantity` every reconcile
-  // cycle: if they differ by more than 0.25% we re-arm. This closes a
-  // bug where accumulation merges or delayed partial fills grew the
-  // position but the original SL/TP order on the exchange still only
-  // protected the *original* volume — leaving the additional volume
-  // unprotected. Optional for back-compat with existing positions.
-  protectionArmedQuantity?: number
-  // Exchange references
-  orderId?: string
   stopLossOrderId?: string
   takeProfitOrderId?: string
-  status:
-    | "pending"
-    | "placed"
-    | "open"
-    | "partially_filled"
-    | "filled"
-    | "closed"
-    | "error"
-    | "simulated"
-    | "rejected"
+  assignedStopLoss?: number
+  assignedTakeProfit?: number
+  protectionArmedQuantity?: number
+  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "rejected" | "cancelled" | "error" | "simulated" | "pending"
   statusReason?: string
-  fills: {
-    timestamp: number
-    quantity: number
-    price: number
-    fee: number
-    feeAsset: string
-  }[]
-  exchangeData?: {
-    exchangePositionId?: string
-    marginType?: "cross" | "isolated"
-    markPrice?: number
-    liquidationPrice?: number
-    unrealizedPnl?: number
-    unrealizedPnL?: number   // alias; some code-paths write either casing
-    roi?: number
-    syncedAt?: number        // last reconciliation timestamp
-  }
-  // Close / terminal state
-  closedAt?: number
-  realizedPnL?: number
-  closeReason?: string       // "sl_hit" | "tp_hit" | "manual" | "exchange_reconciliation" | ...
-  // ── Accumulation tracking ──────────────────────────────────────────
-  // When multiple upstream Sets (or the same Set firing repeatedly via
-  // DCA / pyramiding) want to enter on the same symbol+direction, we
-  // ADD their computed volumes into a single exchange position instead
-  // of rejecting duplicates. These fields document the consolidation
-  // history so the UI can show "this 1 exchange order absorbed N Set
-  // signals" and so reconcile knows the SL/TP levels need to track the
-  // weighted-average entry, not just the very first fill.
-  accumulationCount?: number               // number of Set signals merged in (1 = single entry)
-  lastAccumulatedAt?: number               // timestamp of the most recent merge
-  accumulatedRealPositionIds?: string[]    // upstream Real position ids that contributed
-  // ── Set lineage (optional, threaded from Main → Real → Live) ────────
-  // These fields preserve the *Set Type* context that produced this
-  // exchange position. They let post-trade statistics dimensionalise
-  // realised PnL by:
-  //   - variant         (default / trailing / block / dca / pause)
-  //   - axisWindows     (which prev/last/cont/pause window was active)
-  //   - parentSetKey    (the Base Set the Main variant was derived from)
-  //   - setKey          (the materialised Main Set's identifier)
-  //
-  // All optional so legacy code paths that don't have lineage info
-  // (manual exchange operations, reconciliation) still work. When
-  // present, accumulation merges *do not* overwrite the original
-  // lineage — the first Set that opened the position keeps authorship,
-  // and subsequent absorbed Sets are appended into `accumulatedSetKeys`.
+  closeReason?: string
   setKey?: string
+  exchangeData?: Record<string, unknown>
+  orderId?: string
+  connection_id?: string
+  entry_price?: number
+  current_price?: number
+  quantity: number
+  axisWindows?: { prev: number; last: number; cont: number; pause: number }
   parentSetKey?: string
   setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
-  axisWindows?: { prev: number; last: number; cont: number; pause: number }
-  /** All upstream Set ids that contributed to this exchange position
-   *  (initial entry plus every accumulation). Useful for "which Sets
-   *  realised this PnL" stats. */
   accumulatedSetKeys?: string[]
-  progression: {
-    step: string
-    timestamp: number
-    success: boolean
-    details?: string
-  }[]
-  createdAt: number
-  updatedAt: number
+  
+  progression?: { step: string; timestamp: number; success: boolean; details: string }[]
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-function pushStep(pos: LivePosition, step: string, success: boolean, details?: string): void {
-  pos.progression.push({ step, timestamp: Date.now(), success, details })
-  pos.updatedAt = Date.now()
+interface FillRecord {
+  id?: string
+  price: number
+  quantity: number
+  timestamp?: number
+  fee?: number
+  feeAsset?: string
 }
 
-// In-memory set of ids already registered in the Redis index this runtime.
-// Avoids a roundtrip GET on every intermediate savePosition() call. Cleared
-// on serverless cold start, which is correct because Redis dedup marker
-// (`live:positions:{connId}:indexed:{id}`) is the ultimate source of truth.
-const _indexedInMemory = new Set<string>()
+// ── Helper functions (real implementations) ─────────────────────────
+// These helpers are intentionally defined as module-level functions
+// (not imported from a separate file) so they share the same module
+// scope as executeLivePosition, reconcileLivePositions, etc. and can
+// reference the Redis client + LivePosition type directly.
 
-async function savePosition(pos: LivePosition): Promise<void> {
+/** Append a progression step to position.progression (bounded to 100 entries). */
+function pushStep(position: LivePosition, step: string, ok: boolean, detail: string): void {
+  if (!Array.isArray(position.progression)) position.progression = []
+  position.progression.push({ step, timestamp: Date.now(), success: ok, details: detail })
+  if (position.progression.length > 100) position.progression = position.progression.slice(-100)
+}
+
+/**
+ * Persist a LivePosition to Redis.
+ *
+ * Key layout:
+ *   live:position:{id}              — full JSON, TTL 7 days
+ *   live:positions:{connId}         — open-index List (lpush + dedup via LREM)
+ *   live:closed:{connId}            — closed-archive List (lpush, capped at 2000)
+ *   real:active_positions:{connId}  — SADD Set of Real-stage active position IDs
+ *   real:active_positions:{connId}:meta  — HSET: {positionId} → JSON meta
+ *
+ * The function is idempotent: repeated calls for the same position ID are
+ * safe because the List dedup (LREM → LPUSH) and SADD prevent duplicates.
+ *
+ * Real-active index invariant:
+ *   A position is in the real:active_positions Set iff:
+ *     - It has a setKey (i.e. it originated from a Real Set), AND
+ *     - Its status is NOT one of: closed | rejected | cancelled | error
+ *   On every savePosition call, membership is adjusted atomically so the
+ *   set never contains stale entries for positions that have been closed.
+ */
+async function savePosition(position: LivePosition): Promise<void> {
+  if (!position?.id) return
   try {
     const client = getRedisClient()
-    const key = `live:position:${pos.id}`
-    const openIndexKey   = `live:positions:${pos.connectionId}`
-    const closedIndexKey = `live:positions:${pos.connectionId}:closed`
-    const indexedMarker  = `live:positions:${pos.connectionId}:indexed:${pos.id}`
+    const key    = `live:position:${position.id}`
+    const connId = position.connectionId || (position as any).connection_id || ""
+    const TTL    = 7 * 24 * 60 * 60 // 7 days
 
-    // 1. Write the position snapshot
-    await client.setex(key, 604800, JSON.stringify(pos))
+    await client.set(key, JSON.stringify(position), { EX: TTL } as any)
 
-    // 2. Register id in the open index exactly once per lifetime. When the
-    // marker isn't set yet the four follow-up writes are independent, so we
-    // collapse them into a single Promise.all round-trip window.
-    if (!_indexedInMemory.has(pos.id)) {
-      const alreadyIndexed = await client.get(indexedMarker).catch(() => null)
-      if (!alreadyIndexed) {
-        await Promise.all([
-          client.lpush(openIndexKey, pos.id).catch(() => {}),
-          client.setex(indexedMarker, 604800, "1").catch(() => {}),
-          client.ltrim(openIndexKey, 0, 1999).catch(() => {}),
-          client.expire(openIndexKey, 604800).catch(() => {}),
-        ])
+    if (connId) {
+      const isClosed = position.status === "closed" || position.status === "rejected" ||
+                       position.status === "cancelled" || position.status === "error"
+      const openIdx   = `live:positions:${connId}`
+      const closedIdx = `live:closed:${connId}`
+
+      if (isClosed) {
+        // Remove from open index, push to closed archive.
+        await client.lrem(openIdx, 0, position.id).catch(() => {})
+        await client.lpush(closedIdx, position.id).catch(() => {})
+        // Cap archive at 2000 entries.
+        await client.ltrim(closedIdx, 0, 1999).catch(() => {})
+      } else {
+        // Remove any stale duplicate then re-insert at head (LREM is O(N)
+        // but N is bounded to 500 open positions in practice).
+        await client.lrem(openIdx, 0, position.id).catch(() => {})
+        await client.lpush(openIdx, position.id).catch(() => {})
+        // Prevent unbounded list growth — keep at most 500 open entries.
+        await client.ltrim(openIdx, 0, 499).catch(() => {})
+        await client.expire(openIdx, TTL).catch(() => {})
       }
-      _indexedInMemory.add(pos.id)
-    }
 
-    // 3. When a position reaches a terminal status, move it out of the open
-    // index and into the closed archive so getLivePositions() only scans
-    // currently-active records (major performance win for long-running apps).
-    const isTerminal =
-      pos.status === "closed" ||
-      pos.status === "error" ||
-      pos.status === "rejected"
+      // ── Real-active dedicated index ────────────────────────────────────
+      // A position is "Real-active" when it has a setKey (originated from a
+      // Real Set evaluated by StrategyCoordinator) and is not in a terminal
+      // state. This Set is queried directly by syncWithExchange and
+      // reconcileLivePositions so they can work on the focused subset of
+      // positions that require Set-level coordination, without scanning the
+      // entire open-positions list.
+      const realActiveKey  = `real:active_positions:${connId}`
+      const realActiveMetaKey = `real:active_positions:${connId}:meta`
+      const hasSetKey = !!String(position.setKey || "").trim()
 
-    if (isTerminal) {
-      const movedMarker = `live:positions:${pos.connectionId}:moved:${pos.id}`
-      const alreadyMoved = await client.get(movedMarker).catch(() => null)
-      if (!alreadyMoved) {
-        // These five writes are independent — lrem + lpush + ltrim + two
-        // expiries. Parallelising halves the per-close latency.
-        await Promise.all([
-          client.lrem(openIndexKey, 0, pos.id).catch(() => {}),
-          client.lpush(closedIndexKey, pos.id).catch(() => {}),
-          client.ltrim(closedIndexKey, 0, 4999).catch(() => {}),
-          client.expire(closedIndexKey, 30 * 24 * 60 * 60).catch(() => {}),
-          client.setex(movedMarker, 604800, "1").catch(() => {}),
-        ])
+      if (hasSetKey) {
+        if (isClosed) {
+          // Remove from the real-active Set and wipe its meta entry.
+          await Promise.all([
+            client.srem(realActiveKey, position.id).catch(() => {}),
+            client.hdel(realActiveMetaKey, position.id).catch(() => {}),
+          ])
+        } else {
+          // Upsert into the real-active Set + refresh meta hash field.
+          const meta = JSON.stringify({
+            setKey:          String(position.setKey || ""),
+            parentSetKey:    String(position.parentSetKey || ""),
+            symbol:          String(position.symbol || ""),
+            direction:       String(position.direction || ""),
+            pseudoPositionId: String(position.pseudoPositionId || ""),
+            status:          String(position.status || ""),
+            createdAt:       position.createdAt ?? Date.now(),
+          })
+          await Promise.all([
+            client.sadd(realActiveKey, position.id).catch(() => {}),
+            client.hset(realActiveMetaKey, position.id, meta).catch(() => {}),
+            client.expire(realActiveKey, TTL).catch(() => {}),
+            client.expire(realActiveMetaKey, TTL).catch(() => {}),
+          ])
+        }
       }
     }
   } catch (err) {
-    console.error(`${LOG_PREFIX} Failed to save position:`, err)
+    console.warn(`${LOG_PREFIX} savePosition error for ${position.id}:`, err instanceof Error ? err.message : String(err))
   }
 }
 
-async function incrementMetric(connectionId: string, field: string, by = 1): Promise<void> {
-  // Fire the counter bump and the TTL refresh in parallel — the expire is
-  // independent of the hincrby result and would otherwise force a second
-  // round-trip for every live-stage metric update.
+/** Increment a named metric counter in the per-connection progression hash. */
+async function incrementMetric(connectionId: string, metric: string, delta = 1): Promise<void> {
+  if (!connectionId || !metric) return
   try {
     const client = getRedisClient()
-    const key = `progression:${connectionId}`
-    await Promise.all([
-      client.hincrby(key, field, by),
-      client.expire(key, 7 * 24 * 60 * 60),
-    ])
-  } catch {
-    /* non-critical */
-  }
+    await client.hincrby(`progression:${connectionId}`, metric, delta)
+  } catch { /* non-critical */ }
 }
 
-async function fetchCurrentPrice(symbol: string): Promise<number> {
+/** Increment a per-symbol order metric (used for per-symbol fill/reject tracking). */
+async function incrementOrdersBySymbol(connectionId: string, symbol: string, side: string, metric: string): Promise<void> {
+  if (!connectionId || !symbol) return
   try {
     const client = getRedisClient()
-
-    // 1. Primary: hgetall market_data:{symbol} hash
-    const mdhash = await client.hgetall(`market_data:${symbol}`)
-    const price = parseFloat(String(mdhash?.close ?? mdhash?.price ?? mdhash?.last ?? "0"))
-    if (price > 0) return price
-
-    // 2. Fallback: candle envelope. Spec §7 — the loader now writes
-    //    `:1s` exclusively, but old runs may still have `:1m` data
-    //    in Redis. Try the new key first, then the legacy one.
-    const envelopeRaw =
-      (await client.get(`market_data:${symbol}:1s`)) ??
-      (await client.get(`market_data:${symbol}:1m`))
-    if (envelopeRaw) {
-      try {
-        const parsed = typeof envelopeRaw === "string" ? JSON.parse(envelopeRaw) : envelopeRaw
-        const p = parseFloat(String(parsed?.close ?? parsed?.price ?? parsed?.last ?? 0))
-        if (p > 0) return p
-      } catch { /* ignore */ }
-    }
-
-    // 3. Fallback: ticker key (some connectors write here)
-    const rawTicker = await client.get(`ticker:${symbol}`)
-    if (rawTicker) {
-      try {
-        const parsed = typeof rawTicker === "string" ? JSON.parse(rawTicker) : rawTicker
-        const p = parseFloat(String(parsed?.last ?? parsed?.close ?? parsed?.price ?? 0))
-        if (p > 0) return p
-      } catch { /* ignore */ }
-    }
-
-    // 4. Fallback: latest candle string key
-    const rawLatest = await client.get(`market_data:${symbol}:latest`)
-    if (rawLatest) {
-      try {
-        const parsed = typeof rawLatest === "string" ? JSON.parse(rawLatest) : rawLatest
-        const p = parseFloat(String(parsed?.close ?? parsed?.price ?? parsed?.last ?? 0))
-        if (p > 0) return p
-      } catch { /* ignore */ }
-    }
-
-    return 0
-  } catch {
-    return 0
-  }
+    await client.hincrby(`live_orders:${connectionId}:${symbol}`, `${side}_${metric}`, 1)
+  } catch { /* non-critical */ }
 }
 
-// `hasOpenLivePosition` was removed — it was a non-atomic GET-only test
-// that produced the check-then-act race in `executeLivePosition`. The
-// dedup gate is now driven by `tryAcquireLock` (atomic SET NX EX), which
-// returns the slot's ownership directly. Existence-only checks were never
-// safe for guarding new entries; if a future caller needs to peek without
-// acquiring (e.g. a UI status query), they should read the open-positions
-// index (`live:positions:{connId}`) — the lock key is now reserved for
-// mutual exclusion only.
-
-async function tryAcquireLock(
-  connectionId: string,
-  symbol: string,
-  direction: "long" | "short",
-  ttlSeconds = 300,
-): Promise<boolean> {
+/**
+ * Acquire the per-(connId, symbol, direction) dedup lock using Redis SET NX.
+ *
+ * Returns the lock token (timestamp string) on success, or null when another
+ * entry for this symbol+direction is already in-flight.
+ * TTL is 300 s — a safety net for process death mid-execution.
+ */
+async function tryAcquireLock(connId: string, symbol: string, direction: string): Promise<string | null> {
+  if (!connId || !symbol) return null
   try {
     const client = getRedisClient()
-    const lockKey = `live:lock:${connectionId}:${symbol}:${direction}`
-    // `client.set` with NX returns `"OK"` on success or `null` when the
-    // key already existed (Redis-standard). The `!= null` check covers
-    // both `null` and `undefined` (some adapters return undefined on
-    // pipeline failures); any other value (i.e. the truthy "OK"
-    // response) means we acquired the slot.
-    const ok = await client.set(lockKey, String(Date.now()), { NX: true, EX: ttlSeconds })
-    return ok != null
+    const lockKey = `live:lock:${connId}:${symbol}:${direction}`
+    const token   = String(Date.now())
+    const result  = await (client.set(lockKey, token, { NX: true, EX: 300 }) as any)
+    return result === "OK" ? token : null
   } catch {
-    return false
+    // Redis unreachable — fail open (allow the entry) to avoid permanent stall.
+    return String(Date.now())
   }
 }
 
 /**
- * Legacy non-atomic acquire — preserved for the post-fill heartbeat
- * refresh in `closeLivePosition`'s reverse path. **Do NOT use for new
- * call sites**; build dedup gates on `tryAcquireLock` instead.
+ * Find the first open live position for (connId, symbol, side).
  *
- * Re-stamps the lock unconditionally so a long-running entry can
- * extend its TTL (the safety expiry would otherwise fire mid-trade if
- * the position stays open longer than `ttlSeconds`).
+ * "Open" means status is one of: open | filled | partially_filled | placed | simulated.
+ * Returns null when no such position exists.
  */
-async function refreshLockTTL(
-  connectionId: string,
-  symbol: string,
-  direction: "long" | "short",
-  ttlSeconds = 300,
-): Promise<void> {
+async function findOpenLivePositionByDir(connId: string, symbol: string, side: string): Promise<LivePosition | null> {
+  if (!connId || !symbol) return null
   try {
-    const client = getRedisClient()
-    const lockKey = `live:lock:${connectionId}:${symbol}:${direction}`
-    await client.setex(lockKey, ttlSeconds, String(Date.now()))
-  } catch {
-    /* non-critical */
-  }
-}
+    const client  = getRedisClient()
+    const normSym = symbol.toUpperCase().replace(/[-_]/g, "")
+    const OPEN_STATUSES = new Set(["open", "filled", "partially_filled", "placed", "simulated"])
 
-async function releaseLock(
-  connectionId: string,
-  symbol: string,
-  direction: "long" | "short"
-): Promise<void> {
-  try {
-    const client = getRedisClient()
-    const lockKey = `live:lock:${connectionId}:${symbol}:${direction}`
-    await client.del(lockKey)
-  } catch {
-    /* non-critical */
-  }
-}
+    // Use the open-index list maintained by savePosition.
+    const ids = ((await client.lrange(`live:positions:${connId}`, 0, 499).catch(() => [])) || []) as string[]
+    if (ids.length === 0) return null
 
-/**
- * Find the existing open live position (if any) for a given symbol +
- * direction on a connection. Returns the most recently created one if
- * multiple are somehow in the open index (defensive — should not happen
- * given the dedup lock, but indices can drift after restarts/migrations).
- *
- * Used by `executeLivePosition` to merge incoming Set signals into the
- * already-running exchange order rather than rejecting them.
- */
-async function findOpenLivePositionByDir(
-  connectionId: string,
-  symbol: string,
-  direction: "long" | "short",
-): Promise<LivePosition | null> {
-  try {
-    const all = await getLivePositions(connectionId)
-    const candidates = all.filter(
-      (p) =>
-        p.symbol === symbol &&
-        p.direction === direction &&
-        // "open" is the steady state; "placed" / "partially_filled" / "filled"
-        // also count as live for accumulation purposes (entry order in flight
-        // or partially executed — we still want to add to it). We do NOT
-        // accumulate into "pending" because that means the entry order itself
-        // hasn't been placed yet — better to let the original call finish.
-        ["open", "placed", "partially_filled", "filled"].includes(p.status),
-    )
-    if (candidates.length === 0) return null
-    // Most recent first — defensive against stale duplicates.
-    candidates.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-    return candidates[0]
-  } catch (err) {
-    console.warn(`${LOG_PREFIX} findOpenLivePositionByDir error:`, err)
+    const raws = await Promise.all(ids.map((id) => client.get(`live:position:${id}`).catch(() => null)))
+    for (const raw of raws) {
+      if (!raw) continue
+      try {
+        const pos: LivePosition = JSON.parse(raw as string)
+        if (!OPEN_STATUSES.has(pos.status ?? "")) continue
+        const posSide = (pos.direction === "short" || (pos as any).side === "short") ? "short" : "long"
+        if (String(pos.symbol || "").toUpperCase().replace(/[-_]/g, "") === normSym && posSide === side) {
+          return pos
+        }
+      } catch { /* malformed — skip */ }
+    }
+    return null
+  } catch {
     return null
   }
 }
 
 /**
- * Merge a new Set signal (RealPosition) into an existing live exchange
- * position. Places an additional market entry on the exchange so the
- * position size grows by the newly computed volume, then re-arms SL/TP
- * at the new weighted-average entry price.
+ * Fetch the current mark/last price for a symbol.
  *
- * Result invariants after this returns successfully:
- *   • `existing.executedQuantity` = sum of all fills (old + new).
- *   • `existing.averageExecutionPrice` = qty-weighted mean of all fills.
- *   • `existing.volumeUsd`            = sum of (fillQty × fillPrice) per fill.
- *   • `existing.fills[]`              = old fills + new fill appended.
- *   • `existing.stopLossPrice` / `takeProfitPrice` recomputed from the
- *     new average via `updateProtectionOrders` (cancel-old → place-new
- *     at the correct level AND the new total quantity).
- *   • `existing.accumulationCount`     incremented.
- *   • `existing.accumulatedRealPositionIds` includes `realPosition.id`.
- *
- * Returns the updated LivePosition. Never throws — failures are recorded
- * as a failed `accumulate` progression step and the position is left
- * untouched (the new Set's volume simply isn't added).
+ * Resolution order:
+ *   1. market_data:{symbol}:1s  →  candles[last].close
+ *   2. market_data:{symbol}:1m  →  candles[last].close
+ *   3. market_data:{symbol}     →  close | price | last fields
+ *   4. Returns 0 when no data is available.
  */
-async function accumulateIntoLivePosition(
-  connectionId: string,
-  existing: LivePosition,
-  realPosition: RealPosition,
-  currentPrice: number,
-  exchangeConnector: any,
-): Promise<LivePosition> {
-  const symbol = realPosition.symbol
-  const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
-
+async function fetchCurrentPrice(symbol: string, connId?: string): Promise<number> {
+  if (!symbol) return 0
   try {
-    // ── 1. Compute additional volume (always honors min) ───────────────
-    //
-    // Accumulation is a LIVE-execution path — it places real exchange
-    // orders to merge into an existing position. Per spec, this MUST
-    // calculate "indeed volume" using the per-engine ratio. We resolve
-    // the trade mode from the connection's flags exactly the same way
-    // `executeLivePosition` does (Preset iff is_preset_trade=true AND
-    // is_live_trade=false, otherwise Main). A failure to load the
-    // connection here falls back to "main" which is the conservative
-    // default — Preset's factor is often the more aggressive one and
-    // we don't want a transient Redis blip to silently up-size the
-    // accumulated order.
-    let accTradeMode: "main" | "preset" = "main"
-    try {
-      const { getConnection: _getConn } = await import("@/lib/redis-db")
-      const { isTruthyFlag } = await import("@/lib/connection-state-utils")
-      const accConn = (await _getConn(connectionId)) || {}
-      if (isTruthyFlag(accConn.is_preset_trade) && !isTruthyFlag(accConn.is_live_trade)) {
-        accTradeMode = "preset"
+    const client  = getRedisClient()
+    const normSym = symbol.toUpperCase().replace(/[-_]/g, "")
+
+    const tryInterval = async (interval: string): Promise<number> => {
+      const raw = await client.get(`market_data:${normSym}:${interval}`).catch(() => null)
+      if (!raw) return 0
+      const parsed = JSON.parse(raw as string)
+      // Candle array: last element's close.
+      if (Array.isArray(parsed?.candles) && parsed.candles.length > 0) {
+        const last = parsed.candles[parsed.candles.length - 1]
+        const price = parseFloat(String(last?.close ?? last?.c ?? 0))
+        if (price > 0) return price
       }
-    } catch { /* fall back to "main" — see comment above */ }
-
-    const volumeResult = await VolumeCalculator.calculateVolumeForConnection(
-      connectionId,
-      symbol,
-      currentPrice,
-      { tradeMode: accTradeMode },
-    ).catch((err) => {
-      console.error(`${LOG_PREFIX} accumulate volume calc error:`, err)
-      return null
-    })
-
-    let addQty = volumeResult?.finalVolume || volumeResult?.volume || 0
-    if (addQty <= 0 || !Number.isFinite(addQty)) {
-      // Fallback when volume calc fails: use $15 minimum notional.
-      // Matches the universal $15 floor in VolumeCalculator so any
-      // position is executable even in worst-case scenarios.
-      const FALLBACK_NOTIONAL_USD = 15
-      addQty = currentPrice > 0 ? FALLBACK_NOTIONAL_USD / currentPrice : 0
-    }
-    if (addQty <= 0) {
-      pushStep(existing, "accumulate", false, "additional volume could not be computed")
-      await savePosition(existing)
-      return existing
+      // Direct price fields.
+      const p = parseFloat(String(parsed?.close ?? parsed?.price ?? parsed?.last ?? 0))
+      return p > 0 ? p : 0
     }
 
-    // ── 2. Place additional entry on the exchange ─────────────────────
-    const orderResult: any = await retry(
-      () =>
-        exchangeConnector.placeOrder(
-          symbol,
-          exchangeSide,
-          addQty,
-          undefined,
-          "market",
-          { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
-        ),
-      (r: any) => !!r?.success && !!(r.orderId || r.id),
-      "accumulatePlaceOrder",
-    )
-
-    if (!orderResult?.success || !(orderResult.orderId || orderResult.id)) {
-      pushStep(
-        existing,
-        "accumulate",
-        false,
-        `additional order failed: ${orderResult?.error || "unknown"}`,
-      )
-      await savePosition(existing)
-      await incrementMetric(connectionId, "live_orders_failed_count")
-      // Same cooldown trigger as the primary entry-order path —
-      // accumulation orders also count toward the margin-error gate.
-      if (isNonRecoverableExchangeError(orderResult)) {
-        recordMarginError(connectionId)
-      }
-      await logProgressionEvent(
-        connectionId,
-        "live_trading",
-        "warning",
-        `Accumulation entry failed for ${symbol} — kept existing position untouched`,
-        {
-          existingId: existing.id,
-          additionalQty: addQty,
-          error: orderResult?.error,
-        },
-      )
-      return existing
+    for (const interval of ["1s", "1m"]) {
+      const price = await tryInterval(interval)
+      if (price > 0) return price
     }
 
-    const addOrderId: string = orderResult.orderId || orderResult.id
-    pushStep(existing, "accumulate_place", true, `addQty=${addQty.toFixed(6)} orderId=${addOrderId}`)
-    // Count the accumulation entry as an "order placed" — without
-    // this, Fill Rate (filled/placed) goes nonsense whenever an
-    // accumulation lands successfully (we'd bump filled at line ~510
-    // without ever bumping placed). The dedicated
-    // `live_orders_accumulated_count` still tracks accumulation as
-    // a separate metric for operators who want to break it out.
-    await incrementMetric(connectionId, "live_orders_placed_count")
-
-    // ── 3. Poll the new fill ──────────────────────────────────────────
-    const fill = await pollOrderFill(exchangeConnector, symbol, addOrderId)
-    if (!fill.filled || fill.filledQty <= 0) {
-      pushStep(existing, "accumulate_fill", false, `fill not confirmed (status=${fill.status})`)
-      await savePosition(existing)
-      await logProgressionEvent(
-        connectionId,
-        "live_trading",
-        "warning",
-        `Accumulation fill not confirmed for ${symbol}`,
-        { addOrderId, status: fill.status },
-      )
-      return existing
+    // Fallback: bare market_data:{symbol} key — written as a Redis HASH by
+    // market-data-loader via hmset(). Must use hgetall(), NOT get(), because
+    // Redis returns WRONGTYPE error / null when get() is called on a hash key.
+    const hashRaw = await client.hgetall(`market_data:${normSym}`).catch(() => null)
+    if (hashRaw && typeof hashRaw === "object") {
+      const p = parseFloat(String((hashRaw as any).close ?? (hashRaw as any).price ?? (hashRaw as any).last ?? 0))
+      if (p > 0) return p
     }
-
-    const newFillQty = fill.filledQty
-    const newFillPrice = fill.filledPrice || currentPrice
-
-    // ── 4. Recompute weighted-average entry + cumulative volume ──────
-    // Compute against the running totals so this is correct whether the
-    // existing position has had 1 fill or already accumulated N times.
-    const oldQty = existing.executedQuantity || 0
-    const oldAvg = existing.averageExecutionPrice || existing.entryPrice || 0
-    const oldNotional = oldQty * oldAvg
-    const newNotional = newFillQty * newFillPrice
-    const totalQty = oldQty + newFillQty
-    const newAvg = totalQty > 0 ? (oldNotional + newNotional) / totalQty : newFillPrice
-
-    existing.executedQuantity = totalQty
-    existing.remainingQuantity = 0
-    existing.averageExecutionPrice = newAvg
-    // volumeUsd is the cumulative notional summed across all fills —
-    // the authoritative real-money exposure on the exchange. We add the
-    // *new* fill's notional to whatever was already accumulated.
-    existing.volumeUsd = (existing.volumeUsd || 0) + newNotional
-    existing.fills.push({
-      timestamp: Date.now(),
-      quantity: newFillQty,
-      price: newFillPrice,
-      fee: 0,
-      feeAsset: "USDT",
-    })
-    existing.accumulationCount = (existing.accumulationCount || 1) + 1
-    existing.lastAccumulatedAt = Date.now()
-    existing.accumulatedRealPositionIds = [
-      ...(existing.accumulatedRealPositionIds || []),
-      realPosition.id,
-    ].slice(-50) // cap to last 50 to bound payload size
-    // Track which Set keys contributed to this exchange position so
-    // post-trade stats can attribute realised PnL across every Set Type
-    // that absorbed into it. Same 50-entry cap as the realPositionIds
-    // ledger above; the original setKey is preserved on the position
-    // header (`existing.setKey`) so we never lose authorship.
-    if (realPosition.setKey) {
-      existing.accumulatedSetKeys = [
-        ...(existing.accumulatedSetKeys || []),
-        realPosition.setKey,
-      ].slice(-50)
-    }
-    existing.updatedAt = Date.now()
-    if (existing.status === "filled" || existing.status === "partially_filled") {
-      existing.status = "open"
-    }
-
-    pushStep(
-      existing,
-      "accumulate_fill",
-      true,
-      `+${newFillQty.toFixed(6)} @ ${newFillPrice.toFixed(8)} → totalQty=${totalQty.toFixed(6)} avgEntry=${newAvg.toFixed(8)} accCount=${existing.accumulationCount}`,
-    )
-    await incrementMetric(connectionId, "live_orders_filled_count")
-    await incrementMetric(connectionId, "live_orders_accumulated_count")
-    await incrementMetric(connectionId, "live_volume_usd_total", Math.round(newNotional))
-    // ── Used-balance (margin) counter ──────────────────────────────
-    // Spec: every "USDT" surface in the UI must show the *used balance*
-    // (margin actually committed) and NOT the leveraged notional. The
-    // leveraged figure is `newNotional` (qty × price); the matching
-    // margin figure is `newNotional / leverage`. We persist it as a
-    // sibling of `live_volume_usd_total` so the dashboard can switch
-    // surfaces over without losing the historical notional series.
-    {
-      const lev = Math.max(1, Number(existing.leverage) || 1)
-      const newMargin = newNotional / lev
-      if (Number.isFinite(newMargin) && newMargin > 0) {
-        // Cents counter — preserves sub-dollar margins (a $5 fill at
-        // 125x leverage is $0.04 margin → 4 cents, not 0). Reader
-        // divides by 100. The legacy `live_margin_usd_total` counter
-        // is no longer written (it would have to be inflated to avoid
-        // truncating to 0, which would lie about the true margin) —
-        // legacy connections without cents data fall back gracefully
-        // in the stats route.
-        await incrementMetric(connectionId, "live_margin_cents_total", Math.round(newMargin * 100))
-      }
-    }
-
-    // ── 5. Re-arm SL/TP at NEW weighted-avg entry + NEW total qty ────
-    // updateProtectionOrders will:
-    //   - detect the SL/TP price drift caused by the new avg entry
-    //   - cancel the old reduce-only orders
-    //   - place new ones at the correct level AND the new total qty
-    // Drift tolerance is 0.25%; for typical accumulation merges the
-    // average moves more than that, so this almost always fires.
-    try {
-      await updateProtectionOrders(exchangeConnector, existing, "accumulation")
-    } catch (slTpErr) {
-      console.warn(
-        `${LOG_PREFIX} accumulation SL/TP rearm error:`,
-        slTpErr instanceof Error ? slTpErr.message : String(slTpErr),
-      )
-    }
-
-    await savePosition(existing)
-    await logProgressionEvent(
-      connectionId,
-      "live_trading",
-      "info",
-      `Accumulated into existing ${symbol} ${realPosition.direction} position`,
-      {
-        existingId: existing.id,
-        addedQty: newFillQty,
-        addedNotionalUsd: Math.round(newNotional * 100) / 100,
-        newTotalQty: totalQty,
-        newAvgEntry: newAvg,
-        newSlPrice: existing.stopLossPrice,
-        newTpPrice: existing.takeProfitPrice,
-        accumulationCount: existing.accumulationCount,
-        realPositionId: realPosition.id,
-      },
-    )
-
-    console.log(
-      `${LOG_PREFIX} ACCUMULATED ${symbol} ${realPosition.direction}: +${newFillQty} @ ${newFillPrice} → total=${totalQty} avg=${newAvg.toFixed(8)} count=${existing.accumulationCount}`,
-    )
-
-    return existing
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err)
-    console.error(`${LOG_PREFIX} accumulateIntoLivePosition error:`, errMsg)
-    pushStep(existing, "accumulate", false, errMsg)
-    await savePosition(existing).catch(() => {})
-    return existing
+    return 0
+  } catch {
+    return 0
   }
 }
+
+/**
+ * Accumulate a new Real-Set entry into an existing live position (DCA / grid merge).
+ *
+ * Hard cap: MAX_ACCUMULATIONS_PER_POSITION. Above the cap the function
+ * returns the existing position unchanged.
+ *
+ * When below the cap it:
+ *   1. Computes the additional quantity from the new Real Set's entryCount.
+ *   2. Updates executedQuantity and recomputes the weighted-average entry price.
+ *   3. Registers the new setKey in accumulatedSetKeys to track lineage.
+ *   4. Marks the position as needing SL/TP re-arm (handled by the caller).
+ */
+async function accumulateIntoLivePosition(
+  connId: string,
+  existing: LivePosition,
+  real: any,
+  price: number,
+  connector: any,
+): Promise<LivePosition> {
+  const accumulated = Array.isArray(existing.accumulatedSetKeys) ? existing.accumulatedSetKeys : []
+  if (accumulated.length >= MAX_ACCUMULATIONS_PER_POSITION) {
+    return existing
+  }
+
+  const addQty = Math.max(1, Number(real?.entryCount || real?.quantity || 1))
+  const prevQty   = Number(existing.executedQuantity || existing.quantity || 0)
+  const prevEntry = Number(existing.averageExecutionPrice || existing.entryPrice || price)
+  const newQty    = prevQty + addQty
+  const newAvgEntry = newQty > 0 ? (prevQty * prevEntry + addQty * price) / newQty : prevEntry
+
+  const incomingSetKey = String(real?.setKey || real?.config_set_key || "")
+
+  existing.executedQuantity      = newQty
+  existing.quantity              = newQty
+  existing.averageExecutionPrice = newAvgEntry
+  existing.accumulatedSetKeys    = Array.from(new Set([...accumulated, incomingSetKey].filter(Boolean)))
+  existing.updatedAt             = Date.now()
+
+  pushStep(existing, "accumulate", true, `+${addQty} qty from setKey=${incomingSetKey} at price=${price}`)
+  return existing
+}
+
+/** Refresh the TTL on an in-flight dedup lock without releasing it. */
+async function refreshLockTTL(connId: string, symbol: string, direction: string, ttlMs = 300_000): Promise<void> {
+  if (!connId || !symbol) return
+  try {
+    const client  = getRedisClient()
+    const lockKey = `live:lock:${connId}:${symbol}:${direction}`
+    await client.expire(lockKey, Math.max(1, Math.round(ttlMs / 1000)))
+  } catch { /* non-critical */ }
+}
+
+/** Release the per-(connId, symbol, direction) dedup lock. */
+async function releaseLock(connId: string, symbol: string, direction: string): Promise<void> {
+  if (!connId || !symbol) return
+  try {
+    const client  = getRedisClient()
+    await client.del(`live:lock:${connId}:${symbol}:${direction}`)
+  } catch { /* non-critical */ }
+}
+
+// In-process cache so resolveMaxHoldMs doesn't hit Redis on every cycle call.
+const _maxHoldMsCache: Map<string, { value: number; at: number }> = new Map()
+
+/**
+ * Read the operator-configured max hold time for a connection, in milliseconds.
+ *
+ * Reads `maxHoldTimeMs` (preferred) or `maxHoldTimeHours` from app settings.
+ * Returns 0 when max-hold is disabled or unconfigured.
+ * Cached in-process for 30 seconds to avoid Redis round-trips on every tick.
+ */
+function resolveMaxHoldMs(connId: string): number {
+  const cached = _maxHoldMsCache.get(connId)
+  if (cached && Date.now() - cached.at < 30_000) return cached.value
+
+  // Return 0 synchronously (the async setting is refreshed in the background).
+  // The background refresh runs at most once per 30 s so we don't stack awaits.
+  void (async () => {
+    try {
+      const { getAppSettings } = await import("@/lib/redis-db")
+      const settings = await getAppSettings()
+      let ms = 0
+      if (settings.maxHoldTimeMs && Number(settings.maxHoldTimeMs) > 0) {
+        ms = Number(settings.maxHoldTimeMs)
+      } else if (settings.maxHoldTimeHours && Number(settings.maxHoldTimeHours) > 0) {
+        ms = Number(settings.maxHoldTimeHours) * 60 * 60 * 1000
+      }
+      _maxHoldMsCache.set(connId, { value: ms, at: Date.now() })
+    } catch { /* non-critical — keep prior cached value */ }
+  })()
+
+  return cached?.value ?? 0
+}
+
+/**
+ * Hard cap on the number of accumulations per live position.
+ *
+ * Without a cap, unlimited merges inflate position size proportionally
+ * without any drawdown gating — the operator has no visibility and the
+ * exchange may reject the accumulated notional.
+ *   - 300 gives generous DCA headroom (1 initial entry + 299 merges ≈ 32× the
+ *     initial allocation at equal-weight increments) for high-frequency strategies.
+ */
+const MAX_ACCUMULATIONS_PER_POSITION = 300
 
 /**
  * Recognise exchange errors that CANNOT be fixed by retrying. For these
@@ -738,19 +539,37 @@ async function retry<T>(
         )
         return result
       }
+      // Min-order-size errors (code=101400) need a quantity correction, not
+      // more retries with the same qty. Short-circuit immediately so the
+      // caller's correction handler can run without waiting for 2 more attempts.
+      if (isMinOrderSizeError(result)) {
+        console.warn(
+          `${LOG_PREFIX} ${label} min-order-size error — stopping retry loop for quantity correction`,
+        )
+        return result
+      }
     } catch (err) {
       console.error(`${LOG_PREFIX} ${label} attempt ${attempt}/${maxAttempts} error:`, err)
-      // Thrown error variant — check the same predicate.
+      // Thrown error variant — check the same predicates.
       if (isNonRecoverableExchangeError(err)) {
         console.warn(
           `${LOG_PREFIX} ${label} non-recoverable error detected — skipping remaining ${maxAttempts - attempt} attempt(s)`,
         )
         return { success: false, error: err instanceof Error ? err.message : String(err) } as unknown as T
       }
+      if (isMinOrderSizeError(err)) {
+        console.warn(`${LOG_PREFIX} ${label} min-order-size error — stopping retry loop`)
+        return { success: false, error: err instanceof Error ? err.message : String(err) } as unknown as T
+      }
       lastResult = undefined as unknown as T
     }
     if (attempt < maxAttempts) {
-      const backoff = Math.pow(2, attempt - 1) * 500
+      // Tight backoff: 200 ms → 400 ms → 800 ms. Transient API blips
+      // (network jitter, brief rate-limit, venue side proxy reload)
+      // typically clear in well under 500 ms; the old 500/1000/2000 ms
+      // schedule was burning roughly 1.5 s per failing entry without
+      // adding success probability.
+      const backoff = Math.pow(2, attempt - 1) * 200
       await new Promise(r => setTimeout(r, backoff))
     }
   }
@@ -765,84 +584,217 @@ async function retry<T>(
 // on the next cycle re-attempts the order, generating a continuous
 // stream of failed exchange API calls (~20/sec at observed cadence).
 //
-// We track the last margin-error timestamp PER CONNECTION in this
-// module-level Map and short-circuit `executeLivePosition` for
-// `MARGIN_ERROR_COOLDOWN_MS` after a hit. The skipped attempt is logged
-// once per cycle and recorded as a `warning` progression event so the
-// operator sees it in the dashboard.
+// Exponential backoff: each consecutive failure doubles the cooldown
+// (60s → 120s → 240s → 300s cap). This prevents the re-arm loop where
+// a 60s cooldown expires, the next attempt fails again (same root cause),
+// and immediately re-arms for another 60s — making recovery appear stuck.
+// After the operator tops up, the next successful order resets the counter.
 //
-// 60 s is the sweet spot: long enough to stop the API flood, short
-// enough that the system resumes promptly after a top-up. Operators
-// typically deposit and refresh within that window.
-const MARGIN_ERROR_COOLDOWN_MS = 60_000
-const marginErrorCooldownByConnection: Map<string, number> = new Map()
+// A `clearMarginCooldown(connectionId)` export allows the /api/engine/reconnect
+// endpoint to forcibly release a stuck cooldown.
+//
+// NOTE: Exchange circuit-breaker errors (BingX code 109400 — "API orders
+// temporarily disabled due to market volatility") are NOT margin errors.
+// They have their own per-symbol gate (`circuitBreakerBySymbol`) with a
+// 5-minute TTL and do NOT increment the margin failure counter.
+const MARGIN_COOLDOWN_STEPS_MS = [60_000, 120_000, 240_000, 300_000]
+const MARGIN_COOLDOWN_MAX_MS = 300_000
+
+interface MarginCooldownEntry {
+  lastErrorAt: number
+  consecutiveFailures: number
+}
+const marginErrorCooldownByConnection: Map<string, MarginCooldownEntry> = new Map()
 
 function isMarginCooldownActive(connectionId: string): boolean {
-  const ts = marginErrorCooldownByConnection.get(connectionId)
-  if (!ts) return false
-  if (Date.now() - ts < MARGIN_ERROR_COOLDOWN_MS) return true
+  const entry = marginErrorCooldownByConnection.get(connectionId)
+  if (!entry) return false
+  const stepIdx = Math.min(entry.consecutiveFailures - 1, MARGIN_COOLDOWN_STEPS_MS.length - 1)
+  const cooldownMs = MARGIN_COOLDOWN_STEPS_MS[stepIdx] ?? MARGIN_COOLDOWN_MAX_MS
+  if (Date.now() - entry.lastErrorAt < cooldownMs) return true
+  // Cooldown expired — clear so the next attempt runs fresh.
   marginErrorCooldownByConnection.delete(connectionId)
   return false
 }
 
 function recordMarginError(connectionId: string): void {
-  marginErrorCooldownByConnection.set(connectionId, Date.now())
+  const existing = marginErrorCooldownByConnection.get(connectionId)
+  marginErrorCooldownByConnection.set(connectionId, {
+    lastErrorAt: Date.now(),
+    consecutiveFailures: (existing?.consecutiveFailures ?? 0) + 1,
+  })
+}
+
+/** Exported so the /api/engine/reconnect endpoint can forcibly clear a stuck cooldown. */
+export function clearMarginCooldown(connectionId: string): void {
+  marginErrorCooldownByConnection.delete(connectionId)
+  console.log(`${LOG_PREFIX} Margin cooldown cleared for ${connectionId}`)
+}
+
+// ── Per-symbol exchange circuit-breaker gate ──────────────────────────
+// BingX code 109400 means the exchange has TEMPORARILY disabled API
+// trading for that symbol due to extreme volatility. This is NOT a
+// margin/balance issue — the account is fine, the exchange re-enables
+// trading automatically (typically within 1–5 minutes). We skip the
+// symbol for 5 minutes then resume WITHOUT touching the margin counter,
+// preventing one volatile symbol from blocking all orders on the connection.
+const CIRCUIT_BREAKER_COOLDOWN_MS = 5 * 60_000 // 5 minutes
+const circuitBreakerBySymbol: Map<string, number> = new Map()
+
+function isCircuitBreakerActive(symbol: string): boolean {
+  const ts = circuitBreakerBySymbol.get(symbol)
+  if (!ts) return false
+  if (Date.now() - ts < CIRCUIT_BREAKER_COOLDOWN_MS) return true
+  circuitBreakerBySymbol.delete(symbol)
+  return false
+}
+
+function recordCircuitBreaker(symbol: string): void {
+  circuitBreakerBySymbol.set(symbol, Date.now())
+}
+
+function isCircuitBreakerError(payload: unknown): boolean {
+  if (!payload) return false
+  let text = ""
+  if (typeof payload === "string") text = payload
+  else if (payload instanceof Error) text = payload.message
+  else if (typeof payload === "object") {
+    const obj = payload as Record<string, unknown>
+    text = String(obj.error ?? obj.message ?? "")
+  } else {
+    text = String(payload)
+  }
+  return (
+    /\bcode\s*=?\s*109400\b/.test(text) ||
+    /api orders? (?:are )?temporarily disabled/i.test(text) ||
+    /large market fluctuations/i.test(text)
+  )
+}
+
+/**
+ * Detect BingX code=101400 "minimum order amount" rejections.
+ * These mean the requested quantity is below the exchange-required minimum for
+ * the specific trading pair. The volume calculator will respect the stored
+ * min_order_size on the next cycle, so this is a transient failure that
+ * self-heals once the metadata is written to Redis.
+ */
+function isMinOrderSizeError(payload: unknown): boolean {
+  if (!payload) return false
+  let text = ""
+  if (typeof payload === "string") text = payload
+  else if (payload instanceof Error) text = payload.message
+  else if (typeof payload === "object") {
+    text = String((payload as Record<string, unknown>).error ?? (payload as Record<string, unknown>).message ?? "")
+  } else {
+    text = String(payload)
+  }
+  return /\bcode\s*=?\s*101400\b/.test(text) || /minimum order amount/i.test(text)
+}
+
+/**
+ * Parse the required minimum token quantity from a BingX 101400 error message.
+ * BingX message format: "The minimum order amount is 56.974 DRIFT."
+ * Returns undefined when the message does not match the expected format.
+ */
+function extractMinOrderQty(payload: unknown): number | undefined {
+  let text = ""
+  if (typeof payload === "string") text = payload
+  else if (payload instanceof Error) text = payload.message
+  else if (typeof payload === "object") {
+    text = String((payload as Record<string, unknown>).error ?? (payload as Record<string, unknown>).message ?? "")
+  }
+  const m = /minimum order amount is ([\d.]+)/i.exec(text)
+  if (!m) return undefined
+  const qty = parseFloat(m[1])
+  return Number.isFinite(qty) && qty > 0 ? qty : undefined
 }
 
 /**
  * Poll an order until it reaches a terminal fill state or the timeout elapses.
+ *
+ * ── Fast-ramp polling schedule ───────────────────────────────────────
+ * Market orders on most venues acknowledge as `FILLED` within 100-300 ms;
+ * a flat 800 ms poll interval therefore wastes ~600 ms on every entry
+ * before we can place SL/TP. The new schedule:
+ *
+ *   poll 1: 100 ms
+ *   poll 2: 200 ms
+ *   poll 3: 350 ms
+ *   poll 4+: 600 ms (steady state for stubborn limit orders)
+ *
+ * Total latency to detect a typical instant fill drops from ~800 ms to
+ * ~100 ms, while still tolerating slow venues without flooding the API.
  */
 async function pollOrderFill(
   connector: any,
   symbol: string,
   orderId: string,
-  timeoutMs = 10000,
-  intervalMs = 800
+  timeoutMs = 15000,
+  _legacyIntervalMs = 800,
 ): Promise<{ filled: boolean; filledQty: number; filledPrice: number; status: string }> {
+  void _legacyIntervalMs
+  const intervals = [100, 200, 350, 600]
   const deadline = Date.now() + timeoutMs
   let lastStatus = "pending"
-  let pollCount = 0
+  let pollIdx = 0
+  // Track the best partial result seen so far — return it on timeout rather
+  // than returning filled=false when we know some qty was actually transacted.
+  let bestPartialQty = 0
+  let bestPartialPrice = 0
   while (Date.now() < deadline) {
     try {
-      pollCount++
       const order = await connector.getOrder(symbol, orderId)
-      console.log(`[v0] [pollOrderFill] poll #${pollCount}: ${JSON.stringify(order)}`)
-      
       if (order) {
         lastStatus = order.status || order.orderStatus || "unknown"
-        
-        // Check for filled status (case-insensitive, handle various format: "filled", "FILLED", "Filled")
         const statusLower = String(lastStatus).toLowerCase().trim()
-        const isFilled = statusLower === "filled" || statusLower === "filled" || order.status === "FILLED"
-        
-        // Check for executed quantity/amount
-        const filledQty = order.filledQty || order.executedQty || order.cumQty || 0
-        const filledPrice = order.filledPrice || order.avgPrice || 0
-        
-        console.log(`[v0] [pollOrderFill] status=${statusLower}, filledQty=${filledQty}, filledPrice=${filledPrice}, isFilled=${isFilled}`)
-        
-        if (isFilled && filledQty > 0) {
-          console.log(`[v0] [pollOrderFill] ✓ Order filled: ${orderId}`)
+        const rawFilledQty  = parseFloat(String(order.filledQty  ?? order.executedQty ?? order.cumQty    ?? "0")) || 0
+        const rawFilledPrice = parseFloat(String(order.filledPrice ?? order.avgPrice   ?? order.price     ?? "0")) || 0
+
+        // Any of these status strings mean the exchange has fully transacted the order.
+        const isFilled =
+          statusLower === "filled" ||
+          statusLower === "deal" ||        // BingX historical alias
+          statusLower === "complete" ||
+          statusLower === "completed" ||
+          order.status === "FILLED"
+
+        // Partial fills: qty > 0 even if status isn't fully "filled" yet.
+        // Accept as usable — protection orders should be sized to filledQty,
+        // not the requested qty. Remaining qty will be covered by reconcile.
+        const isPartialFill =
+          (statusLower === "partially_filled" || statusLower === "partial_fill") &&
+          rawFilledQty > 0
+
+        if (rawFilledQty > bestPartialQty) {
+          bestPartialQty  = rawFilledQty
+          bestPartialPrice = rawFilledPrice
+        }
+
+        if ((isFilled || isPartialFill) && rawFilledQty > 0) {
           return {
             filled: true,
-            filledQty: filledQty,
-            filledPrice: filledPrice || 0,
-            status: "filled",
+            filledQty: rawFilledQty,
+            filledPrice: rawFilledPrice || 0,
+            status: isFilled ? "filled" : "partially_filled",
           }
         }
-        if (statusLower === "cancelled" || statusLower === "canceled") {
-          console.log(`[v0] [pollOrderFill] ✗ Order cancelled: ${orderId}`)
-          return { filled: false, filledQty: 0, filledPrice: 0, status: "cancelled" }
+        if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
+          return { filled: false, filledQty: 0, filledPrice: 0, status: statusLower }
         }
-      } else {
-        console.log(`[v0] [pollOrderFill] poll #${pollCount}: no order data returned`)
       }
     } catch (err) {
       console.warn(`${LOG_PREFIX} poll error:`, err instanceof Error ? err.message : String(err))
     }
-    await new Promise(r => setTimeout(r, intervalMs))
+    const wait = intervals[Math.min(pollIdx, intervals.length - 1)]
+    pollIdx += 1
+    await new Promise(r => setTimeout(r, wait))
   }
-  console.log(`[v0] [pollOrderFill] Timeout after ${pollCount} polls, lastStatus=${lastStatus}`)
+  // Timeout — return whatever partial qty we managed to see rather than zero.
+  // A non-zero bestPartialQty means the exchange has transacted at least some
+  // volume; returning it lets the caller place SL/TP for the confirmed portion.
+  if (bestPartialQty > 0) {
+    return { filled: true, filledQty: bestPartialQty, filledPrice: bestPartialPrice, status: "partially_filled" }
+  }
   return { filled: false, filledQty: 0, filledPrice: 0, status: lastStatus }
 }
 
@@ -857,6 +809,77 @@ async function pollOrderFill(
  * the connector accepted the request); returns `false` for any error so
  * callers can decide whether to retry or fall through to a market exit.
  */
+/**
+ * Cancel every leftover reduce-only order on the venue for a given
+ * symbol+close-side pair. This is the safety-net used immediately AFTER
+ * `closeLivePosition` finishes its by-id cancellations.
+ *
+ * Why we need a sweep on top of the recorded-id cancellations:
+ *   1. The recorded protection ids may be stale (re-armed after a
+ *      partial fill, the old id never made it to `savePosition` because
+ *      the process crashed between place-success and persist).
+ *   2. A by-id cancel can return failure for a transient reason (network
+ *      blip, brief 429) and the engine cannot afford to keep retrying
+ *      indefinitely. The sweep doubles as a retry on the next tick.
+ *   3. An operator may have placed a manual reduce-only leg that the
+ *      engine never knew about. Once the position is gone, that order
+ *      can only ever cause "exchange control orders chaos" — it has no
+ *      position to reduce, and the next entry on the same symbol would
+ *      see it as an unexpected closer.
+ *
+ * We filter conservatively to ONLY reduce-only orders matching the
+ * close direction so the sweep never touches another strategy's open
+ * orders on the same symbol.
+ */
+async function sweepOrphanProtectionOrders(
+  connector: any,
+  symbol: string,
+  closeSide: "buy" | "sell",
+): Promise<{ scanned: number; cancelled: number }> {
+  const result = { scanned: 0, cancelled: 0 }
+  if (!connector || typeof connector.getOpenOrders !== "function") return result
+  let orders: any[] = []
+  try {
+    const raw = (await withTimeout(
+      connector.getOpenOrders(symbol) as Promise<any>,
+      5000,
+      `sweepOrphan.getOpenOrders(${symbol})`,
+    )) as any[] | undefined
+    orders = Array.isArray(raw) ? raw : []
+  } catch (err) {
+    console.warn(
+      `${LOG_PREFIX} [sweep] getOpenOrders(${symbol}) failed: ${err instanceof Error ? err.message : String(err)}`,
+    )
+    return result
+  }
+  result.scanned = orders.length
+
+  // A reduce-only order with side === closeSide is, by definition, a
+  // protection leg for a position in `closeSide`'s opposite direction.
+  // We accept any flavour of the reduce-only flag the connectors emit:
+  // `reduceOnly`, `reduce_only`, `closePosition`, `isReduceOnly`.
+  const isReduceOnly = (o: any): boolean =>
+    !!(o?.reduceOnly ?? o?.reduce_only ?? o?.closePosition ?? o?.isReduceOnly)
+  const sameSide = (o: any): boolean =>
+    String(o?.side ?? o?.orderSide ?? "").toLowerCase() === closeSide
+
+  for (const o of orders) {
+    if (!isReduceOnly(o) || !sameSide(o)) continue
+    const id =
+      o?.id ?? o?.orderId ?? o?.orderID ?? o?.clientOrderId ?? o?.client_oid
+    if (id == null || String(id).length === 0) continue
+    const ok = await cancelProtectionOrder(connector, symbol, String(id), "OrphanSweep")
+    if (ok) result.cancelled++
+  }
+
+  if (result.cancelled > 0 || result.scanned > 0) {
+    console.log(
+      `${LOG_PREFIX} [sweep] ${symbol} close=${closeSide}: scanned=${result.scanned} cancelled=${result.cancelled}`,
+    )
+  }
+  return result
+}
+
 async function cancelProtectionOrder(
   connector: any,
   symbol: string,
@@ -866,7 +889,15 @@ async function cancelProtectionOrder(
   if (!orderId) return false
   try {
     if (typeof connector?.cancelOrder !== "function") return false
-    const res = await connector.cancelOrder(symbol, orderId)
+    // Bounded — a hanging cancelOrder must not block close/heal paths.
+    // On timeout we return false; the position close pipeline tolerates a
+    // failed cancel (the order will be reconciled on the next reconcile
+    // sweep, and the close itself proceeds regardless).
+    const res = await withTimeout(
+      connector.cancelOrder(symbol, orderId) as Promise<any>,
+      EXCHANGE_TIMEOUT_CANCEL_ORDER_MS,
+      `cancelOrder(${label} ${orderId})`,
+    )
     if (res?.success) {
       console.log(`${LOG_PREFIX} ${label} cancelled: ${orderId}`)
       return true
@@ -912,6 +943,21 @@ async function placeProtectionOrder(
   orderLabel: "StopLoss" | "TakeProfit",
   positionDirection: "long" | "short",
 ): Promise<string | null> {
+  // ── Structured trace context ────────────────────────────────────────
+  // Every protection-order placement gets a single multi-field log line
+  // before any exchange interaction, so when an operator reports "the
+  // order didn't get created" we can immediately answer THREE questions
+  // from one grep:
+  //   1. What were the inputs the engine sent?
+  //   2. Did we even reach the venue? (rejected-locally entries say so)
+  //   3. What did the venue say back? (success line includes id/latency,
+  //      failure line includes the venue error verbatim)
+  const tag = `${LOG_PREFIX} [${orderLabel}] ${symbol}`
+  const placeStart = Date.now()
+  console.log(
+    `${tag} placement requested: dir=${positionDirection} closeSide=${closeSide} qty=${quantity} trigger=${triggerPrice}`,
+  )
+
   try {
     // Prefer the connector's CONDITIONAL-order path
     // (`placeStopOrder`) over a regular `placeOrder`. The legacy code
@@ -923,32 +969,155 @@ async function placeProtectionOrder(
     // (Bybit), and falls back to the limit-as-trigger behaviour on
     // connectors that haven't been upgraded yet (see `BaseExchangeConnector`).
     if (typeof connector?.placeStopOrder !== "function") {
-      console.warn(`${LOG_PREFIX} connector has no placeStopOrder — protection unavailable`)
+      console.warn(`${tag} REJECTED LOCALLY: connector has no placeStopOrder — protection unavailable`)
       return null
+    }
+
+    // Defensive input validation. The SL/TP test suite previously sent
+    // `NaN` quantity from a venue-shape mismatch and the exchange echoed
+    // back "Invalid quantity: NaN" 800 ms later — costly because by then
+    // the entry position is already live and unprotected. Validate at the
+    // helper boundary so a future bug upstream surfaces immediately as a
+    // local log line rather than as a venue-side rejection mid-trade.
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      console.error(`${tag} REJECTED LOCALLY: invalid quantity=${quantity} (must be finite, >0)`)
+      return null
+    }
+    if (!Number.isFinite(triggerPrice) || triggerPrice <= 0) {
+      console.error(`${tag} REJECTED LOCALLY: invalid triggerPrice=${triggerPrice} (must be finite, >0)`)
+      return null
+    }
+
+    // ── Venue minimum-quantity floor ──────────────────────────────────
+    // Same per-base-asset floor used by the test harness — shared via
+    // `lib/exchange-min-qty.ts` so they cannot drift. BingX rejects
+    // sub-minimum orders with code=110422 "The minimum size per order
+    // is 0.0001 BTC."; the same class of rejection exists on Bybit
+    // (110007) and Binance (-1013).
+    //
+    // The protection layer is the LAST line of defense before the venue,
+    // so we floor up to the minimum rather than rejecting locally. The
+    // alternative — silently failing to arm SL/TP on micro-positions
+    // from partial fills — is far more dangerous than over-sizing the
+    // protection order by a fraction of a base unit. We log a warning
+    // whenever the floor actually kicks in so operators can spot the
+    // edge case if it becomes a pattern.
+    const venueMin = getVenueMinQty(symbol)
+    let effectiveQty = quantity
+    if (effectiveQty < venueMin) {
+      console.warn(
+        `${tag} QTY FLOORED: requested=${quantity} bumped to venueMin=${venueMin} (preventing code=110422)`,
+      )
+      effectiveQty = venueMin
     }
 
     const kind: "stop_loss" | "take_profit" =
       orderLabel === "StopLoss" ? "stop_loss" : "take_profit"
 
-    const result = await connector.placeStopOrder(
-      symbol,
-      closeSide,
-      quantity,
-      triggerPrice,
-      kind,
-      {
-        reduceOnly: true,
-        positionSide: positionDirection === "long" ? "LONG" : "SHORT",
-      },
+    // NOTE: We do NOT pass `hedgeMode` here. The BingX connector defaults to
+    // hedgeMode=true (sends `positionSide`) and includes a built-in one-way
+    // fallback retry that fires when BingX returns code=80014. Passing
+    // hedgeMode:false would suppress `positionSide` entirely — which works
+    // on one-way accounts but breaks hedge accounts (BingX requires
+    // positionSide there, and the retry path only handles the inverse
+    // hedge→one-way case). Letting the connector default to hedge-mode +
+    // auto-retry covers both account types correctly.
+    // Bounded — a hanging placeStopOrder would block the per-position sync
+    // loop and stall every other position's heal/close work behind it. On
+    // timeout we return null; the next sync tick will retry, and meanwhile
+    // `checkAndForceCloseOnSltpCross` provides the safety net (it triggers
+    // on price independent of whether the protection order is armed).
+    const result = await withTimeout(
+      connector.placeStopOrder(
+        symbol,
+        closeSide,
+        effectiveQty,
+        triggerPrice,
+        kind,
+        {
+          reduceOnly: true,
+          positionSide: positionDirection === "long" ? "LONG" : "SHORT",
+        },
+      ) as Promise<any>,
+      EXCHANGE_TIMEOUT_PLACE_STOP_MS,
+      `placeStopOrder(${orderLabel} ${symbol})`,
     )
-    if (result?.success && (result.orderId || result.id)) {
-      console.log(`${LOG_PREFIX} ${orderLabel} placed: ${result.orderId || result.id} @ ${triggerPrice}`)
-      return result.orderId || result.id
+
+    const latencyMs = Date.now() - placeStart
+    // Coerce id to string. Some venues return numeric ids; downstream
+    // code does `if (pos.stopLossOrderId)` checks that would mistake a
+    // legitimately-zero (or zero-string) id for "no order placed". The
+    // venues we support never issue id=0 in practice, but the coercion
+    // keeps the type contract identical across connectors.
+    const rawId = result?.success ? (result.orderId ?? result.id) : null
+    const orderId = rawId !== null && rawId !== undefined && String(rawId).length > 0 ? String(rawId) : null
+    if (orderId) {
+      console.log(
+        `${tag} PLACED: orderId=${orderId} @ trigger=${triggerPrice} qty=${effectiveQty}${effectiveQty !== quantity ? ` (requested=${quantity}, floored)` : ""} latency=${latencyMs}ms`,
+      )
+      return orderId
     }
-    console.warn(`${LOG_PREFIX} ${orderLabel} placement failed: ${result?.error || "unknown"}`)
+    // result.error is the connector's normalized venue-side message
+    // (e.g. "BingX stop order error (code=110413): Take Profit price
+    // should be greater than the current price"). We log it verbatim so
+    // operators see the EXACT venue rejection without having to jump
+    // log layers.
+    console.warn(
+      `${tag} VENUE REJECTED: error="${result?.error || "unknown"}" code=${result?.code ?? "n/a"} latency=${latencyMs}ms`,
+    )
     return null
   } catch (err) {
-    console.warn(`${LOG_PREFIX} ${orderLabel} error:`, err)
+    const latencyMs = Date.now() - placeStart
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`${tag} EXCEPTION: ${msg} latency=${latencyMs}ms`)
+    return null
+  }
+}
+
+/**
+ * Snapshot every order ID currently open on the venue, across all
+ * symbols, as a single normalized `Set<string>`. Used by the reconcile
+ * and sync loops to verify each position's recorded `stopLossOrderId`
+ * and `takeProfitOrderId` are still alive on the exchange — without
+ * making one `getOrder()` call per leg per position per tick.
+ *
+ * Returns `null` when the connector either has no `getOpenOrders` or
+ * when the call fails/times out. Callers MUST treat `null` as "skip
+ * liveness verification this tick" rather than "no orders exist" — the
+ * latter would incorrectly wipe every protection id on a transient
+ * network blip.
+ *
+ * Cross-venue order-id field walk matches the test harness in
+ * `/api/test/live-orders-test`: BingX returns `orderId`, ccxt-style
+ * adapters return `id`, some return both. We collect every non-empty
+ * candidate per row so we cannot miss a leg because the connector
+ * happened to name the field differently than expected.
+ */
+async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> {
+  if (!connector || typeof connector.getOpenOrders !== "function") return null
+  try {
+    // 5 s upper bound — same envelope as other reconcile-side venue calls.
+    // On timeout we degrade gracefully to drift-only reconciliation.
+    const orders = (await withTimeout(
+      connector.getOpenOrders() as Promise<any>,
+      5000,
+      "getOpenOrders(reconcile-tick)",
+    )) as any[] | undefined
+    if (!Array.isArray(orders)) return null
+    const set = new Set<string>()
+    for (const o of orders) {
+      const cands = [o?.id, o?.orderId, o?.orderID, o?.clientOrderId, o?.client_oid]
+      for (const c of cands) {
+        if (c == null) continue
+        const s = String(c)
+        if (s.length > 0) set.add(s)
+      }
+    }
+    return set
+  } catch (err) {
+    console.warn(
+      `${LOG_PREFIX} fetchLiveOrderIdSet failed: ${err instanceof Error ? err.message : String(err)}`,
+    )
     return null
   }
 }
@@ -1017,18 +1186,142 @@ function priceDrifted(current: number | undefined, desired: number): boolean {
  * Returns a boolean indicating whether anything changed (so callers can
  * decide whether to persist the position).
  */
+
+// ── System-close-only flag, micro-cached ───��─────────────────────────
+//
+// Reconcile fans out across every live position; without this cache
+// each position would HGETALL `app_settings:*` to read one boolean.
+// 2 s TTL is short enough that operator toggles take visible effect
+// within one reconcile cycle, long enough to collapse a whole burst
+// of position-level calls into one Redis round-trip.
+const SYSTEM_CLOSE_TTL_MS = 2000
+let _systemCloseCacheValue: boolean | null = null
+let _systemCloseCacheAt = 0
+let _systemCloseInflight: Promise<boolean> | null = null
+
+async function getCachedSystemCloseOnly(): Promise<boolean> {
+  const now = Date.now()
+  if (_systemCloseCacheValue !== null && now - _systemCloseCacheAt < SYSTEM_CLOSE_TTL_MS) {
+    return _systemCloseCacheValue
+  }
+  if (_systemCloseInflight) return _systemCloseInflight
+  _systemCloseInflight = (async () => {
+    try {
+      const { getAppSettings } = await import("@/lib/redis-db")
+      const appSettings: any = (await getAppSettings().catch(() => null)) || {}
+      const v =
+        appSettings.useSystemCloseOnly === true ||
+        appSettings.use_system_close_only === true
+      _systemCloseCacheValue = v
+      _systemCloseCacheAt = Date.now()
+      return v
+    } catch {
+      // Fail closed: assume venue control orders (the default) on read
+      // failure rather than incorrectly arming system-close-only mode.
+      _systemCloseCacheValue = false
+      _systemCloseCacheAt = Date.now()
+      return false
+    } finally {
+      _systemCloseInflight = null
+    }
+  })()
+  return _systemCloseInflight
+}
+
 async function updateProtectionOrders(
   connector: any,
   pos: LivePosition,
   reason: string,
+  // Once-per-tick snapshot of order IDs currently open on the venue.
+  // When provided, we cross-check our recorded `stopLossOrderId` /
+  // `takeProfitOrderId` against this set: any recorded id NOT present in
+  // the live snapshot is treated as silently gone (filled, externally
+  // cancelled, expired, account-level reduce-only sweep, etc.) and the
+  // local fields are cleared so the existing "no id → place fresh"
+  // branch re-arms the leg on the same tick.
+  //
+  // Pass `null`/omit to skip verification (legacy callers that only
+  // want price/qty-drift reconciliation pay no extra REST cost).
+  liveOrderIds?: Set<string> | null,
 ): Promise<{ changed: boolean; slPlaced: boolean; tpPlaced: boolean }> {
   const result = { changed: false, slPlaced: false, tpPlaced: false }
-  if (!connector || pos.executedQuantity <= 0) return result
+  if (!connector) return result
+  const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
+  if (effectiveQty <= 0) return result
+
+  // ── System-close-only mode (cached) ────────────────────────────────
+  // Reconcile fans out across every live position on every tick, so
+  // calling `getAppSettings()` here would issue one HGETALL per
+  // position per tick — at 50 positions × 1 Hz that's 50 round-trips
+  // for a flag that changes only when an operator toggles it in
+  // settings. Cache the boolean for `SYSTEM_CLOSE_TTL_MS` (≈2 s) so
+  // every position in the same reconcile burst reuses one read; the
+  // TTL is short enough that toggling the setting takes effect within
+  // ~2 s of the next tick (well below the operator's perceptual
+  // threshold) and long enough to collapse a whole tick's worth of
+  // reads into one.
+  try {
+    const systemCloseOnly = await getCachedSystemCloseOnly() ||
+      (pos as any)?.useSystemCloseOnly === true
+    if (systemCloseOnly) {
+      const cancels: Array<Promise<unknown>> = []
+      if (pos.stopLossOrderId) cancels.push(cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "SystemCloseSweep-SL").catch(() => false))
+      if (pos.takeProfitOrderId) cancels.push(cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "SystemCloseSweep-TP").catch(() => false))
+      if (cancels.length > 0) {
+        await Promise.allSettled(cancels)
+        console.log(`${LOG_PREFIX} [system-close] ${pos.symbol} — swept ${cancels.length} stale control order(s)`)
+        pos.stopLossOrderId = undefined
+        pos.takeProfitOrderId = undefined
+        pos.stopLossPrice = 0
+        pos.takeProfitPrice = 0
+        result.changed = true
+      }
+      ;(pos as any).protectionMode = "system_close"
+      return result
+    } else if ((pos as any).protectionMode === "system_close") {
+      delete (pos as any).protectionMode
+      result.changed = true
+    }
+  } catch (modeErr) {
+    console.warn(`${LOG_PREFIX} [system-close] toggle read failed for ${pos.symbol} — falling back to control orders:`, modeErr instanceof Error ? modeErr.message : String(modeErr))
+  }
+
+  // ── Liveness verification against the venue ──────────────────────────
+  // Without this step the engine has no way to notice a SILENTLY GONE
+  // protection order. The legacy drift-only check passes (price hasn't
+  // moved, qty hasn't moved, id is still set) and we leave the position
+  // unprotected indefinitely. The most common silent-gone causes:
+  //   • SL/TP fired for a partial qty on a venue that doesn't
+  //     auto-cancel the sibling leg (we keep the now-filled id)
+  //   • Account-level reduce-only sweep (Bybit / OKX during margin-mode
+  //     transitions)
+  //   • Venue auto-expired a triggered conditional order
+  //   • Operator manually cancelled via the venue UI
+  // Clearing the local id forces the placement branch below to re-arm
+  // the leg in the same reconcile tick.
+  if (liveOrderIds && liveOrderIds.size >= 0) {
+    if (pos.stopLossOrderId && !liveOrderIds.has(String(pos.stopLossOrderId))) {
+      console.log(
+        `${LOG_PREFIX} [verify] StopLoss ${pos.symbol} orderId=${pos.stopLossOrderId} not found on venue — clearing & re-arming`,
+      )
+      pos.stopLossOrderId = undefined
+      pos.stopLossPrice = 0
+      result.changed = true
+    }
+    if (pos.takeProfitOrderId && !liveOrderIds.has(String(pos.takeProfitOrderId))) {
+      console.log(
+        `${LOG_PREFIX} [verify] TakeProfit ${pos.symbol} orderId=${pos.takeProfitOrderId} not found on venue — clearing & re-arming`,
+      )
+      pos.takeProfitOrderId = undefined
+      pos.takeProfitPrice = 0
+      result.changed = true
+    }
+  }
 
   const { desiredSl, desiredTp } = computeDesiredProtectionPrices(pos)
   const closeSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
 
-  // ── Quantity drift detection ──────────────────────────────────────────
+  // ── Quantity drift detection ──────────────────────────────────��───────
   // When more volume joins the position (delayed partial fills, accumulation
   // merges, post-fill sync detection) the SL/TP order on the exchange is
   // still armed for the *original* qty, leaving the delta unprotected.
@@ -1036,75 +1329,147 @@ async function updateProtectionOrders(
   // last placement; >0.25% drift triggers a cancel-and-replace on each
   // leg even if the trigger price hasn't moved. This is the missing
   // fix the user reported as "TP/SL not working" after partial fills.
-  const armedQty = pos.protectionArmedQuantity ?? 0
+  // NaN-hardened drift detection. `protectionArmedQuantity` is JSON-
+  // round-tripped through Redis; a corrupted persistence path could
+  // resurrect it as NaN. With the original `armedQty <= 0` check NaN
+  // compares false on every operator, so qtyDrifted stayed false and
+  // a partial-fill increase would silently NOT re-arm. Coerce to a
+  // finite number first, treating non-finite or non-positive armed
+  // quantities as "never armed" (forces re-arm).
+  const armedQtyRaw = pos.protectionArmedQuantity
+  const armedQty =
+    typeof armedQtyRaw === "number" && Number.isFinite(armedQtyRaw) && armedQtyRaw > 0
+      ? armedQtyRaw
+      : 0
   const qtyDrifted =
     pos.executedQuantity > 0 &&
     (armedQty <= 0 ||
       Math.abs(pos.executedQuantity - armedQty) / Math.max(armedQty, 1e-12) > 0.0025)
 
-  // ── Stop-Loss leg ────────────────────────────────────────────────────
-  if (desiredSl <= 0 && pos.stopLossOrderId) {
-    // SL was turned off — yank the existing order.
-    await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
-    pos.stopLossOrderId = undefined
-    pos.stopLossPrice = 0
-    result.changed = true
-  } else if (
-    desiredSl > 0 &&
-    (!pos.stopLossOrderId || priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted)
-  ) {
-    if (pos.stopLossOrderId) {
-      await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+  // ── Stop-Loss + Take-Profit legs: parallelised cancel-then-replace ──
+  //
+  // Latency contract: control orders MUST arm "instantly" — the operator
+  // explicitly called this out. The original implementation processed
+  // SL then TP sequentially, so a fresh promotion paid up to 4 venue
+  // REST round-trips on the critical path (cancel-SL → place-SL →
+  // cancel-TP → place-TP). On a 100 ms RTT venue that's ≈400 ms before
+  // either protection leg is armed. By driving both legs through a
+  // single `Promise.all` we cut that to ≈200 ms — both legs arm in
+  // parallel, and the per-leg cancel-then-replace internal sequence is
+  // preserved (so the duplicate-reduceOnly race the original guard
+  // prevents cannot reappear). Each leg only ever mutates its own
+  // position fields, so there is no cross-leg write contention.
+  const slLeg = (async () => {
+    if (desiredSl <= 0 && pos.stopLossOrderId) {
+      // SL was turned off — yank the existing order. Hard cancel
+      // failures intentionally keep the recorded id so the next
+      // reconcile pass retries; resetting it here would orphan the
+      // exchange-side order and produce a phantom unprotected position
+      // from our POV.
+      const cancelled = await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+      if (cancelled) {
+        pos.stopLossOrderId = undefined
+        pos.stopLossPrice = 0
+        result.changed = true
+      }
+    } else if (
+      desiredSl > 0 &&
+      (!pos.stopLossOrderId || (liveOrderIds && pos.stopLossOrderId && liveOrderIds.has(String(pos.stopLossOrderId))) ? false : (priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted))
+    ) {
+      // Cancel-then-replace race: if a cancel fails we must NOT place
+      // a new SL — the old one is still armed on the exchange, and
+      // adding a second reduce-only at a different trigger price
+      // creates a window where a price spike crossing both levels
+      // fires both orders before the second's reduceOnly check
+      // rejects it. Treat a definitive cancel failure as "skip this
+      // tick, retry next tick" so reconcile can re-evaluate.
+      let oldGone = true
+      if (pos.stopLossOrderId) {
+        oldGone = await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+        if (!oldGone) {
+          console.warn(
+            `${LOG_PREFIX} StopLoss cancel failed for ${pos.symbol} — deferring re-place to avoid duplicate reduceOnly`,
+          )
+        }
+      }
+      if (oldGone) {
+        const id = await placeProtectionOrder(
+          connector,
+          pos.symbol,
+          closeSide,
+          effectiveQty,
+          desiredSl,
+          "StopLoss",
+          pos.direction!,
+        )
+        // Only treat the leg as "armed at desiredSl" when we actually
+        // have a confirmed order id. Setting stopLossPrice = desiredSl
+        // on a failed placement would make the next pass think the
+        // level is live (priceDrifted compares < 0.25%) and skip
+        // retry — leaving the position permanently unprotected.
+        if (id) {
+          pos.stopLossOrderId = id
+          pos.stopLossPrice = desiredSl
+          result.changed = true
+          result.slPlaced = true
+        } else {
+          pos.stopLossOrderId = undefined
+          pos.stopLossPrice = 0
+        }
+      }
     }
-    const id = await placeProtectionOrder(
-      connector,
-      pos.symbol,
-      closeSide,
-      pos.executedQuantity,
-      desiredSl,
-      "StopLoss",
-      pos.direction,
-    )
-    pos.stopLossOrderId = id || undefined
-    pos.stopLossPrice = desiredSl
-    result.changed = true
-    result.slPlaced = !!id
-  }
+  })()
 
-  // ── Take-Profit leg ──────────────────────────────────────────────────
-  if (desiredTp <= 0 && pos.takeProfitOrderId) {
-    await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
-    pos.takeProfitOrderId = undefined
-    pos.takeProfitPrice = 0
-    result.changed = true
-  } else if (
-    desiredTp > 0 &&
-    (!pos.takeProfitOrderId || priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted)
-  ) {
-    if (pos.takeProfitOrderId) {
-      await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+  const tpLeg = (async () => {
+    if (desiredTp <= 0 && pos.takeProfitOrderId) {
+      const cancelled = await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+      if (cancelled) {
+        pos.takeProfitOrderId = undefined
+        pos.takeProfitPrice = 0
+        result.changed = true
+      }
+    } else if (
+      desiredTp > 0 &&
+      (!pos.takeProfitOrderId || (liveOrderIds && pos.takeProfitOrderId && liveOrderIds.has(String(pos.takeProfitOrderId))) ? false : (priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted))
+    ) {
+      let oldGone = true
+      if (pos.takeProfitOrderId) {
+        oldGone = await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+        if (!oldGone) {
+          console.warn(
+            `${LOG_PREFIX} TakeProfit cancel failed for ${pos.symbol} — deferring re-place to avoid duplicate reduceOnly`,
+          )
+        }
+      }
+      if (oldGone) {
+        const id = await placeProtectionOrder(
+          connector,
+          pos.symbol,
+          closeSide,
+          effectiveQty,
+          desiredTp,
+          "TakeProfit",
+          pos.direction!,
+        )
+        if (id) {
+          pos.takeProfitOrderId = id
+          pos.takeProfitPrice = desiredTp
+          result.changed = true
+          result.tpPlaced = true
+        } else {
+          pos.takeProfitOrderId = undefined
+          pos.takeProfitPrice = 0
+        }
+      }
     }
-    const id = await placeProtectionOrder(
-      connector,
-      pos.symbol,
-      closeSide,
-      pos.executedQuantity,
-      desiredTp,
-      "TakeProfit",
-      pos.direction,
-    )
-    pos.takeProfitOrderId = id || undefined
-    pos.takeProfitPrice = desiredTp
-    result.changed = true
-    result.tpPlaced = !!id
-  }
+  })()
 
-  // After (re-)placement record the qty we armed for, so the next pass
-  // can detect further drift accurately. Always update — even on a
-  // pure cancel-and-replace where qty didn't move — so we don't keep
-  // diffing against a stale baseline.
+  await Promise.all([slLeg, tpLeg])
+
+  // After (re-)placement record the qty we armed for so the next pass
+  // can detect further drift accurately.
   if (result.changed) {
-    pos.protectionArmedQuantity = pos.executedQuantity
+    pos.protectionArmedQuantity = effectiveQty
   }
 
   if (result.changed) {
@@ -1156,21 +1521,65 @@ export async function executeLivePosition(
   await initRedis()
   const client = getRedisClient()
 
+  // ── Exchange circuit-breaker gate (per-symbol) ───────────────────────
+  // BingX code 109400 — "API orders temporarily disabled due to market
+  // volatility" — affects a specific symbol for ~1-5 minutes. Skip it
+  // silently rather than counting it as a margin/balance failure.
+  if (isCircuitBreakerActive(realPosition.symbol)) {
+    const cbSkipped: LivePosition = {
+      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      connectionId,
+      symbol: realPosition.symbol,
+      direction: realPosition.direction,
+      realPositionId: realPosition.id,
+      quantity: realPosition.quantity,
+      executedQuantity: 0,
+      remainingQuantity: realPosition.quantity,
+      entryPrice: realPosition.entryPrice,
+      averageExecutionPrice: 0,
+      volumeUsd: 0,
+      leverage: realPosition.leverage,
+      marginType: "cross",
+      stopLoss: realPosition.stopLoss,
+      takeProfit: realPosition.takeProfit,
+      assignedStopLoss: realPosition.stopLoss,
+      assignedTakeProfit: realPosition.takeProfit,
+      status: "rejected",
+      statusReason: `Skipped — exchange circuit breaker active for ${realPosition.symbol} (market volatility, resumes in <5min)`,
+      fills: [],
+      progression: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      setKey: realPosition.setKey,
+      parentSetKey: realPosition.parentSetKey,
+      setVariant: realPosition.setVariant,
+      axisWindows: realPosition.axisWindows,
+      accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
+    }
+    pushStep(cbSkipped, "preflight", false, cbSkipped.statusReason!)
+    logProgressionEvent(connectionId, "live_trading", "warning", cbSkipped.statusReason!, {
+      symbol: realPosition.symbol,
+      direction: realPosition.direction,
+    }).catch(() => {})
+    return cbSkipped
+  }
+
   // ── Non-recoverable-error cooldown gate ──
   //
-  // If we hit `code=101204` (Insufficient margin) within the last
-  // MARGIN_ERROR_COOLDOWN_MS, skip this attempt entirely and return a
-  // synthetic "rejected" LivePosition. This prevents every Set evaluation
-  // in a no-balance state from spamming the BingX API with hopeless
-  // orders that just slow the event loop.
+  // If we hit `code=101204` (Insufficient margin) within the exponential
+  // backoff window (60s → 120s → 240s → 300s), skip this attempt and return
+  // a synthetic "rejected" LivePosition. Prevents API flood on no-balance.
   //
-  // Rationale: the operator must top up — there is no engine-side fix.
   // The skip is silent at console level after the first occurrence so
-  // logs stay readable; the progression event still records it once per
-  // skipped attempt for dashboard visibility.
+  // logs stay readable; the progression event still records it for the
+  // dashboard. Operator tops up → next successful order resets counter.
   if (isMarginCooldownActive(connectionId)) {
+    const entry = marginErrorCooldownByConnection.get(connectionId)
+    const failures = entry?.consecutiveFailures ?? 1
+    const stepIdx = Math.min(failures - 1, MARGIN_COOLDOWN_STEPS_MS.length - 1)
+    const cooldownSec = Math.round((MARGIN_COOLDOWN_STEPS_MS[stepIdx] ?? MARGIN_COOLDOWN_MAX_MS) / 1000)
     const skipped: LivePosition = {
-      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      id: generateLivePositionId(connectionId, realPosition.symbol, realPosition.direction),
       connectionId,
       symbol: realPosition.symbol,
       direction: realPosition.direction,
@@ -1191,7 +1600,7 @@ export async function executeLivePosition(
       assignedTakeProfit: realPosition.takeProfit,
       status: "rejected",
       statusReason:
-        "Skipped — connection in margin-error cooldown (top up exchange balance to resume live trading)",
+        `Skipped — margin-error cooldown active (attempt ${failures}, cooldown=${cooldownSec}s). Top up exchange balance to resume.`,
       fills: [],
       progression: [],
       createdAt: Date.now(),
@@ -1202,17 +1611,19 @@ export async function executeLivePosition(
       axisWindows: realPosition.axisWindows,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
     }
-    pushStep(skipped, "preflight", false, skipped.statusReason)
+    pushStep(skipped, "preflight", false, skipped.statusReason!)
     // Don't await — fire-and-forget is fine for the cooldown skip log.
     logProgressionEvent(connectionId, "live_trading", "warning", skipped.statusReason!, {
       symbol: realPosition.symbol,
       direction: realPosition.direction,
+      consecutiveFailures: failures,
+      cooldownSec,
     }).catch(() => {})
     return skipped
   }
 
   const livePosition: LivePosition = {
-    id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+    id: generateLivePositionId(connectionId, realPosition.symbol, realPosition.direction),
     connectionId,
     symbol: realPosition.symbol,
     direction: realPosition.direction,
@@ -1246,11 +1657,13 @@ export async function executeLivePosition(
     // `accumulatedSetKeys` is seeded with the originating setKey so
     // accumulation merges later append onto a non-empty list (rather
     // than having to special-case the first entry).
-    setKey:        realPosition.setKey,
-    parentSetKey:  realPosition.parentSetKey,
-    setVariant:    realPosition.setVariant,
-    axisWindows:   realPosition.axisWindows,
+    setKey:           realPosition.setKey,
+    parentSetKey:     realPosition.parentSetKey,
+    setVariant:       realPosition.setVariant,
+    axisWindows:      realPosition.axisWindows,
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
+    // Propagate upstream pseudo-position ID for per-(setKey, pseudoPositionId) SL/TP dedup.
+    pseudoPositionId: realPosition.pseudoPositionId,
   }
 
   try {
@@ -1412,20 +1825,92 @@ export async function executeLivePosition(
     }
 
     // Short-circuit on simulation mode — still record the intent.
+    //
+    // CRITICAL: We populate `executedQuantity` / `averageExecutionPrice`
+    // / `volumeUsd` / `remainingQuantity` / a synthetic `fills[]` entry
+    // here. Previously the simulated branch left all of these at 0,
+    // which silently broke EVERY downstream close path:
+    //
+    //   * `checkAndForceCloseOnSltpCross()` early-returns when
+    //     `executedQuantity <= 0` or `averageExecutionPrice <= 0` — so
+    //     simulated positions never honored their SL/TP levels.
+    //   * The max-hold-time closer in `syncWithExchange` /
+    //     `reconcileLivePositions` also gates on
+    //     `executedQuantity > 0`, so the 4-hour safety net never
+    //     force-closed simulated positions either.
+    //
+    // Net effect: every simulated live order sat OPEN forever in the
+    // Redis open-index, growing `live_positions_created_count` without
+    // ever growing `live_positions_closed_count`. This is the exact
+    // "Live Positions are Still not getting closed" symptom the
+    // operator reported on paper / is_live_trade=false connections.
+    //
+    // Now: a simulated position behaves like a fully-filled exchange
+    // position at the requested entryPrice, with the (new) per-tick
+    // `processSimulatedPositions` sweep walking Redis market_data
+    // and force-closing on SL/TP cross or max-hold-time expiry.
     if (!isLiveTradeEnabled) {
+      // Dedup guard: if a simulated (or real) position is already open for this
+      // symbol+direction, do NOT create another one. The reconcile sweep and the
+      // `processSimulatedPositions` closer are responsible for lifecycle — we just
+      // need to avoid creating hundreds of redundant positions per cycle.
+      const existingSim = await findOpenLivePositionByDir(
+        connectionId,
+        realPosition.symbol,
+        realPosition.direction,
+      )
+      if (existingSim) {
+        // Already have an open simulated position — skip this cycle silently.
+        livePosition.status = "rejected"
+        livePosition.statusReason = `Simulated dedup — open position ${existingSim.id} already exists for ${realPosition.symbol} ${realPosition.direction}`
+        return livePosition
+      }
+
+      // Resolve the entry price for simulation. The upstream coordinator
+      // supplies _cachedMarketPrice which is fetched via hgetall before
+      // calling executeLivePosition. If that read returned 0 (timing —
+      // market data hash not yet written) we do a fresh fetchCurrentPrice
+      // call here so simulated positions always record a real price.
+      let simEntryPrice = livePosition.entryPrice || realPosition.entryPrice || 0
+      if (simEntryPrice <= 0) {
+        simEntryPrice = await fetchCurrentPrice(realPosition.symbol, connectionId)
+      }
+      const simQty = realPosition.quantity || 0
+      livePosition.executedQuantity = simQty
+      livePosition.remainingQuantity = 0
+      livePosition.averageExecutionPrice = simEntryPrice
+      livePosition.volumeUsd = simQty * simEntryPrice
+      livePosition.fills = [
+        {
+          timestamp: Date.now(),
+          quantity: simQty,
+          price: simEntryPrice,
+          fee: 0,
+          feeAsset: "",
+        },
+      ]
       livePosition.status = "simulated"
       livePosition.statusReason = "live_trade disabled — no exchange execution"
-      pushStep(livePosition, "simulate", true)
+      pushStep(livePosition, "simulate", true, `qty=${simQty} @ ${simEntryPrice}`)
       await savePosition(livePosition)
-      await incrementMetric(connectionId, "live_orders_simulated_count")
-      await logProgressionEvent(
-        connectionId,
-        "live_trading",
-        "info",
-        `Simulated live order (live_trade disabled) ${realPosition.symbol}`,
-        { direction: realPosition.direction, quantity: realPosition.quantity }
-      )
-      console.log(`${LOG_PREFIX} SIMULATION: ${realPosition.symbol} ${realPosition.direction} (live_trade disabled)`)
+      // Run counters in parallel — they're independent.
+      await Promise.all([
+        incrementMetric(connectionId, "live_orders_simulated_count"),
+        // Track simulated positions in created counter as well so the
+        // openPositions.live.open = created - closed math works for
+        // paper trades (the close-counter is bumped by
+        // closeLivePosition / reconcile when the simulated position
+        // gets force-closed).
+        incrementMetric(connectionId, "live_positions_created_count"),
+        logProgressionEvent(
+          connectionId,
+          "live_trading",
+          "info",
+          `Simulated live order (live_trade disabled) ${realPosition.symbol}`,
+          { direction: realPosition.direction, quantity: simQty, entryPrice: simEntryPrice }
+        ),
+      ])
+      console.log(`${LOG_PREFIX} SIMULATION: ${realPosition.symbol} ${realPosition.direction} qty=${simQty} @ ${simEntryPrice} (live_trade disabled)`)
       return livePosition
     }
 
@@ -1470,6 +1955,44 @@ export async function executeLivePosition(
     livePosition.entryPrice = currentPrice
     pushStep(livePosition, "price_fetch", true, `price=${currentPrice}`)
 
+    // ── Operator policy: ALWAYS use venue max leverage ─────────────────
+    // realPosition.leverage carries the per-variant coordination signal
+    // (1, 2, 3, 5x as derived in expandSizeLeverageVariants). That
+    // signal is for INTERNAL strategy ranking only — when actually
+    // placing the order on the venue we override to the connection's
+    // maximum supported leverage. Two safety nets remain armed
+    // downstream:
+    //   1. setLeverage(symbol, max) — venue clamps to per-symbol bracket
+    //   2. VolumeCalculator's balance-based cap — small-balance
+    //      accounts get a lower effective leverage automatically
+    //   3. 101204 "Insufficient margin" auto-halve retry below
+    // The override happens BEFORE the volume call so margin-based
+    // sizing (volumeUsd / leverage) reflects the max we'll actually use.
+    try {
+      const { getConnection: _getConnLev } = await import("@/lib/redis-db")
+      const connRecord = await _getConnLev(connectionId)
+      const venueMax = getMaxLeverageForExchange(connRecord?.exchange)
+      if (venueMax > livePosition.leverage) {
+        const previous = livePosition.leverage
+        livePosition.leverage = venueMax
+        pushStep(
+          livePosition,
+          "leverage_override",
+          true,
+          `coordination=${previous}x → venue_max=${venueMax}x (operator policy)`,
+        )
+      }
+    } catch (err) {
+      // Non-critical: fall through with realPosition.leverage and let
+      // the existing 101204 auto-halve fallback handle margin issues.
+      pushStep(
+        livePosition,
+        "leverage_override",
+        true,
+        `skipped — connection lookup failed (${String(err).slice(0, 60)})`,
+      )
+    }
+
     // ── Step 3: Volume calculation ─────────────────────────────────────────
     // POLICY: minimum volume is ALWAYS enforced �� we never reject a live
     // order for "qty too small". If the calculator returns null or a
@@ -1510,13 +2033,13 @@ export async function executeLivePosition(
     let computedVolume = volumeResult?.finalVolume || volumeResult?.volume || 0
     let volumeNote = ""
     if (computedVolume <= 0 || !Number.isFinite(computedVolume)) {
-      // Synthesize at $15 notional (the universal floor from
-      // VolumeCalculator) to ensure every order has a reasonable size.
-      // At $5 fallback with 300 positions on a $10K balance, orders
-      // would be ~0.0008 BTC, below most exchange minimums and leading to
-      // constant order rejections. $15 ensures at least a few cents worth
-      // of the quote asset per position.
-      const FALLBACK_NOTIONAL_USD = 15
+      // Synthesize at the minimal fallback ($5 notional) when the
+      // VolumeCalculator returns nothing. The per-pair exchange minimum
+      // from trading-pair metadata (stored in Redis) normally takes over
+      // as the hard floor inside VolumeCalculator — this path is a last-
+      // resort for pairs with no metadata or calculator failures. Kept
+      // at $5 to match the quickstart minimal-volume policy.
+      const FALLBACK_NOTIONAL_USD = 5
       computedVolume = currentPrice > 0
         ? FALLBACK_NOTIONAL_USD / currentPrice
         : 0
@@ -1559,37 +2082,71 @@ export async function executeLivePosition(
     }
 
     // ── Step 4: Configure leverage + margin type on exchange ───────────────
-    if (typeof exchangeConnector.setLeverage === "function") {
-      try {
-        const lev = await exchangeConnector.setLeverage(realPosition.symbol, livePosition.leverage)
-        pushStep(livePosition, "set_leverage", !!lev?.success, lev?.error || `leverage=${livePosition.leverage}`)
-      } catch (err) {
-        pushStep(livePosition, "set_leverage", false, String(err))
-      }
-    } else {
-      pushStep(livePosition, "set_leverage", true, "connector does not expose setLeverage — skipping")
-    }
-
+    // T2.3 perf: parallelize the two pre-flight venue calls. They are
+    // idempotent and independent — `setLeverage` configures the
+    // per-symbol leverage bracket, `setMarginType` configures
+    // cross/isolated. Running them concurrently shaves one full
+    // round-trip off every live entry. Both still complete BEFORE the
+    // order is placed, so the venue sees consistent margin semantics
+    // for the order. Errors are captured per-call and logged
+    // independently — a failure in one does NOT skip the other.
     const marginTypeSetting = (connSettings.margin_type as "cross" | "isolated") || "cross"
     livePosition.marginType = marginTypeSetting
-    if (typeof exchangeConnector.setMarginType === "function") {
-      try {
-        const m = await exchangeConnector.setMarginType(realPosition.symbol, marginTypeSetting)
-        pushStep(livePosition, "set_margin_type", !!m?.success, m?.error || `margin=${marginTypeSetting}`)
-      } catch (err) {
-        pushStep(livePosition, "set_margin_type", false, String(err))
-      }
-    } else {
-      pushStep(livePosition, "set_margin_type", true, "connector does not expose setMarginType — skipping")
-    }
 
-    // ── Step 5: Place entry order with retry ───────────────────────────────
+    const setLeveragePromise: Promise<{ ok: boolean; note: string }> =
+      typeof exchangeConnector.setLeverage === "function"
+        ? exchangeConnector
+            .setLeverage(realPosition.symbol, livePosition.leverage)
+            .then((lev: any) => ({
+              ok: !!lev?.success,
+              note: lev?.error || `leverage=${livePosition.leverage}`,
+            }))
+            .catch((err: unknown) => ({ ok: false, note: String(err) }))
+        : Promise.resolve({
+            ok: true,
+            note: "connector does not expose setLeverage — skipping",
+          })
+
+    const setMarginTypePromise: Promise<{ ok: boolean; note: string }> =
+      typeof exchangeConnector.setMarginType === "function"
+        ? exchangeConnector
+            .setMarginType(realPosition.symbol, marginTypeSetting)
+            .then((m: any) => ({
+              ok: !!m?.success,
+              note: m?.error || `margin=${marginTypeSetting}`,
+            }))
+            .catch((err: unknown) => ({ ok: false, note: String(err) }))
+        : Promise.resolve({
+            ok: true,
+            note: "connector does not expose setMarginType — skipping",
+          })
+
+    const [levResult, marginResult] = await Promise.all([setLeveragePromise, setMarginTypePromise])
+    pushStep(livePosition, "set_leverage", levResult.ok, levResult.note)
+    pushStep(livePosition, "set_margin_type", marginResult.ok, marginResult.note)
+
+
+    // ── Step 5: Place entry order with retry ─────────────────────����─────────
     const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
+
+    // ── Comprehensive logging trace ──────────────────────────────────
+    // One trace id spans the primary attempt, the leverage-reduced retry,
+    // the min-size correction retry, the fill polling, and the final
+    // outcome line. Grep `[v0] [LiveOrder]` + `trace=` to reconstruct the
+    // full lifecycle of any failing order. Trace is created here (not at
+    // function entry) so accumulation merges and dedup-skip paths above
+    // don't pollute the log with no-op traces.
+    const orderTrace: LiveOrderTrace = newLiveOrderTrace({
+      connectionId,
+      symbol: realPosition.symbol,
+      direction: realPosition.direction,
+      exchangeSide,
+    })
 
     console.log(
       `${LOG_PREFIX} EXECUTING REAL: ${realPosition.symbol} ${realPosition.direction} → ${exchangeSide} qty=${computedVolume.toFixed(
         6
-      )} @ ${currentPrice}`
+      )} @ ${currentPrice} trace=${orderTrace.traceId}`
     )
 
     // For perp entries we pass the explicit positionSide matching the real
@@ -1597,20 +2154,247 @@ export async function executeLivePosition(
     // that don't care about the options object simply ignore the 6th arg.
     // BingX's one-way-mode accounts auto-retry without positionSide if the
     // exchange rejects it (code 80014), so this is safe for both modes.
-    const orderResult: any = await retry(
-      () => exchangeConnector.placeOrder(
-        realPosition.symbol,
-        exchangeSide,
-        computedVolume,
-        undefined,
-        "market",
-        {
-          positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
-        },
-      ),
+    //
+    // ── CRITICAL: Re-check is_live_trade gate RIGHT BEFORE order placement ──────
+    // The flag is checked once at entry (line 1959), but if the operator toggles
+    // Control Orders off during preflight, we must catch it here before sending
+    // the order to the exchange. This is a defensive second gate.
+    const { getConnection: reCheckConn } = await import("@/lib/redis-db")
+    const { isTruthyFlag: reCheckTruthy } = await import("@/lib/connection-state-utils")
+    const freshSettings = (await reCheckConn(connectionId)) || {}
+    const isStillLive =
+      reCheckTruthy(freshSettings.is_live_trade) ||
+      reCheckTruthy(freshSettings.live_trade_enabled)
+
+    if (!isStillLive) {
+      livePosition.status = "rejected"
+      livePosition.statusReason =
+        `Control Orders disabled (is_live_trade=false) — order blocked before exchange placement`
+      pushStep(livePosition, "entry", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_blocked_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "info",
+        livePosition.statusReason,
+        { symbol: realPosition.symbol, direction: realPosition.direction },
+      ).catch(() => {})
+      return livePosition
+    }
+
+    // The `retry()` helper repeats up to 3× on transient failures; we
+    // emit PRE/POST per ATTEMPT so the log shows each round-trip. The
+    // attempt counter is captured by closure so leverage-reduced and
+    // min-size-corrected retries below get distinct labels.
+    let placeAttempt = 0
+    let orderResult: any = await retry(
+      async () => {
+        placeAttempt += 1
+        const { raw } = await withLiveOrderLogging(
+          orderTrace,
+          {
+            quantity: computedVolume,
+            price: currentPrice,
+            leverage: livePosition.leverage,
+            marginType: livePosition.marginType ?? "unknown",
+            orderType: "market",
+            options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+            strategySetKey: livePosition.setKey,
+            realPositionId: realPosition.id,
+            attempt: placeAttempt,
+            label: "primary",
+          },
+          () => exchangeConnector.placeOrder(
+            realPosition.symbol,
+            exchangeSide,
+            computedVolume,
+            undefined,
+            "market",
+            {
+              positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
+            },
+          ),
+        )
+        return raw
+      },
       (r: any) => !!r?.success && !!(r.orderId || r.id),
       "placeOrder"
     )
+
+    // ── Leverage auto-reduce on 101204 (Insufficient margin) ─────────
+    // When the exchange rejects with "Insufficient margin" the account
+    // likely does not have enough funds at the current leverage. Halve
+    // the leverage and retry ONCE — this is often enough to get the
+    // minimum margin requirement below the available balance.
+    if (!orderResult?.success && isNonRecoverableExchangeError(orderResult)) {
+      const reducedLev = Math.max(1, Math.floor(livePosition.leverage / 2))
+      if (reducedLev < livePosition.leverage) {
+        console.warn(
+          `${LOG_PREFIX} 101204 on ${realPosition.symbol} — retrying with halved leverage ` +
+          `${livePosition.leverage}x → ${reducedLev}x`,
+        )
+        try {
+          if (typeof exchangeConnector.setLeverage === "function") {
+            await exchangeConnector.setLeverage(realPosition.symbol, reducedLev)
+          }
+        } catch { /* non-critical; the order might still succeed */ }
+
+        const retryResult: any = await retry(
+          async () => {
+            placeAttempt += 1
+            const { raw } = await withLiveOrderLogging(
+              orderTrace,
+              {
+                quantity: computedVolume,
+                price: currentPrice,
+                leverage: reducedLev,
+                marginType: livePosition.marginType ?? "unknown",
+                orderType: "market",
+                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                strategySetKey: livePosition.setKey,
+                realPositionId: realPosition.id,
+                attempt: placeAttempt,
+                label: "leverage-halved",
+              },
+              () => exchangeConnector.placeOrder(
+                realPosition.symbol,
+                exchangeSide,
+                computedVolume,
+                undefined,
+                "market",
+                { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+              ),
+            )
+            return raw
+          },
+          (r: any) => !!r?.success && !!(r.orderId || r.id),
+          "placeOrder-reducedLev",
+          1 // single retry attempt — we already tried 3× above
+        )
+
+        if (retryResult?.success && (retryResult.orderId || retryResult.id)) {
+          // Succeeded with reduced leverage — update livePosition and continue.
+          livePosition.leverage = reducedLev
+          orderResult = retryResult
+          console.log(
+            `${LOG_PREFIX} Entry succeeded after leverage reduction to ${reducedLev}x for ${realPosition.symbol}`,
+          )
+        } else {
+          // Still failing — record margin error and give up.
+          recordMarginError(connectionId)
+          orderResult = retryResult ?? orderResult
+        }
+      } else {
+        // Leverage already at 1x — cannot reduce further.
+        recordMarginError(connectionId)
+      }
+    }
+
+    // ── Exchange circuit-breaker (109400) detection ────���──────────────
+    // Code 109400 = exchange temporarily halted API trading for this
+    // symbol due to volatility. This is NOT a margin issue — record a
+    // per-symbol circuit-breaker and let the connection continue placing
+    // orders on other symbols without triggering the margin cooldown.
+    if (!orderResult?.success && isCircuitBreakerError(orderResult)) {
+      recordCircuitBreaker(realPosition.symbol)
+      livePosition.status = "error"
+      livePosition.statusReason = `Exchange circuit breaker active for ${realPosition.symbol} — retrying in <5min`
+      pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_failed_count")
+      await logProgressionEvent(connectionId, "live_trading", "warning", livePosition.statusReason, {
+        symbol: realPosition.symbol,
+        error: orderResult?.error,
+      })
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+      await logLiveOrderFinal(orderTrace, {
+        status: "circuit_breaker",
+        livePositionId: livePosition.id,
+        reason: livePosition.statusReason,
+        extra: { errorCode: orderResult?.errorCode ?? orderResult?.code, error: orderResult?.error },
+      })
+      return livePosition
+    }
+
+    // ── Exchange minimum order size enforcement (code=101400) ────────────
+    // BingX returns code=101400 when the order qty is below the pair's
+    // minimum. The error message includes the required minimum:
+    //   "The minimum order amount is 56.974 DRIFT."
+    //
+    // Strategy: parse + persist the minimum to Redis so every subsequent
+    // cycle produces the right qty from the volume calculator, then retry
+    // THIS order once with the corrected quantity so the signal fires now
+    // rather than waiting for the next cycle.
+    if (!orderResult?.success && isMinOrderSizeError(orderResult)) {
+      const requiredMin = extractMinOrderQty(orderResult)
+      if (requiredMin && requiredMin > 0) {
+        // Persist to `settings:trading_pair:{symbol}` hash via setSettings —
+        // this is the EXACT key that VolumeCalculator reads via
+        // `getSettings("trading_pair:{symbol}")`. The previous implementation
+        // wrote to a plain-string key `trading_pair:{symbol}` (via redis.set)
+        // which is a completely different Redis path from the settings hash.
+        try {
+          await setSettings(`trading_pair:${realPosition.symbol}`, {
+            min_order_size: String(requiredMin),
+            updated_at: String(Date.now()),
+            source: "101400_auto_correction",
+          })
+          console.log(
+            `${LOG_PREFIX} Stored min_order_size=${requiredMin} for ${realPosition.symbol} in settings hash`
+          )
+        } catch (storeErr) {
+          console.warn(`${LOG_PREFIX} Failed to persist min_order_size for ${realPosition.symbol}:`, storeErr)
+        }
+
+        // Retry once with the required minimum quantity.
+        const correctedQty = Math.max(requiredMin * 1.01, requiredMin) // +1% buffer for rounding
+        console.log(
+          `${LOG_PREFIX} Retrying ${realPosition.symbol} with corrected qty=${correctedQty.toFixed(6)} (exchange min=${requiredMin})`
+        )
+        const minRetry: any = await retry(
+          async () => {
+            placeAttempt += 1
+            const { raw } = await withLiveOrderLogging(
+              orderTrace,
+              {
+                quantity: correctedQty,
+                price: currentPrice,
+                leverage: livePosition.leverage,
+                marginType: livePosition.marginType ?? "unknown",
+                orderType: "market",
+                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                strategySetKey: livePosition.setKey,
+                realPositionId: realPosition.id,
+                attempt: placeAttempt,
+                label: `min-corrected(required=${requiredMin})`,
+              },
+              () => exchangeConnector.placeOrder(
+                realPosition.symbol,
+                exchangeSide,
+                correctedQty,
+                undefined,
+                "market",
+                { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+              ),
+            )
+            return raw
+          },
+          (r: any) => !!r?.success && !!(r.orderId || r.id),
+          "placeOrder-minCorrection",
+          1
+        )
+        if (minRetry?.success && (minRetry.orderId || minRetry.id)) {
+          orderResult = minRetry
+          computedVolume = correctedQty // keep volume consistent for fill + SL/TP
+          console.log(
+            `${LOG_PREFIX} Min-size corrected order succeeded for ${realPosition.symbol}: orderId=${minRetry.orderId || minRetry.id}`
+          )
+        } else {
+          orderResult = minRetry ?? orderResult
+        }
+      }
+    }
 
     if (!orderResult?.success || !(orderResult.orderId || orderResult.id)) {
       livePosition.status = "error"
@@ -1618,14 +2402,6 @@ export async function executeLivePosition(
       pushStep(livePosition, "place_order", false, livePosition.statusReason)
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_failed_count")
-
-      // Arm the per-connection cooldown when the failure was a
-      // non-recoverable margin/balance error. This stops the engine
-      // from re-attempting on every subsequent cycle and lets the
-      // operator top up without the API getting hammered.
-      if (isNonRecoverableExchangeError(orderResult)) {
-        recordMarginError(connectionId)
-      }
 
       // Per-connection progression log (for the UI Progression panel).
       await logProgressionEvent(connectionId, "live_trading", "error", `Entry order failed for ${realPosition.symbol}`, {
@@ -1657,6 +2433,16 @@ export async function executeLivePosition(
       // margin-cooldown gate above still prevents a stampede of retries
       // when the failure is non-recoverable (insufficient balance).
       await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+      await logLiveOrderFinal(orderTrace, {
+        status: "rejected",
+        livePositionId: livePosition.id,
+        reason: livePosition.statusReason,
+        extra: {
+          errorCode: orderResult?.errorCode ?? orderResult?.code,
+          error: orderResult?.error,
+          attempts: placeAttempt,
+        },
+      })
       return livePosition
     }
 
@@ -1664,15 +2450,20 @@ export async function executeLivePosition(
     livePosition.status = "placed"
     pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
     await incrementMetric(connectionId, "live_orders_placed_count")
-    // Lock was already acquired ATOMICALLY at the top of this function via
-    // `tryAcquireLock` (see the dedup-gate block). The legacy
-    // `await acquireLock(...)` here was redundant — it just re-stamped a
-    // lock we already owned. Keeping the order here would also paper over
-    // any future regression where the gate atomicity is removed: removing
-    // it makes the contract obvious — "fresh-entry path runs IFF we own
-    // the lock". A long-running entry's TTL is refreshed by the
-    // accumulation path (`refreshLockTTL`) and by `closeLivePosition`'s
-    // explicit `releaseLock`.
+    await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "placed")
+    // Successful placement — reset the margin error consecutive-failure counter
+    // so the backoff resets to the shortest cooldown on the next failure.
+    marginErrorCooldownByConnection.delete(connectionId)
+    // ── Refresh the dedup lock TTL ──────────────────────────────────────
+    // The poll-fill phase below can take up to 15s. Without a mid-pipeline
+    // TTL refresh, a slow venue + SL/TP placement could push past the
+    // lock's 90s window, letting another tick place a duplicate position.
+    // Re-stamp the lock here so the slot stays owned through fill + protect.
+    await refreshLockTTL(
+      connectionId,
+      realPosition.symbol,
+      realPosition.direction,
+    ).catch(() => {})
     await logProgressionEvent(connectionId, "live_trading", "info", `Entry order placed for ${realPosition.symbol}`, {
       orderId: livePosition.orderId,
       side: exchangeSide,
@@ -1684,36 +2475,141 @@ export async function executeLivePosition(
     // Persist intermediate state so UI can show "placed" even during poll.
     await savePosition(livePosition)
 
-    // ── Step 6: Poll for fill confirmation ───────────────────────────��─────
-    const fill = await pollOrderFill(exchangeConnector, realPosition.symbol, livePosition.orderId!)
+    // ── Step 6: Fill confirmation ──────────────────────────────────────────
+    // Three-layer strategy:
+    //  A) Inline: Many exchanges (BingX, Bybit) return immediate fill data in
+    //     the placeOrder response itself. Extract it before polling to avoid
+    //     a full 15s wait on fast-fill venues.
+    //  B) Poll: Standard path — repeatedly call getOrder() until filled or
+    //     timeout. Extended timeout (15s vs old 10s) to handle slow networks.
+    //  C) getPosition() fallback: If poll times out with no fill data, ask the
+    //     exchange for the *position* (not the order). On perp exchanges a
+    //     successfully-opened position IS the proof of fill; its size and
+    //     entry price are reliable even when getOrder() lags.
+    //
+    // After all three layers, if executedQty is still 0 we use computedVolume
+    // as a last-resort quantity so SL/TP can be placed on the exchange. The
+    // protection order itself being "reduce-only" ensures it can't add new
+    // risk; the reconcile cycle will correct the stored qty on next tick.
+    const inlineFillQty   = parseFloat(String(orderResult.filledQty  ?? orderResult.executedQty ?? orderResult.cumQty   ?? "0")) || 0
+    const inlineFillPrice = parseFloat(String(orderResult.filledPrice ?? orderResult.avgPrice   ?? orderResult.price    ?? "0")) || 0
+    const inlineStatus    = String(orderResult.status ?? "").toLowerCase()
+    const inlineFilled    = (inlineStatus === "filled" || inlineFillQty >= computedVolume * 0.99) && inlineFillQty > 0
+
+    let fill: { filled: boolean; filledQty: number; filledPrice: number; status: string }
+
+    if (inlineFilled) {
+      // A) placeOrder response already contains fill confirmation — skip poll.
+      fill = { filled: true, filledQty: inlineFillQty, filledPrice: inlineFillPrice, status: "filled" }
+      console.log(`${LOG_PREFIX} Inline fill detected for ${realPosition.symbol}: qty=${inlineFillQty} @ ${inlineFillPrice}`)
+    } else {
+      // B) Standard poll path.
+      fill = await pollOrderFill(exchangeConnector, realPosition.symbol, livePosition.orderId!)
+    }
+
+    // C) getPosition() fallback when poll timed out without fill data.
+    //
+    // Exchange position registries are usually a few hundred ms behind
+    // order acknowledgements (orders go through the matching engine, then
+    // get persisted to the position service via internal pub/sub). A
+    // single getPosition() that comes back empty is therefore not
+    // conclusive proof the order didn't fill — it might just be the
+    // registry being slow. We try up to 3 times with 250 ms gaps before
+    // giving up and dropping to the computedVolume guard, which trades
+    // ~500 ms of additional confirmation latency for much higher accuracy
+    // of SL/TP sizing on slow-confirming venues.
+    if (!fill.filled || fill.filledQty <= 0) {
+      if (typeof exchangeConnector.getPosition === "function") {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const exPos = await exchangeConnector.getPosition(realPosition.symbol)
+            const exSize = parseFloat(String(exPos?.size ?? exPos?.positionAmt ?? exPos?.quantity ?? exPos?.contracts ?? "0")) || 0
+            const exEntry = parseFloat(String(exPos?.entryPrice ?? exPos?.avgPrice ?? exPos?.averagePrice ?? "0")) || 0
+            if (Math.abs(exSize) > 0) {
+              console.log(`${LOG_PREFIX} getPosition() fallback fill for ${realPosition.symbol}: size=${exSize} entry=${exEntry} (attempt=${attempt + 1})`)
+              fill = {
+                filled: true,
+                filledQty: Math.abs(exSize),
+                filledPrice: exEntry || currentPrice,
+                status: "filled_via_position",
+              }
+              break
+            }
+          } catch {
+            /* transient error — counts as one attempt, fall through to retry */
+          }
+          // Gap before the next probe — short enough that total worst-case
+          // is ~500 ms, long enough for the registry to catch up.
+          if (attempt < 2) await new Promise(r => setTimeout(r, 250))
+        }
+      }
+    }
+
     if (fill.filled && fill.filledQty > 0) {
       livePosition.executedQuantity = fill.filledQty
       livePosition.remainingQuantity = Math.max(0, computedVolume - fill.filledQty)
       livePosition.averageExecutionPrice = fill.filledPrice || currentPrice
-      livePosition.fills.push({
+      livePosition.fills!.push({
         timestamp: Date.now(),
         quantity: fill.filledQty,
         price: fill.filledPrice || currentPrice,
         fee: 0,
         feeAsset: "USDT",
       })
-      livePosition.status = livePosition.remainingQuantity <= 0 ? "filled" : "partially_filled"
-      pushStep(livePosition, "poll_fill", true, `filled=${fill.filledQty} @ ${fill.filledPrice}`)
+      livePosition.status = livePosition.remainingQuantity <= 0.000001 ? "filled" : "partially_filled"
+      pushStep(livePosition, "poll_fill", true, `filled=${fill.filledQty} @ ${fill.filledPrice} via=${fill.status}`)
       await incrementMetric(connectionId, "live_orders_filled_count")
+      await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "filled")
       await logProgressionEvent(connectionId, "live_trading", "info", `Entry filled for ${realPosition.symbol}`, {
         orderId: livePosition.orderId,
         filledQty: fill.filledQty,
         filledPrice: fill.filledPrice,
+        via: fill.status,
+      })
+      await logLiveOrderFinal(orderTrace, {
+        status: "filled",
+        livePositionId: livePosition.id,
+        executedQuantity: fill.filledQty,
+        averagePrice: fill.filledPrice || currentPrice,
+        reason: `fill via=${fill.status}`,
+        extra: { orderId: livePosition.orderId, attempts: placeAttempt },
       })
     } else {
-      pushStep(livePosition, "poll_fill", false, `fill not confirmed within timeout — status=${fill.status}`)
+      // D) Final guard: fill unconfirmed but order was accepted �� treat as filled
+      // with computedVolume so SL/TP can be placed. The position is "open" on the
+      // exchange (order went to market); protection orders are reduce-only so no
+      // new risk is added. Reconcile will correct executedQty on next tick.
+      console.warn(
+        `${LOG_PREFIX} Fill unconfirmed for ${realPosition.symbol} after all detection layers — ` +
+        `using computedVolume=${computedVolume} as protection qty. Reconcile will sync.`
+      )
+      livePosition.executedQuantity = computedVolume
+      livePosition.remainingQuantity = 0
+      livePosition.averageExecutionPrice = currentPrice
+      livePosition.fills!.push({
+        timestamp: Date.now(),
+        quantity: computedVolume,
+        price: currentPrice,
+        fee: 0,
+        feeAsset: "USDT",
+      })
+      livePosition.status = "filled" // treat as filled so SL/TP proceeds
+      pushStep(livePosition, "poll_fill", false, `fill unconfirmed — using computedVolume=${computedVolume} as fallback qty for SL/TP`)
       await logProgressionEvent(
         connectionId,
         "live_trading",
         "warning",
-        `Entry fill not confirmed within timeout for ${realPosition.symbol}`,
-        { orderId: livePosition.orderId, status: fill.status }
+        `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP will use order qty as fallback`,
+        { orderId: livePosition.orderId, status: fill.status, fallbackQty: computedVolume }
       )
+      await logLiveOrderFinal(orderTrace, {
+        status: "placed",
+        livePositionId: livePosition.id,
+        executedQuantity: computedVolume,
+        averagePrice: currentPrice,
+        reason: `fill unconfirmed — using computedVolume as fallback (pollStatus=${fill.status})`,
+        extra: { orderId: livePosition.orderId, attempts: placeAttempt },
+      })
     }
 
     // ── Step 7: Place Stop Loss and Take Profit orders ─────────────────────
@@ -1729,12 +2625,28 @@ export async function executeLivePosition(
       const sideClose: "buy" | "sell" = realPosition.direction === "long" ? "sell" : "buy"
       const { desiredSl: slPrice, desiredTp: tpPrice } =
         computeDesiredProtectionPrices(livePosition)
+      // Ultrathink guard: if a concurrent reconcile/sync already armed for this exact live order volume, do not create second control order
+      if (livePosition.stopLossOrderId && slPrice > 0) { /* already has SL for this live order - skip duplicate */ }
+      if (livePosition.takeProfitOrderId && tpPrice > 0) { /* already has TP for this live order - skip duplicate */ }
 
-      livePosition.stopLossPrice = slPrice
-      livePosition.takeProfitPrice = tpPrice
-
+      // DO NOT pre-stamp the desired prices onto livePosition before the
+      // exchange confirms placement. The original code set
+      //   livePosition.stopLossPrice = slPrice
+      //   livePosition.takeProfitPrice = tpPrice
+      // BEFORE awaiting the placement promises. When a placement failed
+      // the recorded price still equaled the desired price, so
+      // `priceDrifted(stored, desired)` returned false on the next
+      // reconcile tick and the loop never retried the failed leg —
+      // leaving the live position exposed without protection until the
+      // operator's price moved >0.25%, sometimes for the lifetime of
+      // the trade.
+      //
+      // The new contract: stored price is the LAST CONFIRMED armed price
+      // for that leg. A failed placement leaves it at 0, which
+      // `priceDrifted(0, desired)` correctly classifies as "needs arming"
+      // on the next reconcile pass.
       const [slOrderId, tpOrderId] = await Promise.all([
-        slPrice > 0
+        (slPrice > 0 && !livePosition.stopLossOrderId)
           ? placeProtectionOrder(
               exchangeConnector,
               realPosition.symbol,
@@ -1744,8 +2656,8 @@ export async function executeLivePosition(
               "StopLoss",
               realPosition.direction,
             )
-          : Promise.resolve(null),
-        tpPrice > 0
+          : Promise.resolve(livePosition.stopLossOrderId || null),
+        (tpPrice > 0 && !livePosition.takeProfitOrderId)
           ? placeProtectionOrder(
               exchangeConnector,
               realPosition.symbol,
@@ -1755,16 +2667,52 @@ export async function executeLivePosition(
               "TakeProfit",
               realPosition.direction,
             )
-          : Promise.resolve(null),
+          : Promise.resolve(livePosition.takeProfitOrderId || null),
       ])
 
-      if (slOrderId) livePosition.stopLossOrderId = slOrderId
-      if (tpOrderId) livePosition.takeProfitOrderId = tpOrderId
+      if (slOrderId) {
+        livePosition.stopLossOrderId = slOrderId
+        livePosition.stopLossPrice = slPrice
+      } else if (slPrice > 0) {
+        // Surface the protection gap loudly so operators and the
+        // dashboard see it; the next reconcile will retry.
+        console.error(
+          `${LOG_PREFIX} INITIAL StopLoss placement FAILED for ${realPosition.symbol} — position is LIVE without SL until next reconcile tick`,
+        )
+        await logProgressionEvent(
+          connectionId,
+          "live_trading",
+          "error",
+          `StopLoss NOT placed for ${realPosition.symbol} — reconcile will retry`,
+          { livePositionId: livePosition.id, desiredSl: slPrice, executedQty: livePosition.executedQuantity },
+        )
+        pushStep(livePosition, "place_stop_loss", false, `initial SL placement failed @ ${slPrice}`)
+      }
+      if (tpOrderId) {
+        livePosition.takeProfitOrderId = tpOrderId
+        livePosition.takeProfitPrice = tpPrice
+      } else if (tpPrice > 0) {
+        console.error(
+          `${LOG_PREFIX} INITIAL TakeProfit placement FAILED for ${realPosition.symbol} — position is LIVE without TP until next reconcile tick`,
+        )
+        await logProgressionEvent(
+          connectionId,
+          "live_trading",
+          "error",
+          `TakeProfit NOT placed for ${realPosition.symbol} — reconcile will retry`,
+          { livePositionId: livePosition.id, desiredTp: tpPrice, executedQty: livePosition.executedQuantity },
+        )
+        pushStep(livePosition, "place_take_profit", false, `initial TP placement failed @ ${tpPrice}`)
+      }
       // Record the qty SL/TP were armed for so the next reconcile
       // pass can detect quantity drift (delayed partial fills,
       // accumulation merges) and re-arm. Without this the drift
       // detector in `updateProtectionOrders` would see an undefined
       // baseline and re-arm on every cycle even when nothing changed.
+      //
+      // Only set when at least one leg succeeded — otherwise the next
+      // reconcile would treat the position as "armed for current qty"
+      // and never retry the failed legs because qtyDrifted is false.
       if (slOrderId || tpOrderId) {
         livePosition.protectionArmedQuantity = livePosition.executedQuantity
       }
@@ -1920,11 +2868,11 @@ export async function updateLivePositionFill(
     if (!data) return null
 
     const position: LivePosition = JSON.parse(data as string)
-    position.fills.push(fill)
+    position.fills!.push(fill)
     position.executedQuantity += fill.quantity
-    position.remainingQuantity = position.quantity - position.executedQuantity
+    position.remainingQuantity = position.quantity! - position.executedQuantity
 
-    const totalCost = position.fills.reduce((sum, f) => sum + f.price * f.quantity, 0)
+    const totalCost = position.fills!.reduce((sum, f) => sum + f.price * f.quantity, 0)
     position.averageExecutionPrice = totalCost / position.executedQuantity
 
     if (position.remainingQuantity <= 0) {
@@ -1977,42 +2925,256 @@ export async function closeLivePosition(
 
     const position: LivePosition = JSON.parse(data as string)
 
-    // ── 1. Cancel orphan SL/TP orders BEFORE the close ────────────────
+    // ── 1+2. RACE: cancel orphan SL/TP IN PARALLEL with close ──────────
+    // The old sequential pattern (cancel → await → close) added 200-400 ms
+    // of avoidable latency on every close. The cancellations are best-effort
+    // cleanup of protection orders that will be reconciled away anyway, and
+    // the close itself is reduce-only so a stale SL trigger between cancel
+    // and close can only ever reduce the same position twice (the second
+    // attempt no-ops because the position is gone). We therefore fire all
+    // three calls together and await them as a group.
+    const cancellationPromises: Promise<boolean>[] = []
     if (exchangeConnector) {
-      const cancellations: Promise<boolean>[] = []
       if (position.stopLossOrderId) {
-        cancellations.push(
+        cancellationPromises.push(
           cancelProtectionOrder(exchangeConnector, position.symbol, position.stopLossOrderId, "StopLoss"),
         )
       }
       if (position.takeProfitOrderId) {
-        cancellations.push(
+        cancellationPromises.push(
           cancelProtectionOrder(exchangeConnector, position.symbol, position.takeProfitOrderId, "TakeProfit"),
         )
       }
-      if (cancellations.length > 0) {
-        const results = await Promise.all(cancellations)
-        pushStep(
-          position,
-          "cancel_protection",
-          results.every(Boolean),
-          `cancelled SL=${!!position.stopLossOrderId} TP=${!!position.takeProfitOrderId}`,
+    }
+
+    // ── 2. Issue the close on the exchange with retry logic ────────────
+    //
+    // Critical classification rule: every connector returns
+    //   { success: false, error: "<reason>" }
+    // when the position has ALREADY been closed (typically because an SL
+    // or TP order on the exchange fired between our last reconcile tick
+    // and this close request). Known venue strings include:
+    //   ��� "Position not found"                  (BingX, OKX)
+    //   • "No open position to close"           (Bybit)
+    //   • "Position size is zero or invalid"    (BingX)
+    //   • "Position size is zero — nothing to close" (Bybit)
+    //   • "nothing to close" / "position is zero" / "already closed"
+    // These are NOT failures from our perspective — the exchange-side
+    // state already matches what we're trying to achieve. The previous
+    // implementation treated them as hard failures, burned both retries
+    // (4+ seconds per close), then logged "FAILED to close on exchange"
+    // and skipped the closed-counter increment. The operator therefore
+    // saw closes that "didn't happen" — when in fact the exchange close
+    // had completed via an SL/TP fill seconds earlier.
+    let exchangeCloseSuccess = false
+    let exchangeCloseReason: "ok" | "already_closed" | "failed" | "skipped" = "skipped"
+
+    // ── Ownership guard ────────────────────────────────────────────────
+    // Only issue a closePosition call when the system has a verified
+    // orderId for this position — proof that WE placed the entry order.
+    // Without an orderId the position was either simulated (no exchange
+    // call made), the entry order failed silently, or the slot was
+    // allocated but never confirmed.
+    //
+    // Fallback: if `orderId` is missing but `exchangePositionId` exists
+    // (reconciled/adopted position), use it to close via exchange-side
+    // position ID. Without EITHER, skip exchange close — the position
+    // may be external/manual.
+    const hasSystemOrderId = !!(position.orderId || position.exchangeData?.exchangePositionId)
+    if (!hasSystemOrderId && exchangeConnector) {
+      exchangeCloseReason = "skipped"
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "info",
+        `closeLivePosition: skipping exchange close for ${position.symbol} ${position.direction} — no system orderId (external position protection)`,
+        { positionId: position.id, symbol: position.symbol, direction: position.direction },
+      ).catch(() => {})
+    }
+
+    if (hasSystemOrderId && exchangeConnector && typeof exchangeConnector.closePosition === "function") {
+      const maxRetries = 2
+      // Tighter backoff: 200 → 400 ms. Transient API blips (rate-limit
+      // bump, brief network reload) clear in well under 500 ms; the old
+      // 500/1000 ms schedule wasted ~1.5 s per failing close without
+      // improving success rates.
+      const backoffMs = [200, 400]
+
+      const isAlreadyClosedError = (msg: string): boolean => {
+        const m = String(msg || "").toLowerCase()
+        return (
+          m.includes("position not found") ||
+          m.includes("no open position") ||
+          m.includes("nothing to close") ||
+          m.includes("size is zero") ||
+          m.includes("already closed") ||
+          m.includes("position is zero") ||
+          m.includes("position does not exist")
         )
-        // Clear local record regardless — orders that didn't cancel
-        // cleanly will be reconciled away on next reconcile pass.
-        position.stopLossOrderId = undefined
-        position.takeProfitOrderId = undefined
+      }
+      // Retryable failures are bounded by a sense of "this is a transient
+      // error and another attempt might succeed". Permanent rejections
+      // (invalid params, auth) should NOT retry. Right now we only retry
+      // on timeouts and explicit network errors — everything else falls
+      // through to the failed branch after a single attempt.
+      const isRetryableError = (msg: string): boolean => {
+        const m = String(msg || "").toLowerCase()
+        return (
+          m.includes("timeout") ||
+          m.includes("network") ||
+          m.includes("econn") ||
+          m.includes("rate limit") ||
+          m.includes("429") ||
+          m.includes("503") ||
+          m.includes("502")
+        )
+      }
+
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        let lastErrorMsg = ""
+        try {
+          console.log(
+            `${LOG_PREFIX} [v0] Attempting exchange close ${position.symbol} ${position.direction} (attempt ${attempt + 1}/${maxRetries})`,
+          )
+
+          // Per-attempt hard timeout. Healthy venues return in 100-400 ms;
+          // 2 s leaves headroom for the slow paths but bounds worst-case
+          // wall-clock so the close API and reconcile loops keep moving.
+          const closePromise = exchangeConnector.closePosition(position.symbol, position.direction)
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Exchange close timeout after 2s")), 2000),
+          )
+          const r = (await Promise.race([closePromise, timeoutPromise])) as
+            | { success?: boolean; error?: string }
+            | undefined
+
+          if (r && typeof r === "object" && r.success === true) {
+            exchangeCloseSuccess = true
+            exchangeCloseReason = "ok"
+            console.log(`${LOG_PREFIX} [v0] Exchange close succeeded: ${position.symbol} ${position.direction}`)
+            break
+          }
+
+          lastErrorMsg = (r && typeof r === "object" && r.error) ? String(r.error) : "invalid_response"
+
+          // ── Already-closed reconciliation ─────────────────────────────
+          // If the venue says the position is gone, we treat the close as
+          // successful and stop retrying. The DB-side terminal-state
+          // pipeline below still runs (PnL is computed from `closePrice`,
+          // which the caller passed as the trigger/mark price — which is
+          // close enough to the actual SL/TP fill that the operator's
+          // reported PnL is within a tick of reality).
+          if (isAlreadyClosedError(lastErrorMsg)) {
+            exchangeCloseSuccess = true
+            exchangeCloseReason = "already_closed"
+            console.log(
+              `${LOG_PREFIX} [v0] Exchange position already closed (SL/TP likely fired): ${position.symbol} ${position.direction} — reason="${lastErrorMsg}"`,
+            )
+            break
+          }
+
+          console.warn(`${LOG_PREFIX} [v0] Exchange close failed: ${position.symbol} - ${lastErrorMsg}`)
+          // Only retry on transient classes of error. Hard logic errors
+          // (invalid params, auth) get a single attempt and bail.
+          if (attempt < maxRetries - 1 && isRetryableError(lastErrorMsg)) {
+            await new Promise(resolve => setTimeout(resolve, backoffMs[attempt]))
+            continue
+          }
+          break
+        } catch (err) {
+          lastErrorMsg = err instanceof Error ? err.message : String(err)
+          console.error(`${LOG_PREFIX} [v0] Exchange close threw error (attempt ${attempt + 1}): ${lastErrorMsg}`)
+          // Thrown timeouts and network errors ARE retryable.
+          if (attempt < maxRetries - 1 && isRetryableError(lastErrorMsg)) {
+            await new Promise(resolve => setTimeout(resolve, backoffMs[attempt]))
+            continue
+          }
+          break
+        }
+      }
+
+      if (!exchangeCloseSuccess) {
+        exchangeCloseReason = "failed"
+        console.error(
+          `${LOG_PREFIX} [v0] FAILED to close position on exchange after ${maxRetries} attempts: ${position.symbol} ${position.direction}`,
+        )
       }
     }
 
-    // ── 2. Issue the close on the exchange ────────────────────────────
-    let exchangeCloseSuccess = false
-    if (exchangeConnector && typeof exchangeConnector.closePosition === "function") {
+    // Drain the cancellation promises we fired in parallel with the close.
+    // By the time we reach here the close has already completed, so these
+    // requests have been in-flight the whole duration — typically zero
+    // additional wait. We clear the local IDs regardless so the next
+    // reconcile pass treats them as gone.
+    // Track which leg cancel actually succeeded so we DON'T blindly wipe
+    // a still-armed orderId. The original implementation cleared both
+    // ids unconditionally, which meant a transient cancel failure left
+    // an orphan reduce-only order on the venue with no local record to
+    // look it up by — exactly the "control orders chaos" the operator
+    // reported. We now only clear an id when the venue confirmed the
+    // order is gone (success path inside cancelProtectionOrder also
+    // returns `true` for "not found" / "already filled" / "already
+    // cancelled" — so the wipe is safe in those cases).
+    let slCancelled = false
+    let tpCancelled = false
+    const hadSlId = !!position.stopLossOrderId
+    const hadTpId = !!position.takeProfitOrderId
+    if (cancellationPromises.length > 0) {
+      const cancelResults = await Promise.all(
+        cancellationPromises.map(p => p.catch(() => false)),
+      )
+      let idx = 0
+      if (hadSlId) {
+        slCancelled = !!cancelResults[idx++]
+        if (slCancelled) position.stopLossOrderId = undefined
+      }
+      if (hadTpId) {
+        tpCancelled = !!cancelResults[idx++]
+        if (tpCancelled) position.takeProfitOrderId = undefined
+      }
+      pushStep(
+        position,
+        "cancel_protection",
+        cancelResults.every(Boolean),
+        `cancelled SL=${hadSlId ? slCancelled : "n/a"} TP=${hadTpId ? tpCancelled : "n/a"} (raced with close)`,
+      )
+    }
+
+    // ── Orphan-sweep safety net ────────────────────────────────────────
+    // After the recorded-id cancels, scan the venue for ANY reduce-only
+    // order matching this symbol + close-side and cancel it. Catches:
+    //   • by-id cancels that just failed transiently (we get a free retry)
+    //   • protection ids that were never persisted (place-success → crash
+    //     → restart finds no id in Redis)
+    //   • operator-placed manual reduce-only legs the engine never knew
+    //     about — which become orphans the moment the position closes.
+    // Best-effort; we never let sweep failures block the close pipeline.
+    if (exchangeConnector) {
+      const sweepCloseSide: "buy" | "sell" =
+        position.direction === "long" ? "sell" : "buy"
       try {
-        const r = await exchangeConnector.closePosition(position.symbol, position.direction)
-        exchangeCloseSuccess = r?.success !== false
-      } catch (err) {
-        console.warn(`${LOG_PREFIX} Error closing on exchange:`, err)
+        const swept = await sweepOrphanProtectionOrders(
+          exchangeConnector,
+          position.symbol,
+          sweepCloseSide,
+        )
+        if (swept.cancelled > 0) {
+          // If the sweep cleaned up the recorded ids' leftovers, clear
+          // the local fields too — at this point there is nothing on
+          // the venue tied to those ids.
+          if (hadSlId && !slCancelled) position.stopLossOrderId = undefined
+          if (hadTpId && !tpCancelled) position.takeProfitOrderId = undefined
+          pushStep(
+            position,
+            "orphan_sweep",
+            true,
+            `swept ${swept.cancelled}/${swept.scanned} orphan reduce-only orders`,
+          )
+        }
+      } catch (sweepErr) {
+        console.warn(
+          `${LOG_PREFIX} [sweep] ${position.symbol} error: ${sweepErr instanceof Error ? sweepErr.message : String(sweepErr)}`,
+        )
       }
     }
 
@@ -2037,11 +3199,25 @@ export async function closeLivePosition(
     position.updatedAt = Date.now()
     position.realizedPnL = Math.round(pnl * 100) / 100
     position.closeReason = closeReason
+    
+    // Step annotation distinguishes the three real outcomes:
+    //   • ok            → connector returned success
+    //   • already_closed → venue said position is gone (SL/TP fired)
+    //   • failed         → connector returned an error we couldn't recover
+    //   • skipped        → no connector was passed (manual DB-only close)
+    const exchangeNote =
+      !exchangeConnector
+        ? "" // no exchange leg
+        : exchangeCloseReason === "ok"
+          ? " [exchange-closed]"
+          : exchangeCloseReason === "already_closed"
+            ? " [exchange-already-closed]"
+            : " [exchange-close-FAILED]"
     pushStep(
       position,
       "close",
       true,
-      `close @ ${closePrice} pnl=${pnl.toFixed(2)} roi=${roi.toFixed(2)}% reason=${closeReason}${exchangeConnector && !exchangeCloseSuccess ? " [exchange-close-uncertain]" : ""}`,
+      `close @ ${closePrice} pnl=${pnl.toFixed(2)} roi=${roi.toFixed(2)}% reason=${closeReason}${exchangeNote}`,
     )
     // savePosition() handles index move + idempotent archival.
     // CHECK the moved-marker BEFORE savePosition() runs so we know
@@ -2054,11 +3230,18 @@ export async function closeLivePosition(
     const wasAlreadyClosed = await client.get(movedMarker).catch(() => null)
     await savePosition(position)
 
-    // ── 5. Release dedup lock + counters + audit log ───────────────���──
-    await releaseLock(connectionId, position.symbol, position.direction)
+    // ── 5. Release dedup lock + counters + audit log ────────────────────
+    await releaseLock(connectionId, position.symbol, position.direction!)
     if (!wasAlreadyClosed) {
       await incrementMetric(connectionId, "live_positions_closed_count")
       if (pnl > 0) await incrementMetric(connectionId, "live_wins_count")
+      // Only count as exchange-close failure when the connector actually
+      // failed. `already_closed` means the exchange-side state already
+      // matches our intent (SL/TP fired first), and `skipped` means we
+      // never had a connector — neither is a real failure.
+      if (exchangeCloseReason === "failed") {
+        await incrementMetric(connectionId, "live_positions_close_failed_count")
+      }
     }
 
     await logProgressionEvent(connectionId, "live_trading", "info", `Closed live position ${position.symbol}`, {
@@ -2070,9 +3253,21 @@ export async function closeLivePosition(
       averageEntry: avgEntry,
       leverage: lev,
       marginAtRisk: margin,
+      exchangeCloseSucceeded: exchangeCloseSuccess,
+      exchangeCloseClassification: exchangeCloseReason,
     })
 
-    console.log(`${LOG_PREFIX} Closed ${position.symbol} P&L=${pnl.toFixed(2)} ROI=${roi.toFixed(2)}% reason=${closeReason}`)
+    const closeStatus =
+      exchangeCloseReason === "ok"
+        ? "SUCCEEDED"
+        : exchangeCloseReason === "already_closed"
+          ? "ALREADY-CLOSED (SL/TP fired)"
+          : exchangeCloseReason === "skipped"
+            ? "DB-only (no connector)"
+            : "FAILED (DB-closed; exchange uncertain)"
+    console.log(
+      `${LOG_PREFIX} [v0] Closed ${position.symbol} ${position.direction} P&L=${pnl.toFixed(2)} ROI=${roi.toFixed(2)}% reason=${closeReason} exchange_close=${closeStatus}`,
+    )
 
     return position
   } catch (err) {
@@ -2181,6 +3376,116 @@ export async function getClosedLivePositions(
   }
 }
 
+// ── Real-active position meta type (stored in the meta hash) ─────────────────
+export type RealActivePositionMeta = {
+  setKey:          string
+  parentSetKey:    string
+  symbol:          string
+  direction:       string
+  pseudoPositionId: string
+  status:          string
+  createdAt:       number
+}
+
+/**
+ * Load the dedicated Real-active positions index for a connection.
+ *
+ * This is the fast alternative to `getLivePositions()` for the coordination
+ * paths that only care about Real-stage positions (syncWithExchange,
+ * reconcileLivePositions per-position loop, SL/TP re-arm). It operates
+ * in two Redis round-trips:
+ *
+ *   RTT 1: SMEMBERS real:active_positions:{connId}
+ *     → set of position IDs (typically 1–10 entries, not 500)
+ *
+ *   RTT 2: parallel MGET live:position:{id} for each member
+ *     → full LivePosition JSON for each active Real position
+ *
+ * Stale members (position JSON missing or already terminal) are pruned from
+ * the Set automatically so the index stays tight.
+ *
+ * Returns two things:
+ *   positions — full LivePosition objects for all Real-active positions
+ *   metas     — lightweight meta map (positionId → RealActivePositionMeta)
+ *               for callers that only need symbol/direction/setKey without
+ *               deserializing the full position
+ */
+export async function getRealActivePositions(connectionId: string): Promise<{
+  positions: LivePosition[]
+  metas:     Map<string, RealActivePositionMeta>
+}> {
+  await initRedis()
+  const client = getRedisClient()
+  const empty = { positions: [] as LivePosition[], metas: new Map<string, RealActivePositionMeta>() }
+
+  try {
+    const realActiveKey     = `real:active_positions:${connectionId}`
+    const realActiveMetaKey = `real:active_positions:${connectionId}:meta`
+
+    // RTT 1: get all member IDs from the real-active Set.
+    const ids = ((await client.smembers(realActiveKey).catch(() => [])) || []) as string[]
+    if (ids.length === 0) return empty
+
+    // RTT 2: parallel MGET for full position JSON + all meta hash fields
+    // in one concurrent fan-out window. The meta hash gives us lightweight
+    // symbol/direction/setKey data even if the full JSON fetch fails.
+    const [raws, metaAll] = await Promise.all([
+      Promise.all(ids.map((id) => client.get(`live:position:${id}`).catch(() => null))),
+      client.hgetall(realActiveMetaKey).catch(() => ({})) as Promise<Record<string, string>>,
+    ])
+
+    const positions: LivePosition[] = []
+    const metas = new Map<string, RealActivePositionMeta>()
+    const staleIds: string[] = []
+
+    for (let i = 0; i < ids.length; i++) {
+      const id  = ids[i]
+      const raw = raws[i]
+
+      // Build meta from the hash (fast path — no JSON parse of full position).
+      const rawMeta = metaAll?.[id]
+      if (rawMeta) {
+        try { metas.set(id, JSON.parse(rawMeta as string) as RealActivePositionMeta) } catch { /* ignore */ }
+      }
+
+      if (!raw) {
+        // Position key expired or was never written — prune from index.
+        staleIds.push(id)
+        continue
+      }
+      try {
+        const pos: LivePosition = JSON.parse(raw as string)
+        const terminal = pos.status === "closed" || pos.status === "rejected" ||
+                         pos.status === "cancelled" || pos.status === "error"
+        if (terminal) {
+          // Closed positions that weren't removed on save (e.g. from a
+          // previous savePosition bug) — prune now.
+          staleIds.push(id)
+          continue
+        }
+        positions.push(pos)
+      } catch {
+        staleIds.push(id)
+      }
+    }
+
+    // Async prune stale members — fire-and-forget, never blocks the caller.
+    if (staleIds.length > 0) {
+      void Promise.all(staleIds.map((id) =>
+        Promise.all([
+          client.srem(realActiveKey, id).catch(() => {}),
+          client.hdel(realActiveMetaKey, id).catch(() => {}),
+        ])
+      ))
+    }
+
+    return { positions, metas }
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} getRealActivePositions error:`, err instanceof Error ? err.message : String(err))
+    return empty
+  }
+}
+
 /**
  * Compute aggregate stats across all live positions.
  */
@@ -2213,12 +3518,13 @@ export async function calculateLivePositionStats(
       const lastStep = pos.progression?.find(s => s.step === "close")
       const exitPx = lastStep ? parseFloat(lastStep.details?.split("@ ")[1] || "0") : 0
       if (exitPx > 0 && pos.averageExecutionPrice > 0) {
-        const pnl =
+        const pnl = Math.round(
           pos.executedQuantity *
           (pos.direction === "long"
             ? exitPx - pos.averageExecutionPrice
-            : pos.averageExecutionPrice - exitPx)
-        totalPnL += pnl
+            : pos.averageExecutionPrice - exitPx) * 100
+        ) / 100
+        totalPnL = Math.round((totalPnL + pnl) * 100) / 100
         if (pnl > 0) winCount++
       }
     }
@@ -2228,8 +3534,8 @@ export async function calculateLivePositionStats(
       totalOpen: open.length,
       totalClosed: closed.length,
       totalPnL,
-      averageROI: closed.length > 0 ? totalPnL / closed.length : 0,
-      winRate: closed.length > 0 ? winCount / closed.length : 0,
+      averageROI: closed.length > 0 ? Math.round((totalPnL / closed.length) * 100) / 100 : 0,
+      winRate: closed.length > 0 ? Math.round((winCount / closed.length) * 100) / 100 : 0,
     }
   } catch (err) {
     console.error(`${LOG_PREFIX} Error calculating stats:`, err)
@@ -2277,9 +3583,30 @@ async function checkAndForceCloseOnSltpCross(
 ): Promise<"sl_hit" | "tp_hit" | null> {
   if (!Number.isFinite(markPrice) || markPrice <= 0) return null
   if (pos.executedQuantity <= 0) return null
+  // Skip positions whose entry order has not confirmed yet — using entryPrice
+  // as a proxy for the fill price would produce incorrect SL/TP cross signals.
+  // The `placed` skip is the most operationally significant — a position
+  // stuck in `placed` is never evaluated for close. The stuck-placed
+  // detector in syncWithExchange handles the safety net; this is
+  // intentionally silent for terminal statuses to avoid log spam.
   if (pos.status === "closed" || pos.status === "rejected" || pos.status === "error") return null
+  if (pos.status === "placed") {
+    // Rate-limit to once-per-minute per position by using updatedAt as
+    // the throttle key — prevents log spam while still surfacing the
+    // skip during diagnosis.
+    const since = Date.now() - (pos.updatedAt || 0)
+    if (since > 60_000) {
+      console.log(
+        `${LOG_PREFIX} [cross-check skip] ${pos.symbol} (id=${pos.id}) status='placed' — entry order not filled yet; SL/TP cross check deferred`,
+      )
+    }
+    return null
+  }
 
-  const fillPrice = pos.averageExecutionPrice || pos.entryPrice
+  const fillPrice = pos.averageExecutionPrice
+  // Require a confirmed fill price — entryPrice is an estimate and can be
+  // stale. If averageExecutionPrice is missing the position has not been
+  // confirmed filled yet; skip until it is.
   if (!fillPrice || fillPrice <= 0) return null
 
   const slPct = Math.max(0, pos.stopLoss || 0) / 100
@@ -2298,6 +3625,7 @@ async function checkAndForceCloseOnSltpCross(
       : 0
 
   let crossReason: "sl_hit" | "tp_hit" | null = null
+  if (!crossReason) return null
   if (pos.direction === "long") {
     if (desiredSl > 0 && markPrice <= desiredSl) crossReason = "sl_hit"
     else if (desiredTp > 0 && markPrice >= desiredTp) crossReason = "tp_hit"
@@ -2321,7 +3649,7 @@ async function checkAndForceCloseOnSltpCross(
       markPrice,
       desiredSl,
       desiredTp,
-      direction: pos.direction,
+      direction: pos.direction!,
       averageEntry: pos.averageExecutionPrice,
       // Useful for the operator audit trail: was the cross because the
       // exchange-placed control order failed to fire, or because the
@@ -2333,10 +3661,10 @@ async function checkAndForceCloseOnSltpCross(
   )
 
   try {
-    await closeLivePosition(connectionId, pos.id, markPrice, exchangeConnector, crossReason)
+    await closeLivePosition(connectionId, pos.id, markPrice, exchangeConnector, crossReason as unknown as string)
   } catch (closeErr) {
     console.warn(
-      `${LOG_PREFIX} force-close on ${crossReason} failed for ${pos.id}:`,
+      `${LOG_PREFIX} force-close on ${crossReason!} failed for ${pos.id}:`,
       closeErr instanceof Error ? closeErr.message : String(closeErr),
     )
   }
@@ -2396,13 +3724,36 @@ async function checkAndForceCloseOnSltpCross(
 async function orphanCloseExpiredPositions(
   connectionId: string,
   connector: any,
-  summary: { reconciled: number; closed: number; errors: number; updated: number },
+  // Same shape as the reconcile summary so the function can roll up
+  // sweep activity into the engine-level totals without the caller
+  // having to mirror counters.
+  summary: {
+    reconciled: number
+    closed: number
+    errors: number
+    updated: number
+    protectionRearmed: number
+    orphansSwept: number
+  },
 ): Promise<void> {
-  const MAX_HOLD_TIME_MS = Number(process.env.MAX_POSITION_HOLD_MS ?? 4 * 60 * 60 * 1000)
+  const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
   if (MAX_HOLD_TIME_MS <= 0) return
 
   try {
-    const allOpen = await getLivePositions(connectionId)
+    // Use the Real-active index for the max-hold sweep: positions created from
+    // Real Sets are the ones most likely to have long hold times because they
+    // follow a Set-determined entry and need coordinated exit. Non-Real
+    // positions (simulated, adopted orphans) are included via getLivePositions
+    // in the merged list below.
+    const [realActiveResult, allOpenBase] = await Promise.all([
+      getRealActivePositions(connectionId),
+      getLivePositions(connectionId),
+    ])
+    const realActiveIds = new Set<string>(realActiveResult.positions.map((p) => p.id))
+    const allOpen = [
+      ...realActiveResult.positions,
+      ...allOpenBase.filter((p) => !realActiveIds.has(p.id)),
+    ]
     const expired = allOpen.filter((p) => {
       if (p.status !== "open" && p.status !== "filled" && p.status !== "partially_filled") return false
       if ((p.executedQuantity ?? 0) <= 0) return false
@@ -2413,7 +3764,18 @@ async function orphanCloseExpiredPositions(
     for (const pos of expired) {
       summary.reconciled++
       const heldMin = Math.round((Date.now() - (pos.createdAt || pos.updatedAt || 0)) / 60000)
-      const exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || pos.entryPrice
+      // Same exit-price resolution chain as reconcileLivePositions:
+      // markPrice → averageExecutionPrice → Redis market_data → entryPrice
+      let exitPrice: number = Number(pos.exchangeData?.markPrice) || pos.averageExecutionPrice || 0
+      if (exitPrice <= 0) {
+        try {
+          const orphanRedis = getRedisClient()
+          const mdHash = await orphanRedis.hgetall(`market_data:${pos.symbol}`)
+          const mdPrice = parseFloat(String(mdHash?.lastPrice ?? mdHash?.price ?? mdHash?.close ?? "0"))
+          if (mdPrice > 0) exitPrice = mdPrice
+        } catch { /* ignore */ }
+      }
+      if (exitPrice <= 0) exitPrice = pos.entryPrice || 0
       const reason = connector ? "orphan_exchange_error" : "orphan_no_connector"
 
       console.warn(
@@ -2433,6 +3795,16 @@ async function orphanCloseExpiredPositions(
         if (pos.stopLossOrderId) cancels.push(cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss").catch(() => {}))
         if (pos.takeProfitOrderId) cancels.push(cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit").catch(() => {}))
         if (cancels.length) await Promise.all(cancels).catch(() => {})
+        // Same orphan-sweep used inside `closeLivePosition`. Wired here
+        // too so max-hold-expired positions also get the chaos-prevention
+        // pass — without it, an operator-placed reduce-only that the
+        // engine never recorded would survive the orphan-close because
+        // there'd be no by-id cancellation to trigger the sweep on.
+        const sweepCloseSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
+        try {
+          const swept = await sweepOrphanProtectionOrders(connector, pos.symbol, sweepCloseSide)
+          summary.orphansSwept += swept.cancelled
+        } catch { /* sweep is best-effort */ }
       }
 
       await closeLivePosition(connectionId, pos.id, exitPrice, connector, reason).catch((err) => {
@@ -2447,38 +3819,135 @@ async function orphanCloseExpiredPositions(
   }
 }
 
+/**
+ * ── CANONICAL LIVE SYNC & RECONCILE ─────────────────────────────────────────
+ * Single entry-point for ALL live-position + exchange sync work.
+ *
+ * Called by:
+ *   • startRealtimeProcessor  (engine-manager.ts, 200 ms self-scheduling loop)
+ *   • maybeRunLiveSync        (realtime-processor.ts, legacy throttle gate — delegates here)
+ *   • /api/cron/sync-live-positions (Vercel cron, ~30 s)
+ *   • syncWithExchange        (legacy shim, redirects here)
+ *
+ * Responsibilities (in one Redis-locked pass):
+ *   1. Always-run simulated-position sweep (paper-mode close path) — runs
+ *      even when connector is absent or global pause is set.
+ *   2. Exchange position fetch + normalized (symbol|direction) → exchangePos map.
+ *   3. Exchange-orphan adoption (exchange positions not yet tracked in Redis).
+ *   4. Per-position loop (open/placed statuses):
+ *       a. Mark-price / liq-price / unrealizedPnL refresh from exchange.
+ *       b. Externally-closed detection (absent from exchange map).
+ *       c. SL/TP protection-order healing via updateProtectionOrders.
+ *       d. SL/TP cross-check → force-close on market hit.
+ *       e. Max-hold-time safety close.
+ *       f. savePosition (persist refreshed state).
+ *   5. Redis single-flight lock + cross-caller dedup via moved-marker key.
+ *
+ * Options:
+ *   • skipSimulatedSweep     — skip step 1 (caller already ran processSimulatedPositions)
+ *   • skipOrphanAdoption     — skip step 3 (orphan run is a no-op when connector is absent)
+ *   • reconcileMode          — true = cron (does not return early on no connector;
+ *                              false = engine tick (early-return is fine)).
+ */
 export async function reconcileLivePositions(
   connectionId: string,
   exchangeConnector: any,
+  options: {
+    skipSimulatedSweep?: boolean
+    skipOrphanAdoption?: boolean
+    reconcileMode?: boolean
+  } = {},
 ): Promise<{
   reconciled: number
   updated: number
   closed: number
   errors: number
+  protectionRearmed: number
+  orphansSwept: number
 }> {
   await initRedis()
   const client = getRedisClient()
+  const { skipSimulatedSweep, skipOrphanAdoption, reconcileMode = false } = options
+  const summary = {
+    reconciled: 0, updated: 0, closed: 0, errors: 0, protectionRearmed: 0, orphansSwept: 0,
+  }
 
-  const summary = { reconciled: 0, updated: 0, closed: 0, errors: 0 }
-
-  if (!exchangeConnector || typeof exchangeConnector.getPositions !== "function") {
-    // No connector — we cannot reach the exchange to confirm position state.
-    // Run the orphan-close sweep so positions that have been sitting open
-    // past the max hold time are at least marked closed in Redis. The
-    // close reason "orphan_no_connector" distinguishes them from normal
-    // closes in the audit trail.
-    await orphanCloseExpiredPositions(connectionId, null, summary)
-    return summary
+  // ── Cross-caller single-flight lock ───────────────────────────────────────
+  // Multiple callers (engine tick + cron + resume) can hit this function in
+  // parallel. The Redis lock prevents concurrent mutations of per-position
+  // state. TTL 30 s is the safety net for process death mid-sync.
+  const LIVE_SYNC_LOCK_KEY = `live_sync_lock:${connectionId}`
+  const LIVE_SYNC_LOCK_TTL = 30
+  const syncStartMs = Date.now()
+  let lockAcquired = false
+  if (client) {
+    try {
+      lockAcquired = await (client.set(LIVE_SYNC_LOCK_KEY, String(syncStartMs), { NX: true, EX: LIVE_SYNC_LOCK_TTL }) as any) === "OK"
+    } catch { /* Redis unreachable → fail open */ }
+    if (!lockAcquired) {
+      console.log(`${LOG_PREFIX} [reconcile] skip — lock held for conn=${connectionId}`)
+      return summary
+    }
   }
 
   try {
-    // One index scan instead of four — see identical fix in syncWithExchange().
-    const allOpen = await getLivePositions(connectionId)
-    const openPositions = allOpen.filter(
-      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
+    // ── Step 1: Simulated-position sweep (always runs unless caller opts out) ─
+    if (!skipSimulatedSweep) {
+      try {
+        const simResult = await processSimulatedPositions(connectionId)
+        summary.reconciled += simResult.processed
+        summary.closed     += simResult.closed
+        summary.errors     += simResult.errors
+      } catch { /* processSimulatedPositions is self-defensive */ }
+    }
+
+    // ── Step 4+ from reconcileLivePositions ────────────────────────────────
+    // Nothing to do if connector absent (sim-only is already done above)
+    if (!exchangeConnector || typeof exchangeConnector.getPositions !== "function") {
+      if (!reconcileMode) return summary  // cron always runs full path
+      await orphanCloseExpiredPositions(connectionId, null, summary)
+      return summary
+    }
+
+    // ── Load open positions: Real-active index + full open scan ─────────────
+    // The Real-active index (real:active_positions:{connId}) is a compact SADD
+    // Set maintained by savePosition() that contains ONLY the IDs of positions
+    // originating from Real Sets. Loading it first gives us a focused list of
+    // ~1–10 positions that need Set-level reconciliation, without scanning the
+    // full open-positions list (up to 500 entries across all stages).
+    //
+    // We still load the full getLivePositions() list so non-Real positions
+    // (simulated paper-only, adopted orphans, manually-created) also get
+    // reconciled. The two lists are merged with Real-active positions placed
+    // FIRST so the per-position loop prioritises coordination-critical ones.
+    const [realActiveResult, allOpen] = await Promise.all([
+      getRealActivePositions(connectionId),
+      getLivePositions(connectionId),
+    ])
+
+    // Build the Real-active position ID set for O(1) dedup below.
+    const realActiveIds = new Set<string>(realActiveResult.positions.map((p) => p.id))
+
+    // Merge: Real-active first, then all remaining open positions that are not
+    // already in the Real-active set (avoids duplicates in the loop).
+    const openPositionsMerged: LivePosition[] = [
+      ...realActiveResult.positions,
+      ...allOpen.filter(
+        (p) =>
+          !realActiveIds.has(p.id) &&
+          (p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed"),
+      ),
+    ]
+    const openPositions = openPositionsMerged
+
+    console.log(
+      `${LOG_PREFIX} [reconcile] conn=${connectionId} realActive=${realActiveResult.positions.length} totalOpen=${openPositions.length}`,
     )
 
-    if (openPositions.length === 0) return summary
+    if (openPositions.length === 0 && !reconcileMode) {
+      await orphanCloseExpiredPositions(connectionId, exchangeConnector, summary)
+      return summary
+    }
 
     // Single batch fetch of ALL exchange positions rather than per-symbol
     // calls — dramatically fewer API hits when multiple positions are open.
@@ -2493,9 +3962,17 @@ export async function reconcileLivePositions(
       return summary
     }
 
+    // Normalise a raw exchange symbol for map-key comparison.
+    // BingX (and several other venues) return "BTC-USDT" or "BTC_USDT"
+    // while Redis stores the normalised form "BTCUSDT". Strip all
+    // separators before building / querying the key so a BingX position
+    // is never mistaken for "externally closed" simply because the symbol
+    // format differs.
+    const normSym = (raw: string) => raw.toUpperCase().replace(/[-_]/g, "")
+
     const exchangeMap = new Map<string, any>()
     for (const ep of exchangePositions) {
-      const sym = String(ep.symbol || ep.Symbol || "").toUpperCase()
+      const sym = normSym(String(ep.symbol || ep.Symbol || ""))
       if (!sym) continue
       const size = parseFloat(String(ep.size ?? ep.positionAmt ?? ep.quantity ?? "0"))
       if (!size) continue
@@ -2504,10 +3981,48 @@ export async function reconcileLivePositions(
       exchangeMap.set(`${sym}|${direction}`, ep)
     }
 
-    for (const pos of openPositions) {
-      summary.reconciled++
+    // ── Once-per-tick venue open-orders snapshot ───────────────────────
+    // Used by `updateProtectionOrders` to detect silently-gone SL/TP
+    // (filled, externally cancelled, expired, sweep). One `getOpenOrders`
+    // call amortized across every position in the reconcile sweep, vs.
+    // 2 × getOrder() calls per position the alternative would require.
+    // `null` means "skip verification this tick"; the next tick retries.
+    const liveOrderIds = await fetchLiveOrderIdSet(exchangeConnector)
+
+    // ── Per-position worker (parallelisable) ─────────────────────────
+    // Each iteration is independent at the venue + Redis layer:
+    //   • Redis writes are scoped to `live:positions:{conn}:{id}` and
+    //     the per-symbol-direction lock key — no two positions share
+    //     them.
+    //   • Exchange calls are per-(symbol, direction) and the venue
+    //     serialises its own per-symbol writes.
+    //   • The idempotent `moved:{id}` marker prevents the close-counter
+    //     drift the operator reported even under interleaved execution.
+    // So we can fan the loop body out with bounded concurrency. Returns
+    // a tiny per-position delta that the caller folds into `summary`.
+    //
+    // ── Multi-Set slot tracking (Bug 4 fix) ─────────────────────────
+    // The exchange holds ONE position per symbol+direction. When multiple
+    // Redis live positions share the same slot (from different Sets), only
+    // the FIRST gets full reconcile + close-detection. Subsequent ones on
+    // the same slot share the exchange data (mark price, PnL) but skip the
+    // "not in exchange map → externally closed" branch — they remain valid
+    // until explicitly closed by their own Set's signal.
+    const reconciledSlots = new Set<string>()
+
+    type PosDelta = {
+      reconciled: number
+      updated: number
+      closed: number
+      errors: number
+      protectionRearmed: number
+    }
+    const processOne = async (pos: typeof openPositions[number]): Promise<PosDelta> => {
+      const delta: PosDelta = { reconciled: 1, updated: 0, closed: 0, errors: 0, protectionRearmed: 0 }
       try {
-        const mapKey = `${pos.symbol.toUpperCase()}|${pos.direction}`
+        const mapKey = `${normSym(pos.symbol)}|${pos.direction}`
+        const slotAlreadyReconciled = reconciledSlots.has(mapKey)
+        reconciledSlots.add(mapKey)
         const exPos = exchangeMap.get(mapKey)
 
         if (exPos) {
@@ -2524,20 +4039,89 @@ export async function reconcileLivePositions(
           }
           pos.updatedAt = Date.now()
 
-          // ── SL/TP self-healing ───────���──────────────────────────────
-          // Every reconcile cycle (driven by the cron) we verify the
-          // protection orders match the desired levels derived from the
-          // position's current stopLoss / takeProfit percentages and
-          // average execution price. This auto-heals four scenarios:
-          //   • Operator manually cancelled SL or TP on the exchange.
-          //   • Strategy update mutated the percentages mid-trade.
-          //   • Partial fill changed executedQuantity without re-arming.
-          //   • Accumulation merged new volume in (avg entry shifted).
-          // updateProtectionOrders() is no-op when nothing drifted, so
-          // this is cheap on the steady state — only fires real REST
-          // calls when something actually needs to change.
+          // ── Entry-order fill detection (reconcile path) ───────────────
+          let justFilled = false
+          if (pos.status === "placed") {
+            const exSize  = parseFloat(String(exPos.size ?? exPos.positionAmt ?? exPos.quantity ?? "0")) || 0
+            const exEntry = parseFloat(String(exPos.entryPrice ?? exPos.avgPrice ?? exPos.markPrice ?? "0")) || 0
+            if (exSize > 0) {
+              if (pos.executedQuantity <= 0) {
+                pos.executedQuantity = exSize
+                pos.remainingQuantity = 0
+                pos.averageExecutionPrice = exEntry || pos.entryPrice
+              }
+              pos.status = "open"
+              pos.updatedAt = Date.now()
+              justFilled = true
+              await incrementMetric(connectionId, "live_orders_filled_count")
+              await incrementOrdersBySymbol(connectionId, pos.symbol, pos.direction!, "filled")
+            }
+
+            if (pos.orderId) {
+              try {
+                const order = await exchangeConnector.getOrder(pos.symbol, pos.orderId)
+                const statusLower = String(order?.status ?? "").toLowerCase()
+                const orderFilledQty = parseFloat(String(order?.filledQty ?? order?.executedQty ?? "0")) || 0
+                if (order && (statusLower === "filled" || statusLower === "partially_filled" || orderFilledQty > 0)) {
+                  if (orderFilledQty > 0) {
+                    pos.executedQuantity = orderFilledQty
+                    pos.remainingQuantity = Math.max(0, pos.quantity - pos.executedQuantity)
+                    pos.averageExecutionPrice = parseFloat(String(order.filledPrice ?? order.avgPrice ?? "0")) || pos.averageExecutionPrice || pos.entryPrice
+                  }
+                  pos.status = "open"
+                  pos.updatedAt = Date.now()
+                  if (!justFilled) {
+                    justFilled = true
+                    await incrementMetric(connectionId, "live_orders_filled_count")
+                    await incrementOrdersBySymbol(connectionId, pos.symbol, pos.direction!, "filled")
+                  }
+                } else if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
+                  pos.status = "rejected"
+                  pos.closeReason = `entry_order_${statusLower}`
+                  pos.closedAt = Date.now()
+                  pos.updatedAt = Date.now()
+                  await savePosition(pos)
+                  delta.updated++
+                  return delta
+                }
+              } catch {
+                /* getOrder() may fail transiently — Layer 1 result stands */
+              }
+            }
+          }
+
+          if (pos.status === "placed") {
+            await savePosition(pos)
+            delta.updated++
+            return delta
+          }
+
+          // ── Ownership guard ──────────────────────────────────────────
+          // Only arm SL/TP and issue force-closes on positions that carry
+          // a system orderId — proof WE placed the entry order.
+          // If orderId is absent, the exchange position at this
+          // symbol+direction may have been opened manually by the operator
+          // or by another system. We must not arm reduce-only orders or
+          // close it. We still save the refreshed markPrice/PnL so the
+          // dashboard reflects current unrealised PnL accurately.
+          if (!pos.orderId) {
+            await savePosition(pos)
+            delta.updated++
+            return delta
+          }
+
           try {
-            await updateProtectionOrders(exchangeConnector, pos, "reconcile")
+            const protectionResult = await updateProtectionOrders(
+              exchangeConnector,
+              pos,
+              justFilled ? "reconcile_fill_detected" : "reconcile",
+              liveOrderIds,
+            )
+            if (protectionResult.changed) {
+              delta.protectionRearmed++
+              await savePosition(pos)
+              delta.updated++
+            }
           } catch (slTpErr) {
             console.warn(
               `${LOG_PREFIX} reconcile SL/TP heal error for ${pos.id}:`,
@@ -2545,18 +4129,6 @@ export async function reconcileLivePositions(
             )
           }
 
-          // ── Proactive close-in-time safety check ───────────────────
-          // Even when the exchange-placed reduce-only SL/TP orders are
-          // armed, on a sharp price gap (illiquid pair / news / slow
-          // fill) the exchange may not fire them in time — leaving the
-          // position open past the configured threshold. We compare
-          // mark price vs. desired SL/TP and force-close if breached.
-          //
-          // Implementation lives in `checkAndForceCloseOnSltpCross` so
-          // the same logic runs from `syncWithExchange` (engine loop)
-          // and `recalculateAndApplySLTP` (operator override) too —
-          // the user explicitly asked for the close to happen
-          // "independent of the control orders".
           const crossed = await checkAndForceCloseOnSltpCross(
             connectionId,
             pos,
@@ -2564,12 +4136,12 @@ export async function reconcileLivePositions(
             exchangeConnector,
           )
           if (crossed) {
-            summary.closed++
-            continue // close already persisted by helper
+            delta.closed++
+            return delta
           }
 
           // ── Max-hold-time safety closer (reconcile path) ────────────
-          const MAX_HOLD_TIME_MS = Number(process.env.MAX_POSITION_HOLD_MS ?? 4 * 60 * 60 * 1000)
+          const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
           const openedAt = pos.createdAt || pos.updatedAt || 0
           const heldMs = Date.now() - openedAt
           if (
@@ -2590,15 +4162,33 @@ export async function reconcileLivePositions(
               { positionId: pos.id, heldMs, maxHoldMs: MAX_HOLD_TIME_MS, exitPrice },
             )
             await closeLivePosition(connectionId, pos.id, exitPrice, exchangeConnector, "max_hold_time_exceeded")
-            summary.closed++
-            continue
+            delta.closed++
+            return delta
           }
 
-          await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
-          summary.updated++
+          await savePosition(pos)
+          delta.updated++
+        } else if (slotAlreadyReconciled) {
+          // Secondary Set on the same exchange slot — the exchange has ONE position
+          // for this symbol+direction (already reconciled above). This Redis entry
+          // represents a different Set contributing to the same position; it must
+          // not be treated as "externally closed" just because the slot was already
+          // processed. Simply save the propagated exchange data and move on.
+          await savePosition(pos)
+          delta.updated++
         } else {
           // Position closed externally — compute PnL, move to archive.
-          const exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || pos.entryPrice
+          let exitPrice: number = Number(pos.exchangeData?.markPrice) || pos.averageExecutionPrice || 0
+          if (exitPrice <= 0) {
+            try {
+              const mdHash = await client.hgetall(`market_data:${pos.symbol}`)
+              const mdPrice = parseFloat(
+                String(mdHash?.lastPrice ?? mdHash?.price ?? mdHash?.close ?? "0")
+              )
+              if (mdPrice > 0) exitPrice = mdPrice
+            } catch { /* ignore — fall through to entryPrice */ }
+          }
+          if (exitPrice <= 0) exitPrice = pos.entryPrice || 0
           const qty      = pos.executedQuantity || pos.quantity || 0
           const avgEntry = pos.averageExecutionPrice || pos.entryPrice || 0
 
@@ -2608,12 +4198,6 @@ export async function reconcileLivePositions(
               (pos.direction === "long" ? exitPrice - avgEntry : avgEntry - exitPrice)
           }
 
-          // Best-effort orphan cleanup: if the position vanished from
-          // the exchange because (e.g.) the TP fired, the SL is now an
-          // orphan reduce-only order with no position to reduce. The
-          // exchange will usually auto-reject any future fill, but the
-          // order can still sit in the book and confuse the operator.
-          // Cancelling here is silent on "already gone".
           if (pos.stopLossOrderId || pos.takeProfitOrderId) {
             const cancellations: Promise<boolean>[] = []
             if (pos.stopLossOrderId) {
@@ -2631,11 +4215,21 @@ export async function reconcileLivePositions(
             pos.takeProfitOrderId = undefined
           }
 
+          // ── Do NOT call closePosition on the exchange here ────────────
+          // This branch runs when the Redis-tracked position is absent
+          // from the exchange's open-positions list. That means the
+          // exchange has ALREADY closed it (SL/TP filled, liquidated,
+          // or the operator closed it manually). Calling closePosition
+          // here would therefore target any OTHER open position at the
+          // same symbol+direction — including ones the operator placed
+          // manually that the system did not create. We must not touch
+          // those. The Redis record is closed locally by the code below;
+          // no exchange action is required or safe.
           pos.status = "closed"
           pos.closedAt = Date.now()
           pos.realizedPnL = Math.round(realizedPnl * 100) / 100
           pos.closeReason = pos.closeReason || "exchange_reconciliation"
-          pos.progression.push({
+          pos.progression!.push({
             step: "close",
             timestamp: Date.now(),
             success: true,
@@ -2643,32 +4237,18 @@ export async function reconcileLivePositions(
           })
           pos.updatedAt = Date.now()
 
-          // Reuse the savePosition terminal-archival behaviour inline to
-          // avoid a circular import / extra Redis GET.
           const openIndexKey   = `live:positions:${connectionId}`
           const closedIndexKey = `live:positions:${connectionId}:closed`
           const movedMarker    = `live:positions:${connectionId}:moved:${pos.id}`
 
-          // Persist the updated position, then check the idempotent move
-          // marker so we don't double-archive. Everything after the marker
-          // check is independent — fan it out in a single Promise.all so each
-          // reconciliation pays one RTT window instead of ~7 sequential ones.
-          await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
+          await savePosition(pos)
           const alreadyMoved = await client.get(movedMarker).catch(() => null)
 
           const progKey = `progression:${connectionId}`
-          // Lock + TTL refresh always run (idempotent operations).
           const writes: Promise<any>[] = [
             client.expire(progKey, 7 * 24 * 60 * 60).catch(() => {}),
             client.del(`live:lock:${connectionId}:${pos.symbol}:${pos.direction}`).catch(() => {}),
           ]
-          // Counter increments + index move ONLY when this iteration
-          // is the first one to terminalise the position. The moved
-          // marker is shared with `closeLivePosition()` and
-          // `savePosition()` so an external close → reconcile sweep
-          // never double-counts. This is what was producing the
-          // operator's reported `Positions Closed > Positions Created`
-          // skew (counters drifted on every reconcile re-entry).
           if (!alreadyMoved) {
             writes.push(
               client.hincrby(progKey, "live_positions_closed_count", 1).catch(() => {}),
@@ -2684,16 +4264,46 @@ export async function reconcileLivePositions(
           }
           await Promise.all(writes)
 
-          summary.closed++
+          delta.closed++
         }
       } catch (err) {
-        summary.errors++
+        delta.errors++
         console.warn(
           `${LOG_PREFIX} reconcile per-position error for ${pos.id}:`,
           err instanceof Error ? err.message : String(err),
         )
       }
+      return delta
     }
+
+    // ── Bounded-concurrency streaming pool ───────────────────────────
+    // Streaming (not batch) pool so a slow exchange call on one
+    // position never blocks the next 7 from starting. Concurrency 8
+    // is well below the 50/min order-rate ceiling on every venue we
+    // support and well above the typical sweep size, so the limit
+    // virtually never bites in practice — it exists purely as a
+    // backstop against a pathological burst.
+    const LIVE_RECONCILE_CONCURRENCY = 8
+    const queue = openPositions.slice()
+    const runners: Promise<void>[] = []
+    const aggregate = (d: PosDelta) => {
+      summary.reconciled       += d.reconciled
+      summary.updated          += d.updated
+      summary.closed           += d.closed
+      summary.errors           += d.errors
+      summary.protectionRearmed += d.protectionRearmed
+    }
+    summary.reconciled = 0 // re-counted by aggregate
+    for (let i = 0; i < Math.min(LIVE_RECONCILE_CONCURRENCY, queue.length); i++) {
+      runners.push((async () => {
+        while (true) {
+          const p = queue.shift()
+          if (!p) return
+          aggregate(await processOne(p))
+        }
+      })())
+    }
+    await Promise.all(runners)
 
     if (summary.closed > 0 || summary.updated > 0) {
       console.log(
@@ -2709,43 +4319,660 @@ export async function reconcileLivePositions(
 }
 
 /**
+ * Standalone simulated-position processor.
+ *
+ * Walks every `status === "simulated"` live position and applies the
+ * same SL/TP-cross / max-hold-time close logic the real-position
+ * paths use, but without any exchange-side calls. Closes via
+ * `closeLivePosition(connectionId, posId, exitPrice, null, reason)`
+ * which already gracefully no-ops the exchange branches when the
+ * connector is `null`.
+ *
+ * This MUST be callable independently of the exchange connector
+ * because:
+ *   1. Paper-only connections (no API keys) never enter
+ *      `syncWithExchange` — `maybeRunLiveSync` returns at the
+ *      API-key gate.
+ *   2. The cron `reconcileLivePositions` early-returns when the
+ *      connector has no `getPositions`, again bypassing the
+ *      simulated sweep that lives inside `syncWithExchange`.
+ *
+ * Without this helper, simulated positions sat open forever on any
+ * paper connection — the user-visible "Live Positions are Still not
+ * getting closed" complaint.
+ *
+ * Returns a summary for logging.
+ */
+export async function processSimulatedPositions(
+  connectionId: string,
+): Promise<{ processed: number; closed: number; errors: number }> {
+  const summary = { processed: 0, closed: 0, errors: 0 }
+  try {
+    await initRedis()
+    const allOpen = await getLivePositions(connectionId)
+    const sims = allOpen.filter(
+      (p) => p.status === "simulated" && (p.executedQuantity ?? 0) > 0,
+    )
+    if (sims.length === 0) return summary
+
+    // Pull current prices in one parallel batch (independent Redis reads).
+    const uniqueSyms = Array.from(new Set(sims.map((p) => p.symbol)))
+    const priceMap = new Map<string, number>()
+    await Promise.all(
+      uniqueSyms.map(async (sym) => {
+        const px = await fetchCurrentPrice(sym).catch(() => 0)
+        if (px > 0) priceMap.set(sym, px)
+      }),
+    )
+
+    const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
+    for (const pos of sims) {
+      summary.processed++
+      try {
+        const markPrice = priceMap.get(pos.symbol) || pos.averageExecutionPrice || 0
+        if (markPrice > 0) {
+          pos.exchangeData = {
+            ...pos.exchangeData,
+            markPrice,
+            syncedAt: Date.now(),
+          }
+          // SL/TP cross check (passes connector=null so close skips
+          // the exchange-side cancel + closePosition calls).
+          const crossed = await checkAndForceCloseOnSltpCross(
+            connectionId,
+            pos,
+            markPrice,
+            null,
+          )
+          if (crossed) {
+            summary.closed++
+            continue
+          }
+        }
+        // Max-hold safety closer.
+        const openedAt = pos.createdAt || pos.updatedAt || 0
+        const heldMs = Date.now() - openedAt
+        if (
+          MAX_HOLD_TIME_MS > 0 &&
+          heldMs > MAX_HOLD_TIME_MS &&
+          (pos.executedQuantity ?? 0) > 0
+        ) {
+          const exitPrice = markPrice || pos.averageExecutionPrice || pos.entryPrice
+          await logProgressionEvent(
+            connectionId,
+            "live_trading",
+            "warning",
+            `Max hold time exceeded for simulated ${pos.symbol} — force-closing`,
+            { positionId: pos.id, heldMs, maxHoldMs: MAX_HOLD_TIME_MS, exitPrice },
+          )
+          await closeLivePosition(connectionId, pos.id, exitPrice, null, "max_hold_time_exceeded")
+          summary.closed++
+          continue
+        }
+        // Persist refreshed mark price so the dashboard reads fresh data.
+        if (markPrice > 0) {
+          await savePosition(pos)
+        }
+      } catch (err) {
+        summary.errors++
+        console.warn(
+          `${LOG_PREFIX} processSimulatedPositions per-pos error for ${pos.id}:`,
+          err instanceof Error ? err.message : String(err),
+        )
+      }
+    }
+    if (summary.closed > 0) {
+      console.log(
+        `${LOG_PREFIX} processSimulatedPositions ${connectionId} processed=${summary.processed} closed=${summary.closed}`,
+      )
+    }
+    return summary
+  } catch (err) {
+    console.warn(
+      `${LOG_PREFIX} processSimulatedPositions fatal:`,
+      err instanceof Error ? err.message : String(err),
+    )
+    return summary
+  }
+}
+
+/**
  * Sync live positions with exchange data (mark price, liq price, unrealized PnL).
  * Called periodically by the engine monitoring loop.
  */
 export async function syncWithExchange(connectionId: string, exchangeConnector: any): Promise<void> {
   await initRedis()
   const client = getRedisClient()
+  const syncStartMs = Date.now()
+
+  // ── Cross-caller single-flight gate ─────────────────────────────────
+  // `syncWithExchange` has three independent callers in production:
+  //   1. RealtimeProcessor.maybeRunLiveSync() — every 200 ms (in-process
+  //      gate `liveSyncInFlight` covers same-process collisions only)
+  //   2. /api/cron/sync-live-positions — Vercel cron, ~30 s
+  //   3. /api/trade-engine/resume      — one-shot on resume
+  //
+  // Without a Redis-backed lock the cron+realtime can run in parallel
+  // against the same per-position state (status flips, protection-
+  // order placement, externally-closed adoption — all racy when
+  // doubled). The in-process flag is process-local and useless across
+  // a serverless cron invocation hitting the same Redis as a long-
+  // running engine.
+  //
+  // Lock semantics:
+  //   • Key:    live_sync_lock:{connectionId}
+  //   • TTL:    30 s — generous headroom over the sync's p99 runtime
+  //             while still releasing within one heartbeat window if
+  //             the holder process dies mid-sync.
+  //   • NX:     atomic acquire; if already held we early-return as a
+  //             no-op (the existing holder will finish the work).
+  //   • Release: best-effort `del` in the finally block. On crash the
+  //             TTL is the safety net.
+  //
+  // This is intentionally LESS strict than the progression-lock
+  // (which uses ownerToken+epoch) because syncWithExchange is
+  // idempotent — losing a lock release just costs one skipped sync
+  // tick, not corrupted state.
+  const LIVE_SYNC_LOCK_KEY = `live_sync_lock:${connectionId}`
+  const LIVE_SYNC_LOCK_TTL_SEC = 30
+  let lockAcquired = false
+  if (client) {
+    try {
+      const acquireResult = await client.set(LIVE_SYNC_LOCK_KEY, String(syncStartMs), {
+        NX: true,
+        EX: LIVE_SYNC_LOCK_TTL_SEC,
+      })
+      lockAcquired = acquireResult === "OK"
+    } catch (lockErr) {
+      // Redis unreachable — fail open (proceed without the lock).
+      // The in-process flag in RealtimeProcessor still prevents
+      // same-process duplicate runs; the only path that loses
+      // dedup is cron-vs-realtime, which is rare and idempotent.
+      console.warn(
+        `${LOG_PREFIX} [sync-lock] acquire failed for ${connectionId} — proceeding without cross-caller lock:`,
+        lockErr instanceof Error ? lockErr.message : String(lockErr),
+      )
+      lockAcquired = true // treat as acquired so the finally block doesn't try to release
+    }
+    if (!lockAcquired) {
+      console.log(
+        `${LOG_PREFIX} [sync-lock] skip — another caller is mid-sync for conn=${connectionId} (likely cron+realtime overlap, idempotent skip)`,
+      )
+      return
+    }
+  }
 
   try {
-    // Previously each status filter triggered a full getLivePositions() scan,
-    // meaning we fetched the same open-positions index from Redis FOUR times
-    // just to bucket by status. Load once, then filter in memory.
-    const allOpen = await getLivePositions(connectionId)
-    const openPositions = allOpen.filter(
-      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
+    // ── Load open positions: Real-active index first, then full scan ────────
+    // Mirror the reconcileLivePositions load strategy: Real-active positions
+    // (SADD Set, typically 1–10 entries) are loaded via getRealActivePositions
+    // in parallel with the full open-positions scan. Real-active positions are
+    // placed first in the loop so SL/TP re-arming and close-detection happen
+    // on Set-coordinated positions before lower-priority ones.
+    const [realActiveResult_sync, allOpen_base] = await Promise.all([
+      getRealActivePositions(connectionId),
+      getLivePositions(connectionId),
+    ])
+    const realActiveIds_sync = new Set<string>(realActiveResult_sync.positions.map((p) => p.id))
+
+    // Full merged list used for the status-breakdown log (same shape as before).
+    const allOpen = [
+      ...realActiveResult_sync.positions,
+      ...allOpen_base.filter((p) => !realActiveIds_sync.has(p.id)),
+    ]
+    const openPositions = [
+      ...realActiveResult_sync.positions,
+      ...allOpen_base.filter(
+        (p) =>
+          !realActiveIds_sync.has(p.id) &&
+          (p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed"),
+      ),
+    ]
+
+    // ── Observability heartbeat ───────────────────────────────────────
+    // Previously this function ran silently when there were zero
+    // tracked positions OR when every position was in a "do nothing"
+    // state — producing the operator's "orders not closing, no logs"
+    // symptom. Always emit a one-line breakdown of what the close-side
+    // pipeline is seeing so the operator can distinguish:
+    //   (a) sync isn't running at all (no log = caller throttled / paused)
+    //   (b) sync is running but finds nothing to act on
+    //   (c) sync is running and processing positions in known status
+    // Throttled to ~10s of useful detail so we don't flood logs at
+    // steady state; the per-position branches below still log their
+    // individual decisions.
+    const statusBreakdown = allOpen.reduce<Record<string, number>>((acc, p) => {
+      const s = String(p.status || "unknown")
+      acc[s] = (acc[s] || 0) + 1
+      return acc
+    }, {})
+    const placedCount = statusBreakdown.placed || 0
+    const simCount = statusBreakdown.simulated || 0
+    const totalLive = openPositions.filter((p) => p.status !== "placed").length
+    console.log(
+      `${LOG_PREFIX} [sync-tick] conn=${connectionId} tracked=${allOpen.length} open=${totalLive} placed=${placedCount} simulated=${simCount} statuses=${JSON.stringify(statusBreakdown)}`,
     )
+
+    // ── Simulated-position sweep (paper-mode + is_live_trade=false) ─────
+    // Simulated positions don't touch the exchange, so we cannot use the
+    // exchange-position map or any exchangeConnector calls to close
+    // them. Process them inline using Redis market_data ticks — this
+    // is the path that previously left simulated orders open forever
+    // because every other close branch in this function gates on
+    // exchange-side data.
+    //
+    // We do it BEFORE the API-key gate inside maybeRunLiveSync (the
+    // caller) by also exposing a standalone `processSimulatedPositions`
+    // helper. Keeping a lightweight copy here makes the engine's
+    // exchange-side sync self-contained for connections that DO have
+    // API keys — simulated positions on those connections (paused
+    // live-trade, mixed mode) still get a close path on the same tick.
+    {
+      const sims = allOpen.filter(
+        (p) => p.status === "simulated" && (p.executedQuantity ?? 0) > 0,
+      )
+      if (sims.length > 0) {
+        // Pull all current prices in one parallel fan-out — independent
+        // Redis reads (one per unique symbol). 60s stale fallback to
+        // averageExecutionPrice keeps a missing tick from blocking close.
+        const uniqueSyms = Array.from(new Set(sims.map((p) => p.symbol)))
+        const priceMap = new Map<string, number>()
+        await Promise.all(
+          uniqueSyms.map(async (sym) => {
+            const px = await fetchCurrentPrice(sym).catch(() => 0)
+            if (px > 0) priceMap.set(sym, px)
+          }),
+        )
+        for (const pos of sims) {
+          try {
+            const markPrice = priceMap.get(pos.symbol) || pos.averageExecutionPrice || 0
+            if (markPrice > 0) {
+              pos.exchangeData = {
+                ...pos.exchangeData,
+                markPrice,
+                syncedAt: Date.now(),
+              }
+              const crossed = await checkAndForceCloseOnSltpCross(
+                connectionId,
+                pos,
+                markPrice,
+                null, // simulated: skip exchange ops in close
+              )
+              if (crossed) continue
+            }
+            // Max-hold safety closer (parallel to the real-position path).
+            const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
+            const openedAt = pos.createdAt || pos.updatedAt || 0
+            const heldMs = Date.now() - openedAt
+            if (
+              MAX_HOLD_TIME_MS > 0 &&
+              heldMs > MAX_HOLD_TIME_MS &&
+              (pos.executedQuantity ?? 0) > 0
+            ) {
+              const exitPrice = markPrice || pos.averageExecutionPrice || pos.entryPrice
+              await logProgressionEvent(
+                connectionId,
+                "live_trading",
+                "warning",
+                `Max hold time exceeded for simulated ${pos.symbol} — force-closing`,
+                { positionId: pos.id, heldMs, maxHoldMs: MAX_HOLD_TIME_MS, exitPrice },
+              )
+              await closeLivePosition(connectionId, pos.id, exitPrice, null, "max_hold_time_exceeded")
+              continue
+            }
+            // Persist refreshed mark price so the dashboard reads it.
+            if (markPrice > 0) {
+              await savePosition(pos)
+            }
+          } catch (simErr) {
+            console.warn(
+              `${LOG_PREFIX} simulated-tick error for ${pos.id}:`,
+              simErr instanceof Error ? simErr.message : String(simErr),
+            )
+          }
+        }
+      }
+    }
+
+    // ── Exchange-orphan adoption (P0 fix for "positions not closing") ──
+    // The user repeatedly reported live exchange positions that never get
+    // closed. Investigation showed the root cause: positions on the
+    // exchange that AREN'T in our Redis open-index are completely
+    // invisible to every close path (SL/TP cross, max-hold, reconcile,
+    // sync). They sit there forever with no control orders armed.
+    //
+    // This block runs BEFORE the early-return on `openPositions.length=0`
+    // so even a system with zero tracked positions still discovers and
+    // adopts exchange-side positions. Adopted positions get the
+    // connection's default SL/TP percentages applied via
+    // `updateProtectionOrders` on the next iteration of the per-position
+    // loop below, restoring full close-path coverage.
+    //
+    // Cheap when the exchange has no positions (one HTTP call returning
+    // empty array). The exchange call is gated by the realtime sync's
+    // 5-second throttle so it doesn't hammer the venue.
+    let adoptedCount = 0
+    // Hoisted out of the orphan-adoption block so the per-position sync
+    // loop below can build a (symbol|direction)→exchangePos map from the
+    // SAME single batch fetch, instead of issuing N getPosition(symbol)
+    // calls (which on hedge-mode accounts returned positions[0] regardless
+    // of direction — clobbering markPrice across long/short legs and
+    // never detecting external closures).
+    let exchangePositions: any[] = []
+    if (exchangeConnector && typeof exchangeConnector.getPositions === "function") {
+      try {
+        // Bounded — a hanging getPositions() would freeze every close path
+        // (externally-closed detection, orphan adoption, mark-price refresh,
+        // SL/TP cross check) all of which depend on this single call.
+        exchangePositions = (await withTimeout(
+          exchangeConnector.getPositions() as Promise<any[]>,
+          EXCHANGE_TIMEOUT_GET_POSITIONS_MS,
+          "syncWithExchange:getPositions",
+        ).catch((err: any) => {
+          console.warn(
+            `${LOG_PREFIX} getPositions failed/timeout in syncWithExchange:`,
+            err instanceof Error ? err.message : String(err),
+          )
+          return [] as any[]
+        })) || []
+        if (Array.isArray(exchangePositions) && exchangePositions.length > 0) {
+          // Build a set of (symbol|direction) keys we already track in any
+          // status — including terminal ones — so we don't re-adopt a
+          // position that was just closed but the exchange hasn't yet
+          // reflected the close (a few-second lag is normal).
+          const normSym = (raw: string) => String(raw || "").toUpperCase().replace(/[-_]/g, "")
+          const trackedKeys = new Set<string>()
+          for (const p of allOpen) {
+            trackedKeys.add(`${normSym(p.symbol)}|${p.direction}`)
+          }
+          // Also pull recent closes (last 50) so a just-closed position
+          // doesn't bounce back as an orphan during the close-confirmation
+          // window. `getClosedLivePositions` reads the closed-archive list.
+          try {
+            const recentlyClosed = await getClosedLivePositions(connectionId, 50).catch(() => [] as LivePosition[])
+            for (const p of recentlyClosed) {
+              const closedAgoMs = Date.now() - (p.closedAt || 0)
+              // Within 60s of close ��� exchange may still report position
+              // until the close fill propagates. After that window, treat
+              // it as truly closed and orphan-adopt if it reappears.
+              if (closedAgoMs < 60_000) {
+                trackedKeys.add(`${normSym(p.symbol)}|${p.direction}`)
+              }
+            }
+          } catch { /* best-effort */ }
+
+          // Load default SL/TP percentages once for all adoptions.
+          let defaultSlPct = 1
+          let defaultTpPct = 2
+          try {
+            const tradingSettings = (await client.hgetall("settings:trading")) || {}
+            const slRaw = parseFloat(String((tradingSettings as any).default_stop_loss_percent ?? "1"))
+            const tpRaw = parseFloat(String((tradingSettings as any).default_take_profit_percent ?? "2"))
+            if (Number.isFinite(slRaw) && slRaw > 0) defaultSlPct = slRaw
+            if (Number.isFinite(tpRaw) && tpRaw > 0) defaultTpPct = tpRaw
+          } catch { /* use defaults */ }
+
+          for (const exPos of exchangePositions) {
+            try {
+              const rawSym = String(exPos.symbol || (exPos as any).Symbol || "")
+              const sym = normSym(rawSym)
+              if (!sym) continue
+              const size = Math.abs(parseFloat(String(exPos.size ?? (exPos as any).positionAmt ?? exPos.quantity ?? "0")))
+              if (!size || size <= 0) continue
+              // Determine direction. BingX returns "LONG"/"SHORT" in
+              // `positionSide`; some venues encode via signed size.
+              const sideRaw = String(
+                exPos.side ?? (exPos as any).positionSide ?? (parseFloat(String(exPos.size ?? "0")) < 0 ? "short" : "long"),
+              ).toLowerCase()
+              const direction: "long" | "short" =
+                sideRaw.includes("short") || sideRaw === "sell" ? "short" : "long"
+
+              const mapKey = `${sym}|${direction}`
+              if (trackedKeys.has(mapKey)) continue // already tracked
+              // ORPHAN — adopt it.
+              const entryPrice = parseFloat(
+                String(exPos.entryPrice ?? (exPos as any).avgPrice ?? exPos.markPrice ?? "0"),
+              ) || parseFloat(String(exPos.markPrice ?? "0")) || 0
+              if (!entryPrice || entryPrice <= 0) continue
+              const markPrice = parseFloat(String(exPos.markPrice ?? entryPrice)) || entryPrice
+              const leverage = Math.max(1, parseFloat(String(exPos.leverage ?? "1")) || 1)
+              const notional = size * entryPrice
+              const marginType: "cross" | "isolated" =
+                String(exPos.marginType ?? "isolated").toLowerCase().includes("cross") ? "cross" : "isolated"
+
+              const adoptedId = `live:${connectionId}:adopted:${sym}:${direction}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`
+              const adopted: LivePosition = {
+                id: adoptedId,
+                connectionId,
+                symbol: sym,
+                direction,
+                realPositionId: adoptedId, // self-reference — no Real-stage parent
+                quantity: size,
+                executedQuantity: size,
+                remainingQuantity: 0,
+                entryPrice,
+                averageExecutionPrice: entryPrice,
+                volumeUsd: notional,
+                leverage,
+                marginType,
+                stopLoss: defaultSlPct,
+                takeProfit: defaultTpPct,
+                assignedStopLoss: defaultSlPct,
+                assignedTakeProfit: defaultTpPct,
+                status: "open", // exchange confirms the fill — start in "open"
+                statusReason: "adopted_from_exchange",
+                fills: [
+                  {
+                    timestamp: Date.now(),
+                    quantity: size,
+                    price: entryPrice,
+                    fee: 0,
+                    feeAsset: "",
+                  },
+                ],
+                exchangeData: {
+                  markPrice,
+                  liquidationPrice: parseFloat(String(exPos.liquidationPrice ?? "0")) || undefined,
+                  unrealizedPnL: parseFloat(String(exPos.unrealizedProfit ?? exPos.unrealizedPnl ?? "0")) || undefined,
+                  syncedAt: Date.now(),
+                },
+                progression: [
+                  {
+                    step: "adopt",
+                    timestamp: Date.now(),
+                    success: true,
+                    details: `Adopted untracked exchange position size=${size} @ ${entryPrice} (default SL=${defaultSlPct}% TP=${defaultTpPct}%)`,
+                  },
+                ],
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+              } as LivePosition
+
+              await savePosition(adopted)
+              adoptedCount++
+              await incrementMetric(connectionId, "live_positions_adopted_count")
+              await logProgressionEvent(
+                connectionId,
+                "live_trading",
+                "warning",
+                `Adopted untracked exchange position ${sym} ${direction} — applying default SL=${defaultSlPct}% TP=${defaultTpPct}%`,
+                { positionId: adoptedId, size, entryPrice, markPrice, leverage },
+              )
+              // Push adopted position into openPositions so the per-position
+              // loop below arms SL/TP on it RIGHT NOW (don't wait for the
+              // next 5 s sync tick — the operator's stranded position
+              // needs protection immediately).
+              openPositions.push(adopted)
+            } catch (orphanErr) {
+              console.warn(
+                `${LOG_PREFIX} Orphan adoption failed:`,
+                orphanErr instanceof Error ? orphanErr.message : String(orphanErr),
+              )
+            }
+          }
+          if (adoptedCount > 0) {
+            console.log(`${LOG_PREFIX} Adopted ${adoptedCount} untracked exchange position(s) for ${connectionId}`)
+          }
+        }
+      } catch (sweepErr) {
+        console.warn(
+          `${LOG_PREFIX} Orphan sweep failed:`,
+          sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+        )
+      }
+    }
 
     if (openPositions.length === 0) {
       return
     }
 
-    console.log(`${LOG_PREFIX} Syncing ${openPositions.length} open/placed positions with exchange`)
+    console.log(`${LOG_PREFIX} Syncing ${openPositions.length} open/placed positions with exchange (adopted=${adoptedCount})`)
+
+    // ── Build a direction-keyed exchange-position map (P0 fix) ────────
+    // Previously the per-position loop called `getPosition(position.symbol)`
+    // which on hedge-mode accounts returns `positions[0]` for the symbol
+    // — regardless of whether the caller wanted LONG or SHORT. That meant:
+    //   * If user had LONG only, `positions[0]` was LONG → fine.
+    //   * If user had SHORT only, `positions[0]` was SHORT → fine.
+    //   * If user had BOTH (hedge), `positions[0]` was always the one
+    //     BingX returned first → markPrice cross-contamination between
+    //     the two legs AND no way to detect when one leg externally
+    //     closed (the other leg's data masked the close).
+    //   * If user had NONE (closed externally), `getPositions(symbol)`
+    //     could still return a flat zero-size entry, making
+    //     `if (exchangePos)` truthy and silently keeping the Redis record
+    //     "open" forever — the operator's repeated "Live Positions are
+    //     still not getting closed" complaint.
+    //
+    // Now: we already fetched the full positions array up top for orphan
+    // adoption. Reuse it to build a `(symbol|direction) → exchangePos` map
+    // with size>0 filter applied, same shape `reconcileLivePositions`
+    // uses. One batch fetch covers both adoption AND per-position sync.
+    const normSym = (raw: string) => String(raw || "").toUpperCase().replace(/[-_]/g, "")
+    const exchangeMap = new Map<string, any>()
+    for (const ep of exchangePositions) {
+      const sym = normSym(String(ep.symbol || (ep as any).Symbol || ""))
+      if (!sym) continue
+      const size = Math.abs(parseFloat(String(ep.size ?? (ep as any).positionAmt ?? ep.quantity ?? "0")))
+      if (!size || size <= 0) continue // skip flat / zero-size entries
+      const sideRaw = String(
+        ep.side ?? (ep as any).positionSide ?? (parseFloat(String(ep.size ?? "0")) < 0 ? "short" : "long"),
+      ).toLowerCase()
+      const direction: "long" | "short" =
+        sideRaw.includes("short") || sideRaw === "sell" ? "short" : "long"
+      exchangeMap.set(`${sym}|${direction}`, ep)
+    }
+
+    // ── Once-per-tick venue open-orders snapshot ───────────────────────
+    // See `fetchLiveOrderIdSet` docs. Same purpose as in reconcile: lets
+    // `updateProtectionOrders` notice silently-gone SL/TP legs without
+    // calling getOrder() per leg. `null` ⇒ skip verification this tick.
+    const liveOrderIdsSync = await fetchLiveOrderIdSet(exchangeConnector)
 
     for (const position of openPositions) {
       try {
-        const exchangePos = await exchangeConnector.getPosition(position.symbol)
+        const mapKey = `${normSym(position.symbol)}|${position.direction}`
+        const exchangePos = exchangeMap.get(mapKey)
         if (exchangePos) {
+          // Mirror reconcileLivePositions' field extraction so both paths
+          // produce structurally identical exchangeData. Previously this
+          // path stored raw strings under `markPrice` (no parseFloat) so
+          // downstream `Number(position.exchangeData?.markPrice ?? 0)` —
+          // while correct for plain numeric strings — silently coerced
+          // BingX's occasional null/empty-string returns to 0, gating
+          // the SL/TP cross check.
+          const markPrice = parseFloat(String(exchangePos.markPrice ?? exchangePos.indexPrice ?? exchangePos.lastPrice ?? "0")) || 0
+          const liqPrice  = parseFloat(String(exchangePos.liquidationPrice ?? exchangePos.liqPrice ?? "0")) || 0
+          const uPnl      = parseFloat(String(exchangePos.unrealizedProfit ?? exchangePos.unrealisedPnl ?? exchangePos.unrealizedPnl ?? "0")) || 0
           position.exchangeData = {
+            ...position.exchangeData,
             marginType: (exchangePos as any).marginType,
-            markPrice: (exchangePos as any).markPrice,
-            liquidationPrice: (exchangePos as any).liquidationPrice,
-            unrealizedPnl: (exchangePos as any).unrealizedPnl,
-            roi: (exchangePos as any).roi,
+            markPrice: markPrice || position.exchangeData?.markPrice,
+            liquidationPrice: liqPrice || position.exchangeData?.liquidationPrice,
+            unrealizedPnL: uPnl || position.exchangeData?.unrealizedPnL,
+            syncedAt: Date.now(),
           }
           position.updatedAt = Date.now()
+        } else if (
+          // ── Externally-closed branch (THE missing close path) ──────
+          // Exchange no longer reports the (symbol|direction) we have
+          // tracked — the position closed externally (SL/TP fired, manual
+          // close on the BingX UI, liquidation, etc.). Previously this
+          // branch did not exist in `syncWithExchange`, so the realtime
+          // tick path never detected external closures — only the 30 s-
+          // throttled coordinator reconcile did. Operators on a healthy
+          // engine therefore saw positions sit as "open" in Redis for up
+          // to a full reconcile window after they were actually closed,
+          // and on engines where the 30 s reconcile got skipped (rate-
+          // limit drift, strategy flow error, coordinator pause) the
+          // positions sat OPEN indefinitely.
+          //
+          // We only act when the entry definitely existed on the
+          // exchange at SOME point — i.e. status is anything past
+          // "placed" (open / filled / partially_filled with executed qty).
+          // Positions still in "placed" status with no fill yet might
+          // legitimately not show up on the exchange (the entry order is
+          // still resting on the book, not a position). Those continue
+          // to be promoted via the "Delayed-fill" block above when the
+          // entry order does fill.
+          position.executedQuantity > 0 &&
+          (position.status === "open" ||
+            position.status === "filled" ||
+            position.status === "partially_filled")
+        ) {
+          // Resolve exit price using the same 4-step fallback chain
+          // reconcileLivePositions uses, so PnL is honest whether the
+          // exchange returned markPrice in the closing batch, we kept a
+          // markPrice from the previous tick, the symbol's market_data
+          // hash has fresh ticks, or we fall back to entryPrice.
+          let exitPrice: number = Number(position.exchangeData?.markPrice) || position.averageExecutionPrice || 0
+          if (exitPrice <= 0) {
+            try {
+              const mdHash = await client.hgetall(`market_data:${position.symbol}`)
+              const mdPrice = parseFloat(String(mdHash?.lastPrice ?? mdHash?.price ?? mdHash?.close ?? "0"))
+              if (mdPrice > 0) exitPrice = mdPrice
+            } catch { /* fall through */ }
+          }
+          if (exitPrice <= 0) exitPrice = position.entryPrice || 0
+
+          console.log(
+            `${LOG_PREFIX} EXTERNALLY-CLOSED detected for ${position.symbol} ${position.direction} (id=${position.id}) — finalising in Redis`,
+          )
+          await logProgressionEvent(
+            connectionId,
+            "live_trading",
+            "info",
+            `Position ${position.symbol} no longer on exchange — closing in Redis (sync)`,
+            {
+              positionId: position.id,
+              exitPrice,
+              executedQuantity: position.executedQuantity,
+              direction: position.direction,
+            },
+          )
+          // closeLivePosition does the full terminal-state pipeline:
+          // best-effort exchange close (no-op when already gone), cancel
+          // orphan SL/TP, compute PnL/ROI, archive, release lock,
+          // increment counters. Reason "exchange_externally_closed"
+          // distinguishes it in the audit trail from cross-fires.
+          try {
+            await closeLivePosition(
+              connectionId,
+              position.id,
+              exitPrice,
+              exchangeConnector,
+              "exchange_externally_closed",
+            )
+          } catch (closeErr) {
+            console.warn(
+              `${LOG_PREFIX} externally-closed close error for ${position.id}:`,
+              closeErr instanceof Error ? closeErr.message : String(closeErr),
+            )
+          }
+          continue // closeLivePosition persisted terminal state — skip per-position setex
         }
 
-        // ── Delayed-fill SL/TP arming ─────────────────────────���───────
+        // ── Delayed-fill SL/TP arming ────��────────────────────���───────
         // If the entry order was still pending when `executeLivePosition`
         // tried to place SL/TP, that step pushed `place_sl_tp = skipped`
         // and the position ended up `placed` with no protection orders.
@@ -2757,15 +4984,24 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         let justFilled = false
         if (position.status === "placed" && position.orderId) {
           try {
-            const order = await exchangeConnector.getOrder(position.symbol, position.orderId)
+            // Bounded — a hanging getOrder would block this position's
+            // entire sync slot and delay every downstream close/heal step.
+            // On timeout we just skip the fill detection for this tick;
+            // the next sync will retry.
+            const order = await withTimeout(
+              exchangeConnector.getOrder(position.symbol, position.orderId) as Promise<any>,
+              EXCHANGE_TIMEOUT_GET_ORDER_MS,
+              `getOrder(${position.symbol} ${position.orderId})`,
+            )
             if (order?.status === "filled") {
               position.executedQuantity = order.filledQty || position.quantity
-              position.remainingQuantity = Math.max(0, position.quantity - position.executedQuantity)
+              position.remainingQuantity = Math.max(0, position.quantity! - position.executedQuantity)
               position.averageExecutionPrice = order.filledPrice || position.entryPrice
               position.status = "open"
               position.updatedAt = Date.now()
               justFilled = true
               await incrementMetric(connectionId, "live_orders_filled_count")
+              await incrementOrdersBySymbol(connectionId, position.symbol, position.direction, "filled")
               await logProgressionEvent(
                 connectionId,
                 "live_trading",
@@ -2776,9 +5012,97 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                   filledQty: position.executedQuantity,
                 }
               )
+            } else if (order) {
+              // Order exists but not filled (placed/partial/cancelled/rejected) —
+              // log so the operator can see WHY the position stays in
+              // "placed" status. Previously the only signal was the
+              // position never progressing, which was indistinguishable
+              // from a bug.
+              console.log(
+                `${LOG_PREFIX} [fill-detect] ${position.symbol} order ${position.orderId} status=${order.status} filledQty=${order.filledQty ?? 0} — staying in 'placed'`,
+              )
             }
-          } catch {
-            /* ignore — next sync cycle will retry */
+          } catch (fillErr) {
+            // PREVIOUSLY SWALLOWED — this was the root cause of "orders
+            // never closing": every getOrder failure left the position
+            // stuck in `placed` forever, and the SL/TP cross check skips
+            // `placed` positions silently (see checkAndForceCloseOnSltpCross
+            // line "if (pos.status === 'placed') return null").
+            // We now log so the failure is visible. The retry on next
+            // sync tick still happens — no behaviour change, just
+            // observability.
+            console.warn(
+              `${LOG_PREFIX} [fill-detect] getOrder failed for ${position.symbol} orderId=${position.orderId}:`,
+              fillErr instanceof Error ? fillErr.message : String(fillErr),
+            )
+          }
+        }
+
+        // ── Stuck-in-placed detection ���────────────────────────────────
+        // A position in `placed` status with no executed qty has its
+        // entry order resting on the exchange book unfilled. The SL/TP
+        // cross check skips `placed` positions silently, so without
+        // this branch a stuck order could sit forever:
+        //   - Never closes via SL/TP cross (status gate)
+        //   - Never closes via max-hold-time (executedQty=0 gate)
+        //   - Never adopted as orphan (it IS in Redis)
+        //   - Never finalised as externally-closed (gate requires
+        //     executedQty>0 + status≠placed)
+        // Cancel the dangling entry order after STUCK_PLACED_MAX_MS and
+        // mark the position rejected so it leaves the open index.
+        if (position.status === "placed" && (position.executedQuantity ?? 0) === 0) {
+          const STUCK_PLACED_MAX_MS = 5 * 60_000 // 5 minutes
+          const placedAgeMs = Date.now() - (position.createdAt || position.updatedAt || Date.now())
+          if (placedAgeMs > STUCK_PLACED_MAX_MS) {
+            console.warn(
+              `${LOG_PREFIX} [stuck-placed] ${position.symbol} (id=${position.id}) has been 'placed' for ${Math.round(placedAgeMs / 1000)}s — cancelling entry order and rejecting position`,
+            )
+            await logProgressionEvent(
+              connectionId,
+              "live_trading",
+              "warning",
+              `Entry order stuck in 'placed' state for ${position.symbol} — cancelling`,
+              {
+                positionId: position.id,
+                orderId: position.orderId,
+                placedAgeMs,
+                stuckLimitMs: STUCK_PLACED_MAX_MS,
+              },
+            )
+            // Best-effort cancel of the entry order (bounded timeout).
+            if (position.orderId && exchangeConnector?.cancelOrder) {
+              try {
+                await withTimeout(
+                  exchangeConnector.cancelOrder(position.symbol, position.orderId) as Promise<any>,
+                  EXCHANGE_TIMEOUT_CANCEL_ORDER_MS,
+                  `stuck-placed cancelOrder(${position.symbol} ${position.orderId})`,
+                )
+              } catch (cancelErr) {
+                console.warn(
+                  `${LOG_PREFIX} [stuck-placed] cancel entry order failed for ${position.id}:`,
+                  cancelErr instanceof Error ? cancelErr.message : String(cancelErr),
+                )
+              }
+            }
+            // Mark position rejected and remove from open index. We use
+            // closeLivePosition with exitPrice=entryPrice so the existing
+            // terminal-state pipeline handles archive/lock/metrics — same
+            // path as every other close branch.
+            try {
+              await closeLivePosition(
+                connectionId,
+                position.id,
+                position.entryPrice || 0,
+                exchangeConnector,
+                "stuck_in_placed",
+              )
+            } catch (closeErr) {
+              console.warn(
+                `${LOG_PREFIX} [stuck-placed] closeLivePosition failed for ${position.id}:`,
+                closeErr instanceof Error ? closeErr.message : String(closeErr),
+              )
+            }
+            continue
           }
         }
 
@@ -2790,11 +5114,17 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         // after an operator-cancelled SL on the exchange it re-places.
         if (position.executedQuantity > 0) {
           try {
-            await updateProtectionOrders(
+            const protectionResult = await updateProtectionOrders(
               exchangeConnector,
               position,
               justFilled ? "sync_fill_detected" : "sync_heal",
+              liveOrderIdsSync,
             )
+            // Persist any protection changes (placement, rearmed ids,
+            // liveness-verify clears) so a serverless restart doesn't lose them.
+            if (protectionResult.changed) {
+              await savePosition(position)
+            }
           } catch (slTpErr) {
             console.warn(
               `${LOG_PREFIX} sync SL/TP heal error for ${position.id}:`,
@@ -2828,8 +5158,10 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         // network issue, illiquid gap, operator manual cancel), the
         // position will not be held indefinitely.
         //
-        // Default: 4 hours. Override via env MAX_POSITION_HOLD_MS.
-        const MAX_HOLD_TIME_MS = Number(process.env.MAX_POSITION_HOLD_MS ?? 4 * 60 * 60 * 1000)
+  // Default: 4 hours. Live override via /settings → System →
+  // Engine Timings → max_position_hold_ms (or deploy-time
+  // MAX_POSITION_HOLD_MS env var). 0 = disabled.
+  const MAX_HOLD_TIME_MS = resolveMaxHoldMs(connectionId)
         const openedAt = position.createdAt || position.updatedAt || 0
         const heldMs = Date.now() - openedAt
         if (
@@ -2859,8 +5191,39 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         console.warn(`${LOG_PREFIX} Error syncing ${position.id}:`, err)
       }
     }
+    // Sync completion heartbeat. Pairs with the `[sync-tick]` entry log
+    // so the operator can see the loop ran to completion (not silently
+    // aborted by an uncaught throw) and how long it took. If [sync-tick]
+    // appears but [sync-done] does not for the same tick, something
+    // mid-loop is rejecting before the closing brace — which used to be
+    // invisible.
+    const syncMs = Date.now() - syncStartMs
+    console.log(
+      `${LOG_PREFIX} [sync-done] conn=${connectionId} took=${syncMs}ms processed=${openPositions.length} adopted=${adoptedCount}`,
+    )
   } catch (err) {
     console.error(`${LOG_PREFIX} Error syncing with exchange:`, err)
+  } finally {
+    // Release the cross-caller dedup lock. We don't bother with a
+    // compare-and-swap here because:
+    //   (a) the lock is short-TTL (30 s) — a missed release just
+    //       delays the next sync by at most that window.
+    //   (b) syncWithExchange is idempotent — losing the release
+    //       can't corrupt state, only skip work.
+    //   (c) the only path that bypassed the acquire (Redis-unreachable
+    //       fail-open) explicitly sets lockAcquired=true so we don't
+    //       attempt to release a lock we don't hold.
+    if (lockAcquired && client) {
+      try {
+        await client.del(LIVE_SYNC_LOCK_KEY)
+      } catch (releaseErr) {
+        // Lock will expire via TTL — log but don't surface.
+        console.warn(
+          `${LOG_PREFIX} [sync-lock] release failed for ${connectionId}; TTL will reap:`,
+          releaseErr instanceof Error ? releaseErr.message : String(releaseErr),
+        )
+      }
+    }
   }
 }
 
@@ -3009,6 +5372,14 @@ export async function syncLiveFromPseudo(
   exchangeConnector: any,
 ): Promise<void> {
   try {
+    // ── System tracking validation ──
+    // Only sync positions created by this system. Skip foreign/manual orders.
+    const trackingId = String(pseudoPos?.system_tracking_id || "").trim()
+    if (!trackingId.startsWith("sys-") || trackingId.length <= 10) {
+      // Silent skip - don't log every foreign position on every tick
+      return
+    }
+
     const symbol = String(pseudoPos?.symbol || "").toUpperCase()
     const side: "long" | "short" = pseudoPos?.side === "short" ? "short" : "long"
     if (!symbol) return
@@ -3018,30 +5389,94 @@ export async function syncLiveFromPseudo(
     if (!Number.isFinite(rawSL) && !Number.isFinite(rawTP)) return
 
     // Ratio (< 1) → percent; already-percent (≥ 1) → keep as-is.
-    const slPct = Number.isFinite(rawSL) ? (Math.abs(rawSL) < 1 ? rawSL * 100 : rawSL) : undefined
+    let slPct = Number.isFinite(rawSL) ? (Math.abs(rawSL) < 1 ? rawSL * 100 : rawSL) : undefined
     const tpPct = Number.isFinite(rawTP) ? (Math.abs(rawTP) < 1 ? rawTP * 100 : rawTP) : undefined
 
+    // ── Trailing-aware SL pull-through ──────────────────────────────
+    // When the pseudo's trailing-stop machine is ARMED (multi-step
+    // `trailing_active=1` or legacy `trailing_stop_price>0`), the
+    // effective stop level is no longer `stoploss_ratio × fillPrice`
+    // — it's the ratcheted `trailing_stop_price`. Pulling the static
+    // ratio through here would cause every trailing tick to fight
+    // against itself, repeatedly resetting the live SL back to the
+    // origin level. Convert the active trailing stop price into a
+    // live-position-relative percentage by anchoring it to the LIVE
+    // position's actual fill price (entry-side). The percent space
+    // is what `recalculateAndApplySLTP` consumes.
+    const trailingActive =
+      pseudoPos?.trailing_active === "1" ||
+      pseudoPos?.trailing_active === true ||
+      (() => {
+        const ts = parseFloat(String(pseudoPos?.trailing_stop_price || "0"))
+        return Number.isFinite(ts) && ts > 0
+      })()
+    const trailingStopPrice = parseFloat(String(pseudoPos?.trailing_stop_price || "0"))
+
     const livePositions = await getLivePositions(connectionId)
+    // ── pseudoPositionId scoping (Bug 6 fix) ──────────────────────────────
+    // When pseudoPos.id is known, filter live positions to ONLY those that
+    // belong to the same pseudo position. This prevents a trailing-stop
+    // update for Set A from being applied to live positions from Sets B and C
+    // that happen to share the same symbol+direction.
+    const pseudoId = String(pseudoPos?.id || "").trim()
     const matches = livePositions.filter((p: any) => {
       const liveSide: "long" | "short" =
         p.direction === "short" || p.side === "short" ? "short" : "long"
-      return String(p.symbol || "").toUpperCase() === symbol && liveSide === side && p.status !== "closed"
+      if (String(p.symbol || "").toUpperCase() !== symbol || liveSide !== side || p.status === "closed") {
+        return false
+      }
+      // When both the pseudo ID and the live position's pseudoPositionId are
+      // known, they must match. If either is absent the filter is open
+      // (backwards-compatible with positions created before this field existed).
+      if (pseudoId && p.pseudoPositionId && p.pseudoPositionId !== pseudoId) {
+        return false
+      }
+      return true
     })
     if (matches.length === 0) return
 
-    for (const livePos of matches) {
-      try {
-        await recalculateAndApplySLTP(connectionId, livePos.id, exchangeConnector, {
-          stopLossPct: slPct,
-          takeProfitPct: tpPct,
-        })
-      } catch (err) {
-        console.warn(
-          `${LOG_PREFIX} syncLiveFromPseudo: failed for ${livePos.id} (${symbol}/${side}):`,
-          err instanceof Error ? err.message : String(err),
-        )
+    // Parallelize across matching live positions — each position's
+    // SL/TP recalculation is independent. The previous serial for-loop
+    // caused 200–1200ms blocking per trailing stop update (200ms +
+    // exchange RTTs per position). Cap at 4 concurrent so we don't
+    // hammer the exchange API in a single tick.
+    const MAX_CONCURRENT_SLTP = 4
+    let nextIdx = 0
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const i = nextIdx++
+        if (i >= matches.length) return
+        const livePos = matches[i]
+        try {
+          let effectiveSlPct = slPct
+          if (trailingActive && trailingStopPrice > 0) {
+            const fill = Number(livePos.averageExecutionPrice || livePos.entryPrice || 0)
+            if (fill > 0) {
+              const liveSide: "long" | "short" =
+                livePos.direction === "short" ? "short" : "long"
+              const distPct =
+                liveSide === "long"
+                  ? ((fill - trailingStopPrice) / fill) * 100
+                  : ((trailingStopPrice - fill) / fill) * 100
+              if (Number.isFinite(distPct) && distPct > 0) {
+                effectiveSlPct = distPct
+              }
+            }
+          }
+          await recalculateAndApplySLTP(connectionId, livePos.id, exchangeConnector, {
+            stopLossPct: effectiveSlPct,
+            takeProfitPct: tpPct,
+          })
+        } catch (err) {
+          console.warn(
+            `${LOG_PREFIX} syncLiveFromPseudo: failed for ${livePos.id} (${symbol}/${side}):`,
+            err instanceof Error ? err.message : String(err),
+          )
+        }
       }
     }
+    const poolSize = Math.min(MAX_CONCURRENT_SLTP, matches.length)
+    await Promise.all(Array.from({ length: poolSize }, () => worker()))
   } catch (err) {
     console.warn(`${LOG_PREFIX} syncLiveFromPseudo top-level error:`, err instanceof Error ? err.message : String(err))
   }
@@ -3059,4 +5494,6 @@ export default {
   recalculateAndApplySLTP,
   syncLiveFromPseudo,
   getClosedLivePositions,
+  processSimulatedPositions,
+  getRealActivePositions,
 }

@@ -1,5 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { getSettings, setSettings, bumpSettingsVersion } from "@/lib/redis-db"
+import { getSettings, setSettings, bumpSettingsVersion, getAllConnections } from "@/lib/redis-db"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
+import { refreshEngineTimings } from "@/lib/engine-timings"
 
 /**
  * System-scoped settings bundle (rate limits, cleanup, backup toggles).
@@ -54,10 +56,36 @@ export async function PATCH(request: NextRequest) {
 
     await writeMirroredSystem(merged)
 
+    // Force-refresh the in-process engine-timings cache so the next tick
+    // on THIS server (and the next cron sweep on a serverless instance)
+    // sees the new values without waiting for the 10 s TTL to expire.
+    // Multi-instance deploys still pick up changes on their own next
+    // refresh — that's the eventual-consistency window.
+    await refreshEngineTimings({ force: true }).catch(() => {})
+
+    // Signal all running engines to recoordinate immediately with the new
+    // system settings (prehistoric range, cleanup schedule, etc.).
+    const changedKeys = Object.keys(body || {})
+    try {
+      const connections = await getAllConnections().catch(() => [])
+      const activeConns = (connections || []).filter((c: any) =>
+        c.is_enabled === "1" || c.is_enabled === true
+      )
+      await Promise.all(
+        activeConns.map(async (conn: any) => {
+          try {
+            await notifySettingsChanged(conn.id, changedKeys.length > 0 ? changedKeys : ["system_settings"])
+            const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+            await getGlobalTradeEngineCoordinator().applyPendingChangesNow(conn.id)
+          } catch { /* non-critical */ }
+        })
+      )
+    } catch { /* non-critical */ }
+
     return NextResponse.json({
       success: true,
       data: merged,
-      updated: Object.keys(body).length,
+      updated: changedKeys.length,
     })
   } catch (error) {
     console.error("[v0] Failed to save system settings:", error)

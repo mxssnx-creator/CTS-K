@@ -8,16 +8,67 @@
 
 // Force module rebuild timestamp: 1712341200000
 const _STRATEGY_BUILD_VERSION = "2.1.0"
-
-// `getSettings`, `getAppSettings`, `createPosition` no longer imported —
-// they were only consumed by the now-removed per-variant evaluators
-// and direct pseudo-position creator. Live flow imports come exclusively
-// from `StrategyCoordinator` + `PseudoPositionManager`.
-import { initRedis, getIndications } from "@/lib/redis-db"
+import { getSettings, setSettings, getRedisClient, initRedis, getIndications } from "@/lib/redis-db"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { StrategyCoordinator } from "@/lib/strategy-coordinator"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { trackStrategyStats } from "@/lib/statistics-tracker"
+// Strategy-flow throttle values are read live from `settings:system`. The
+// module-level constants below remain as defaults — used when the
+// engine-timings cache is empty (process cold start) or holds an invalid
+// value that fails the clamp.
+import { getEngineTimings } from "@/lib/engine-timings"
+
+// ── Per-(connection,symbol) strategy-flow throttle ─────────────────────
+// PROBLEM: the engine strategy timer fires every DEFAULT_CYCLE_PAUSE_MS
+// (50 ms). Each tick calls `processStrategy(symbol)` for every watched
+// symbol. With indications growing by ~4 per cycle, the strategy flow
+// was re-evaluating the SAME 1000+ indications and re-creating the SAME
+// 1605 Main sets ~20× per second per symbol — burning CPU, flooding
+// logs, and (under multi-symbol watchlists) saturating Redis with
+// redundant Set writes.
+//
+// FIX: gate `processStrategy` per (connectionId,symbol). Skip the
+// expensive flow when:
+//   - the indication fingerprint (count + latest-timestamp) is unchanged
+//     AND less than STRATEGY_FLOW_MIN_INTERVAL_MS has elapsed since the
+//     last run, OR
+//   - less than STRATEGY_FLOW_HARD_THROTTLE_MS has elapsed since the last
+//     run (even if fingerprint changed — protects against pathological
+//     indication generators that bump the timestamp every tick).
+//
+// We still let the heartbeat run on STRATEGY_FLOW_MAX_INTERVAL_MS even
+// when fingerprint is unchanged so the dashboard "last run" telemetry
+// stays fresh and stale-set-cleanup runs periodically.
+const STRATEGY_FLOW_MIN_INTERVAL_MS = 1_500  // when fingerprint changed
+const STRATEGY_FLOW_HARD_THROTTLE_MS = 750   // absolute minimum gap
+const STRATEGY_FLOW_MAX_INTERVAL_MS = 15_000 // heartbeat re-run
+
+interface FlowThrottleEntry {
+  lastRunAt: number          // wall-clock ms of last successful run
+  lastIndicationCount: number
+  lastLatestTimestamp: number
+}
+
+// Map<`${connectionId}:${symbol}`, FlowThrottleEntry>
+const flowThrottle = new Map<string, FlowThrottleEntry>()
+
+/**
+ * Release all throttle entries for a connection — called from the
+ * engine's `stop()` path. Without this, a stopped engine's entries
+ * linger in the module-level map until the next process restart. For
+ * a single-tenant deployment that's negligible (≤ a few dozen entries),
+ * but for multi-tenant setups that bounce engines frequently it lets
+ * memory grow unbounded. Also guarantees that an immediate restart of
+ * the SAME connection starts with a clean slate so the very first
+ * tick after restart isn't accidentally gated by a stale fingerprint.
+ */
+export function clearFlowThrottleForConnection(connectionId: string): void {
+  const prefix = `${connectionId}:`
+  for (const key of flowThrottle.keys()) {
+    if (key.startsWith(prefix)) flowThrottle.delete(key)
+  }
+}
 
 export class StrategyProcessor {
   private connectionId: string
@@ -36,6 +87,33 @@ export class StrategyProcessor {
     try {
       await initRedis()
       
+      // ── CHECK: Settings dirty flag and reload if needed ────────────────────────
+      // When user updates connection settings via UI, a dirty flag is set.
+      // On the next processor tick, we detect it and reload the configuration
+      // so engine immediately reflects the new settings.
+      try {
+        const client = getRedisClient()
+        const dirtyKey = `settings:dirty:${this.connectionId}`
+        const isDirty = await client.get(dirtyKey)
+        if (isDirty) {
+          // Clear the dirty flag
+          await client.del(dirtyKey)
+          
+          // Clear flow throttle cache so next cycle re-evaluates immediately
+          clearFlowThrottleForConnection(this.connectionId)
+          
+          console.log(
+            `[v0] [StrategyProcessor] Settings reloaded for ${this.connectionId} - flow throttle cleared, will re-evaluate next cycle`
+          )
+        }
+      } catch (settingsErr) {
+        // Non-critical - continue processing even if dirty check fails
+        console.warn(
+          `[v0] [StrategyProcessor] Settings dirty check failed:`,
+          settingsErr instanceof Error ? settingsErr.message : String(settingsErr)
+        )
+      }
+      
       // If no indications passed, retrieve from Redis (populated by indication processor)
       if (!indications || indications.length === 0) {
         indications = await this.getActiveIndications(symbol)
@@ -50,14 +128,20 @@ export class StrategyProcessor {
       // Spec: *"indications calcs for each Type and config coord possibility
       // and evaluated If correct, then inits Strategies calc"*.
       //
-      // Strategy flow should only kick in once indications have been
-      // calculated AND passed per-type validation. Validation here is
-      // permissive (we don't want to starve Base-level learning), but
-      // we DO require at least one indication per distinct `type` to
-      // pass a minimal profit-factor floor. If zero indications pass
-      // the gate, skip the flow with a log event so the dashboard can
-      // surface the state — otherwise we'd silently churn on empty
-      // evaluations every cycle.
+      // Strategy flow kicks in once indications have been calculated AND
+      // passed per-type validation. Validation here is INTENTIONALLY
+      // permissive to avoid starving Base-level learning on a fresh
+      // engine where no PF has been computed yet:
+      //
+      //   - validated === false → explicit reject (skip)
+      //   - validated === true  → explicit accept
+      //   - PF missing/zero     → ACCEPT (fresh indication, no learning yet)
+      //   - PF present          → require PF >= floor
+      //
+      // The downstream Base/Main/Real filters apply their own PF+DDT
+      // thresholds on derived Sets, so passing fresh indications through
+      // here does not weaken the production order pipeline — it only
+      // ensures the engine can bootstrap its statistics.
       const VALIDITY_PF_FLOOR = 0.5
       const validIndications = indications.filter((ind) => {
         if (!ind) return false
@@ -67,11 +151,16 @@ export class StrategyProcessor {
         // Keep anything with an explicit `validated === true` regardless
         // of PF (the indication processor already vetted it).
         if (ind.validated === true) return true
-        // Legacy path: accept indications whose canonical profit-factor
-        // field meets the floor. Read both camelCase (new writer) and
-        // snake_case (legacy writer) field names.
-        const pf = Number(ind.profitFactor ?? ind.profit_factor ?? 0)
-        return Number.isFinite(pf) && pf >= VALIDITY_PF_FLOOR
+        // Read both camelCase (new writer) and snake_case (legacy writer)
+        // field names.
+        const pfRaw = ind.profitFactor ?? ind.profit_factor
+        // Fresh indication path: when PF has never been written, the
+        // indication has not been graded yet. Accept it so Base learning
+        // can bootstrap — downstream stages still apply their own gates.
+        if (pfRaw === undefined || pfRaw === null) return true
+        const pf = Number(pfRaw)
+        if (!Number.isFinite(pf) || pf === 0) return true
+        return pf >= VALIDITY_PF_FLOOR
       })
 
       if (validIndications.length === 0) {
@@ -87,7 +176,72 @@ export class StrategyProcessor {
         return { strategiesEvaluated: 0, liveReady: 0 }
       }
 
-      console.log(`[v0] [StrategyFlow] ${symbol}: Starting progressive evaluation with ${validIndications.length}/${indications.length} valid indications`)
+      // ── Throttle gate ────────────────────────────────────────────────
+      // Compute a cheap fingerprint of the indication set: (count, most
+      // recent timestamp). If unchanged from the last run AND we're
+      // inside the min-interval window, skip the expensive flow. This
+      // prevents the 20×/sec re-evaluation feedback loop documented in
+      // the module header above. The flow still runs on:
+      //   - first call for this (conn, symbol)
+      //   - fingerprint change (new indications arrived)
+      //   - heartbeat (STRATEGY_FLOW_MAX_INTERVAL_MS elapsed)
+      // and is ALWAYS gated by STRATEGY_FLOW_HARD_THROTTLE_MS regardless
+      // of fingerprint changes (protects against pathological generators
+      // that bump the timestamp every tick).
+      const throttleKey = `${this.connectionId}:${symbol}`
+      const now = Date.now()
+      const latestIndicationTs = validIndications.reduce(
+        (max, ind) => {
+          const t = Number(ind?.timestamp ?? 0)
+          return Number.isFinite(t) && t > max ? t : max
+        },
+        0,
+      )
+      const prev = flowThrottle.get(throttleKey)
+      if (prev) {
+        const elapsed = now - prev.lastRunAt
+        // Read live throttle values from settings:system at gate-eval
+        // time (cheap in-memory cache hit). Settings updates from the
+        // UI take effect within ~10 s without restart.
+        const _t = getEngineTimings()
+        const HARD_THROTTLE_MS = _t.strategyFlowHardThrottleMs || STRATEGY_FLOW_HARD_THROTTLE_MS
+        const MIN_INTERVAL_MS  = _t.strategyFlowMinIntervalMs  || STRATEGY_FLOW_MIN_INTERVAL_MS
+        const MAX_INTERVAL_MS  = _t.strategyFlowMaxIntervalMs  || STRATEGY_FLOW_MAX_INTERVAL_MS
+        // Hard throttle: never re-run within HARD_THROTTLE_MS, period.
+        if (elapsed < HARD_THROTTLE_MS) {
+          return { strategiesEvaluated: 0, liveReady: 0 }
+        }
+        // Within MIN_INTERVAL: only re-run if fingerprint changed.
+        if (elapsed < MIN_INTERVAL_MS) {
+          const fingerprintUnchanged =
+            prev.lastIndicationCount === validIndications.length &&
+            prev.lastLatestTimestamp === latestIndicationTs
+          if (fingerprintUnchanged) {
+            return { strategiesEvaluated: 0, liveReady: 0 }
+          }
+        }
+        // Past MIN_INTERVAL but under MAX_INTERVAL: also require
+        // fingerprint change. Past MAX_INTERVAL: always run (heartbeat).
+        if (elapsed < MAX_INTERVAL_MS) {
+          const fingerprintUnchanged =
+            prev.lastIndicationCount === validIndications.length &&
+            prev.lastLatestTimestamp === latestIndicationTs
+          if (fingerprintUnchanged) {
+            return { strategiesEvaluated: 0, liveReady: 0 }
+          }
+        }
+      }
+      // Reserve the slot BEFORE the await so concurrent ticks for the
+      // same (conn,symbol) — possible if two engines somehow share a
+      // processor or HMR replays the timer — don't both fall through
+      // the gate. We update again on completion to record real data,
+      // but this provisional write is enough to keep concurrent callers
+      // throttled.
+      flowThrottle.set(throttleKey, {
+        lastRunAt: now,
+        lastIndicationCount: validIndications.length,
+        lastLatestTimestamp: latestIndicationTs,
+      })
 
       // Execute complete strategy coordination flow using ONLY the
       // validated indications. Base/Main/Real/Live filtering downstream
@@ -133,8 +287,13 @@ export class StrategyProcessor {
           realLiveReady = result.passedEvaluation
         }
 
+        // MAIN fans out (more output than input), so label differs:
+        // BASE/REAL/LIVE: "N passed / M evaluated" (filter). MAIN: "N from M base" (fanout).
+        const stageLabel = result.type === "main"
+          ? `${result.passedEvaluation} Sets from ${result.totalCreated} base`
+          : `${result.passedEvaluation}/${result.totalCreated} Sets passed`
         console.log(
-          `[v0] [StrategyFlow] ${symbol} ${result.type.toUpperCase()}: ${result.passedEvaluation}/${result.totalCreated} Sets passed | ` +
+          `[v0] [StrategyFlow] ${symbol} ${result.type.toUpperCase()}: ${stageLabel} | ` +
           `PF=${result.avgProfitFactor.toFixed(2)} | DDT=${Math.round(result.avgDrawdownTime)}min`
         )
 

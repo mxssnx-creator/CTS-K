@@ -64,8 +64,8 @@ export async function GET(request: NextRequest) {
     let lossCount = 0
     let winSum = 0
     let lossSum = 0
-    let largestWin = 0
-    let largestLoss = 0
+    let largestWin = -Infinity
+    let largestLoss = Infinity
     let totalHoldingTime = 0
 
     for (const posId of positionIds) {
@@ -115,14 +115,14 @@ export async function GET(request: NextRequest) {
       open_positions: openPositions,
       closed_positions: closedPositions,
       total_pnl: parseFloat(totalPnL.toFixed(2)),
-      total_pnl_percent: totalPositions > 0 ? parseFloat(((totalPnL / (totalPositions * 1000)) * 100).toFixed(2)) : 0,
+      total_pnl_percent: winCount + lossCount > 0 ? parseFloat(((winCount - lossCount) / (winCount + lossCount) * 100).toFixed(2)) : 0,
       win_count: winCount,
       loss_count: lossCount,
       win_rate: parseFloat(winRate.toFixed(2)),
       avg_win: parseFloat(avgWin.toFixed(2)),
       avg_loss: parseFloat(Math.abs(avgLoss).toFixed(2)),
-      largest_win: parseFloat(largestWin.toFixed(2)),
-      largest_loss: parseFloat(largestLoss.toFixed(2)),
+      largest_win: isFinite(largestWin) ? parseFloat(largestWin.toFixed(2)) : 0,
+      largest_loss: isFinite(largestLoss) ? parseFloat(largestLoss.toFixed(2)) : 0,
       avg_holding_time_hours: parseFloat(avgHoldingTimeHours.toFixed(2)),
     }
 

@@ -103,7 +103,15 @@ export class DatabaseFiller {
         for (const ind of typeInds) {
           await client.lpush(key, JSON.stringify(ind))
         }
-        await client.ltrim(key, 0, 4999)
+        // Cap at 1000 (down from 5000) — dashboard reads at most ~50 at a
+        // time and these lists explode under prehistoric (one entry per
+        // candle × per type). Lower cap shrinks the in-memory snapshot
+        // without affecting any consumer behaviour.
+        await client.ltrim(key, 0, 999)
+        // 24h TTL: prehistoric per-symbol×type fills are diagnostic only,
+        // never durable state. Without the TTL, cancelled/abandoned
+        // symbols leak forever.
+        await client.expire(key, 86400).catch(() => 0)
       }
 
       // Store in overall symbol list
@@ -111,7 +119,8 @@ export class DatabaseFiller {
       for (const ind of indications) {
         await client.lpush(symbolKey, JSON.stringify(ind))
       }
-      await client.ltrim(symbolKey, 0, 9999)
+      await client.ltrim(symbolKey, 0, 1999) // 2k cap (down from 10k)
+      await client.expire(symbolKey, 86400).catch(() => 0)
 
       // Update indication counts hash
       const countsKey = `indications:${this.connectionId}:counts`
@@ -147,7 +156,8 @@ export class DatabaseFiller {
         for (const strat of stageStrats) {
           await client.lpush(key, JSON.stringify(strat))
         }
-        await client.ltrim(key, 0, 4999)
+        await client.ltrim(key, 0, 999) // 1k cap (down from 5k); see indications block above
+        await client.expire(key, 86400).catch(() => 0)
       }
 
       // Store in overall symbol list
@@ -155,7 +165,8 @@ export class DatabaseFiller {
       for (const strat of strategies) {
         await client.lpush(symbolKey, JSON.stringify(strat))
       }
-      await client.ltrim(symbolKey, 0, 9999)
+      await client.ltrim(symbolKey, 0, 1999) // 2k cap (down from 10k)
+      await client.expire(symbolKey, 86400).catch(() => 0)
 
       // Update strategy counts hash
       const countsKey = `strategies:${this.connectionId}:counts`
@@ -177,17 +188,20 @@ export class DatabaseFiller {
     try {
       const client = getRedisClient()
 
-      // Create symbol index
-      for (const symbol of symbols) {
-        await client.sadd(`engine:${this.connectionId}:symbols`, symbol)
-      }
-
-      // Create progression index
+      // Create symbol index — single SADD with variadic members so N
+      // symbols equals 1 Redis round-trip instead of N sequential
+      // awaits. Both ioredis and node-redis support `sadd(key, ...members)`.
+      const symbolKey = `engine:${this.connectionId}:symbols`
       const progressionKey = `engine:${this.connectionId}:progression`
-      await client.hset(progressionKey, {
-        symbolsCount: symbols.length.toString(),
-        lastUpdate: new Date().toISOString(),
-      })
+      await Promise.all([
+        symbols.length > 0
+          ? (client as any).sadd(symbolKey, ...symbols)
+          : Promise.resolve(0),
+        client.hset(progressionKey, {
+          symbolsCount: symbols.length.toString(),
+          lastUpdate: new Date().toISOString(),
+        }),
+      ])
 
       await this.logger.logSystem(`✓ Created indexes for ${symbols.length} symbols`)
     } catch (error) {

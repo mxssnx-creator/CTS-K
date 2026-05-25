@@ -4,6 +4,7 @@ import { useState, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { TrendingUp, TrendingDown, Activity, Zap } from "lucide-react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { getPosHistoryOverall } from "@/lib/pos-history"
 
 export interface ConnectionStats {
   connectionId: string
@@ -23,14 +24,14 @@ export interface ConnectionStats {
     live: number
     total: number
     evaluated: number
-    drawdown_max: number
-    drawdown_time_hours: number
+    // drawdown_max_usd: largest closed position loss in USD (rawnumber from posData.stats.largest_loss)
+    drawdown_max_usd: number
+    // drawdown_avg_hold_hours: avg position lifetime in hours, NOT a peak-to-trough drawdown duration
+    drawdown_avg_hold_hours: number
   }
-  profit_factor: {
-    last_5: number
-    last_15: number
-    last_50: number
-  }
+  // profitFactor: real server-side profit factor from closed position archive
+  // (sum(grossProfit) / sum(grossLoss)). Falls back to cycle-surrogate =0 when no archived positions yet.
+  profitFactor: number
   positions: {
     total_evaluated: number
     winning: number
@@ -117,6 +118,16 @@ export function StatisticsOverview({ connections }: StatisticsOverviewProps) {
         const strategyCycleCount = engineStatsData?.strategies?.cycleCount || metricsData.strategyCycleCount || 0
         const symbolCount = engineStatsData?.metadata?.symbolCount || 1
 
+        // Fetch real profit factor from closed position archive (pos-history).
+        // Falls back to 0 when no closed positions exist yet.
+        let profitFactor = 0
+        try {
+          const pfOverall = await getPosHistoryOverall(conn.id)
+          if (pfOverall.hasSignal) profitFactor = pfOverall.profitFactor
+        } catch {
+          // pos-history not yet available on fresh boot
+        }
+
         return {
           connectionId: conn.id,
           connectionName: conn.name,
@@ -137,14 +148,12 @@ export function StatisticsOverview({ connections }: StatisticsOverviewProps) {
             total: engineStatsData?.strategies?.totalRecords || 0,
             evaluated: strategyCycleCount,
             cycleCount: strategyCycleCount,
-            drawdown_max: parseFloat(posData.stats?.largest_loss || "0"),
-            drawdown_time_hours: parseFloat(posData.stats?.avg_holding_time_hours || "0"),
+            // largest_loss is a raw USD amount — display as $ not %
+            drawdown_max_usd: Math.abs(parseFloat(posData.stats?.largest_loss || "0")),
+            // drawdown_avg_hold_hours is currently the average position holding duration
+            drawdown_avg_hold_hours: parseFloat(posData.stats?.avg_holding_time_hours || "0"),
           },
-          profit_factor: {
-            last_5: stateData.cycleSuccessRate ? stateData.cycleSuccessRate / 50 : 0,
-            last_15: stateData.cycleSuccessRate ? stateData.cycleSuccessRate / 45 : 0,
-            last_50: stateData.cycleSuccessRate ? stateData.cycleSuccessRate / 40 : 0,
-          },
+          profitFactor,
           positions: {
             total_evaluated: posData.stats?.total_positions || stateData.totalTrades || 0,
             winning: posData.stats?.win_count || stateData.successfulTrades || 0,
@@ -177,14 +186,12 @@ export function StatisticsOverview({ connections }: StatisticsOverviewProps) {
             live: validStats.reduce((sum, s) => sum + s.strategies.live, 0),
             total: validStats.reduce((sum, s) => sum + s.strategies.total, 0),
             evaluated: validStats.reduce((sum, s) => sum + s.strategies.evaluated, 0),
-            drawdown_max: Math.max(...validStats.map((s) => s.strategies.drawdown_max)),
-            drawdown_time_hours: validStats.reduce((sum, s) => sum + s.strategies.drawdown_time_hours, 0) / validStats.length,
+            drawdown_max_usd: Math.max(...validStats.map((s) => s.strategies.drawdown_max_usd)),
+            drawdown_avg_hold_hours: validStats.reduce((sum, s) => sum + s.strategies.drawdown_avg_hold_hours, 0) / validStats.length,
           },
-          profit_factor: {
-            last_5: validStats.reduce((sum, s) => sum + s.profit_factor.last_5, 0) / validStats.length,
-            last_15: validStats.reduce((sum, s) => sum + s.profit_factor.last_15, 0) / validStats.length,
-            last_50: validStats.reduce((sum, s) => sum + s.profit_factor.last_50, 0) / validStats.length,
-          },
+          profitFactor: validStats.length > 0
+            ? Math.round(validStats.reduce((sum, s) => sum + s.profitFactor, 0) / validStats.length * 100) / 100
+            : 0,
           positions: {
             total_evaluated: validStats.reduce((sum, s) => sum + s.positions.total_evaluated, 0),
             winning: validStats.reduce((sum, s) => sum + s.positions.winning, 0),
@@ -304,7 +311,7 @@ function StatisticsCards({ stats }: { stats: ConnectionStats }) {
             Strategies
           </CardTitle>
           <CardDescription>
-            Cycles: {(stats.strategies as any).cycleCount} | Drawdown: {stats.strategies.drawdown_max.toFixed(1)}% | Time: {stats.strategies.drawdown_time_hours.toFixed(1)}h
+            Cycles: {(stats.strategies as any).cycleCount} | Largest Loss: ${stats.strategies.drawdown_max_usd.toFixed(0)} | Avg Hold: {stats.strategies.drawdown_avg_hold_hours.toFixed(1)}h
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -339,32 +346,10 @@ function StatisticsCards({ stats }: { stats: ConnectionStats }) {
         </CardHeader>
         <CardContent className="space-y-2">
           <div className="flex items-center justify-between text-sm">
-            <span className="text-muted-foreground">Last 5</span>
+            <span className="text-muted-foreground">Overall</span>
             <div className="flex items-center gap-1">
-              <span className="font-semibold">{stats.profit_factor.last_5.toFixed(2)}</span>
-              {stats.profit_factor.last_5 >= 1 ? (
-                <TrendingUp className="h-3 w-3 text-green-500" />
-              ) : (
-                <TrendingDown className="h-3 w-3 text-red-500" />
-              )}
-            </div>
-          </div>
-          <div className="flex items-center justify-between text-sm">
-            <span className="text-muted-foreground">Last 15</span>
-            <div className="flex items-center gap-1">
-              <span className="font-semibold">{stats.profit_factor.last_15.toFixed(2)}</span>
-              {stats.profit_factor.last_15 >= 1 ? (
-                <TrendingUp className="h-3 w-3 text-green-500" />
-              ) : (
-                <TrendingDown className="h-3 w-3 text-red-500" />
-              )}
-            </div>
-          </div>
-          <div className="flex items-center justify-between text-sm">
-            <span className="text-muted-foreground">Last 50</span>
-            <div className="flex items-center gap-1">
-              <span className="font-semibold">{stats.profit_factor.last_50.toFixed(2)}</span>
-              {stats.profit_factor.last_50 >= 1 ? (
+              <span className="font-semibold">{stats.profitFactor.toFixed(2)}</span>
+              {stats.profitFactor >= 1 ? (
                 <TrendingUp className="h-3 w-3 text-green-500" />
               ) : (
                 <TrendingDown className="h-3 w-3 text-red-500" />

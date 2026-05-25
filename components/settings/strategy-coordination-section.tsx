@@ -56,6 +56,46 @@ export interface CoordinationSettings {
     dca:      boolean
     pause:    boolean
   }
+  // ── Block-strategy: live position × vol-ratio coordination ──────────
+  // Knobs that flow into the Block variant's runtime size scaling.
+  // The coordinator multiplies each Block sub-config's base size by
+  //   m(n) = 1 + (n − 1) × blockVolumeRatio
+  // where n = live continuousCount on the symbol. blockMaxStack caps n
+  // (gate closes at n ≥ blockMaxStack) so the stacking is bounded.
+  blockVolumeRatio: number // 0.25..3.0 per spec band (UI clamps; engine re-clamps)
+  blockMaxStack:    number // 2..8 (gate uses `n < blockMaxStack`)
+
+  /**
+   * ── Prev-PI threshold (operator spec) ──────────────────────────────
+   *
+   * Activation threshold for the historic-PI blend at Base stage and
+   * the per-variant Real-stage tuner. Below this many CLOSED positions
+   * in the (symbol × indicationType × direction) bucket, the engine
+   * runs in BOOTSTRAP mode (= raw indication PF, no historic blend) so
+   * fresh boots can produce trades immediately. At/above the threshold
+   * the engine engages historic PF min-blend and Real-stage size/leverage
+   * tuning. Default 5 = smallest statistically meaningful denominator.
+   * Backed by `connection_settings:{conn}.prevPosMinCount`.
+   */
+  prevPosMinCount: number // 1..50, default 5
+
+  /**
+   * ── Main-stage validation min position-count ───────────────────────
+   * Operator spec: At Main, only Base Sets whose `entryCount >=
+   * mainEvalPosCount` are run through PF + DDT validation. Sets with
+   * fewer completed pseudo-positions are SKIPPED (not counted as passed,
+   * not promoted) — they re-enter the validation pool on subsequent
+   * cycles once enough positions have closed.
+   * Range 5..50 step 5, default 15.
+   */
+  mainEvalPosCount: number
+
+  /**
+   * ── Real-stage validation min position-count ───────────────────────
+   * Same semantics as `mainEvalPosCount` but applied at Real (Main →
+   * Real promotion). Range 5..50 step 5, default 10.
+   */
+  realEvalPosCount: number
 }
 
 /** Spec-aligned defaults — match the constants in strategy-coordinator.ts. */
@@ -72,6 +112,11 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
     dca:      true,
     pause:    true,
   },
+  blockVolumeRatio: 1.0,
+  blockMaxStack:    3,
+  prevPosMinCount:   5,
+  mainEvalPosCount: 15,
+  realEvalPosCount: 10,
 }
 
 interface StrategyCoordinationSectionProps {
@@ -417,6 +462,310 @@ export function StrategyCoordinationSection({
               </div>
             )
           })}
+        </CardContent>
+      </Card>
+
+      {/* ── Block tuning card ────────────────────────────────────────
+          Two-axis live-coordination knobs for the Block variant:
+            • Volume-ratio slider → additive multiplier per live position
+            • Max-stack stepper   → upper bound on the gate (n < stack) */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <CardTitle className="text-sm">
+                Block — Live Position × Vol-Ratio
+              </CardTitle>
+              <CardDescription className="text-xs">
+                Adjusts how the Block variant scales add-on size by the live
+                open-position count on the symbol. The emitted Set&apos;s
+                size multiplier follows{" "}
+                <span className="font-mono text-[11px]">
+                  m(n) = 1 + (n − 1) × ratio
+                </span>{" "}
+                where <strong>n</strong> is the per-symbol open count and{" "}
+                <strong>ratio</strong> is set below. The gate closes when{" "}
+                <span className="font-mono text-[11px]">n ≥ max-stack</span>{" "}
+                so stacking is always bounded.
+              </CardDescription>
+            </div>
+            <Badge
+              variant={value.variants.block ? "default" : "outline"}
+              className="text-[10px]"
+            >
+              {value.variants.block ? "Active" : "Disabled"}
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Volume ratio */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <Label className="text-sm font-semibold">Volume Ratio</Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Additive scaling step per extra open position on the
+                  symbol. 1.0 ≈ doubles per add-on (spec default); 0.25 is
+                  conservative; 3.0 is aggressive. Engine clamps to
+                  0.25–3.0 even if the value is bypassed.
+                </p>
+              </div>
+              <Badge variant="outline" className="text-[10px] tabular-nums">
+                0.25–3.0
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.blockVolumeRatio]}
+                min={0.25}
+                max={3.0}
+                step={0.05}
+                onValueChange={(v) =>
+                  onChange({ ...value, blockVolumeRatio: Number(v[0].toFixed(2)) })
+                }
+                disabled={!value.variants.block}
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-10 text-right">
+                {value.blockVolumeRatio.toFixed(2)}×
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-2 pt-1 text-[11px]">
+              {[1, 2, 3].map((n) => {
+                const mul = 1 + (n - 1) * value.blockVolumeRatio
+                return (
+                  <div
+                    key={n}
+                    className="rounded-md border border-border/60 p-2 flex items-center justify-between gap-2"
+                  >
+                    <span className="text-muted-foreground">
+                      n={n}
+                    </span>
+                    <span className="font-mono tabular-nums font-semibold">
+                      ×{mul.toFixed(2)}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Max stack */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <Label className="text-sm font-semibold">Max Stack</Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Upper bound on the Block gate: variant fires only while{" "}
+                  <span className="font-mono text-[11px]">
+                    1 ≤ n &lt; max-stack
+                  </span>
+                  . Default 3 means the variant emits at n=1 and n=2 then
+                  closes. Engine clamps to 2–8.
+                </p>
+              </div>
+              <Badge variant="outline" className="text-[10px] tabular-nums">
+                2–8
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.blockMaxStack]}
+                min={2}
+                max={8}
+                step={1}
+                onValueChange={(v) =>
+                  onChange({ ...value, blockMaxStack: v[0] })
+                }
+                disabled={!value.variants.block}
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-8 text-right">
+                {value.blockMaxStack}
+              </span>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ── Prev-PI Influence card ───────────────────────────────────
+          Operator spec: "make sure strategies are evaluating prev pis
+          and profitfactors min from historic … prev pis cnts are
+          working and added to settings,strategy".
+
+          One number — the activation threshold below which the engine
+          runs in BOOTSTRAP mode (raw indication PF, no historic blend).
+          At/above the threshold, Base avgProfitFactor becomes the MIN
+          of (live PF, historic PF) and Real-stage size/leverage tuning
+          activates per (symbol × indicationType × direction). */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <CardTitle className="text-sm">
+                Prev-PI Influence — Historic Blend Threshold
+              </CardTitle>
+              <CardDescription className="text-xs">
+                Activation gate for the historic-PF blend at Base and the
+                Real-stage size/leverage tuner. Below this many CLOSED
+                positions in the{" "}
+                <span className="font-mono text-[11px]">
+                  (symbol × indicationType × direction)
+                </span>{" "}
+                bucket the engine runs in <strong>bootstrap</strong> mode
+                (raw indication PF, no blend) so fresh boots can produce
+                trades immediately. At/above the threshold the engine
+                MIN-blends realised PF into{" "}
+                <span className="font-mono text-[11px]">
+                  avgProfitFactor
+                </span>{" "}
+                — historic underperformance pulls the bar down so Base
+                → Main filters reject it. Default 5 = smallest
+                statistically meaningful denominator.
+              </CardDescription>
+            </div>
+            <Badge variant="outline" className="text-[10px] tabular-nums">
+              1–50
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <Label className="text-sm font-semibold">
+                Min closed positions for blend
+              </Label>
+              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                default 5
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.prevPosMinCount]}
+                min={1}
+                max={50}
+                step={1}
+                onValueChange={(v) =>
+                  onChange({ ...value, prevPosMinCount: v[0] })
+                }
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-8 text-right">
+                {value.prevPosMinCount}
+              </span>
+            </div>
+            <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
+              Lower = engages historic blend faster (small samples can be
+              noisy). Higher = waits for more data before letting history
+              influence current decisions. The Real-stage tuner uses the
+              same threshold to gate per-variant size/leverage adjustments
+              (Block size scaling, DCA leverage capping, Pos-coord axis
+              size). Counts and live status are surfaced on the Strategy
+              Pipeline dashboard tile.
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+      {/* ── Stage Validation Position-Count card ─────────────────────
+          Operator spec:
+            • Main evaluates Base with PF + DDT for X pre pseudo
+              positions per Set (min positions to validate). Default 15.
+            • Real evaluates Main the same way. Default 10.
+          If a Set has fewer positions than the threshold it is SKIPPED
+          (not validated, not promoted, no count bump) — re-evaluated
+          on subsequent cycles once enough positions accumulate. */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <CardTitle className="text-sm">
+                Stage Validation — Min Positions per Set
+              </CardTitle>
+              <CardDescription className="text-xs">
+                Minimum completed pseudo-positions a Set must contain
+                before its <strong>profit-factor</strong> and{" "}
+                <strong>drawdown-time</strong> are evaluated for promotion
+                to the next stage. Below the threshold the Set is
+                <em> skipped</em> (not validated, not counted) — it
+                re-enters the validation pool on subsequent cycles once
+                enough positions have closed. Drawdown-time ceiling at
+                Main + Real is <strong>5 hours</strong>.
+              </CardDescription>
+            </div>
+            <Badge variant="outline" className="text-[10px] tabular-nums">
+              8–80 step 2
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {/* Main */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <Label className="text-sm font-semibold">
+                  Main — Min positions to validate
+                </Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Base → Main: a Base Set is validated against{" "}
+                  <span className="font-mono text-[11px]">minPF</span> and{" "}
+                  <span className="font-mono text-[11px]">maxDDT (5h)</span>{" "}
+                  only when its entry count meets this threshold.
+                </p>
+              </div>
+              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                default 15
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.mainEvalPosCount]}
+                min={8}
+                max={80}
+                step={2}
+                onValueChange={(v) =>
+                  onChange({ ...value, mainEvalPosCount: v[0] })
+                }
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-8 text-right">
+                {value.mainEvalPosCount}
+              </span>
+            </div>
+          </div>
+          {/* Real */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <Label className="text-sm font-semibold">
+                  Real — Min positions to validate
+                </Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Main → Real: a Main Set is validated against{" "}
+                  <span className="font-mono text-[11px]">minPF</span> and{" "}
+                  <span className="font-mono text-[11px]">maxDDT (5h)</span>{" "}
+                  only when its entry count meets this threshold.
+                </p>
+              </div>
+              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                default 10
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.realEvalPosCount]}
+                min={8}
+                max={80}
+                step={2}
+                onValueChange={(v) =>
+                  onChange({ ...value, realEvalPosCount: v[0] })
+                }
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-8 text-right">
+                {value.realEvalPosCount}
+              </span>
+            </div>
+          </div>
         </CardContent>
       </Card>
     </div>
