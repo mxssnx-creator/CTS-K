@@ -1859,41 +1859,53 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.real
 
-    // ── Stage-validation min-position threshold (operator spec, systemwide fix) ────
-    // Same semantics as Main: Sets below `realEvalPosCount` are
-    // MARKED as invalid with status flag — they're not validated against PF/DDT
-    // and not promoted to Real, but kept in map for re-evaluation on subsequent
-    // cycles once entryCount accumulates. Default 10.
-    //
-    // For NEW systems with no history (baseEC=0, liveCont=0),
-    // don't reject sets purely on entryCount. If a set has at least 1 synthetic
-    // entry (axis Sets always have entries for synthetic tracking), it should
-    // pass the gate and be evaluated on PF/DDT merit. This allows fresh
-    // connections to start generating positions on cycle 1.
-    const realMinPos = this._coordinationSettings.realEvalPosCount
-    const beforePosGate = mainSets.length
-    const mainSetsEligible = mainSets.map((s) => {
-      const live = s.entryCount ?? s.entries?.length ?? 0
-      const hist = s.prevPos?.count ?? 0
-      const posCount = Math.max(live, hist)
-      
-      // ALLOW axis Sets with synthetic entries even if posCount < realMinPos
-      // (new systems need a way to start generating positions)
-      const hasEntries = (s.entries?.length ?? 0) > 0
-      const isAxisSet = s.axisWindows && s.axisWindows.direction
-      if (posCount < realMinPos && !(isAxisSet && hasEntries)) {
-        // Real(active) continuous validity: if this Set currently has active Real/Live positions or is in active config keys, keep it valid (operator requirement for ongoing Real stage sets)
-        const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
-        if (!hasActiveReal) {
-          s.status = "invalid"
-          s.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
-          return s
-        }
-        // Force valid for active Real orders to prevent loss in progress processing
-        s.status = "valid_real"
-      }
-      return s
-    })
+     // ── Stage-validation min-position threshold (operator spec, systemwide fix) ────
+     // Same semantics as Main: Sets below `realEvalPosCount` are
+     // MARKED as invalid with status flag — they're not validated against PF/DDT
+     // and not promoted to Real, but kept in map for re-evaluation on subsequent
+     // cycles once entryCount accumulates. Default 10.
+     //
+     // For NEW systems with no history (baseEC=0, liveCont=0),
+     // don't reject sets purely on entryCount. If a set has at least 1 synthetic
+     // entry (axis Sets always have entries for synthetic tracking), it should
+     // pass the gate and be evaluated on PF/DDT merit. This allows fresh
+     // connections to start generating positions on cycle 1.
+     const realMinPos = this._coordinationSettings.realEvalPosCount
+     const beforePosGate = mainSets.length
+     
+     // Get real active keys for validation (moved outside try block for scope access)
+     let realActiveKeysForVP: Set<string> = new Set()
+     try {
+       const c = getRedisClient()
+       realActiveKeysForVP = new Set<string>(
+         (await c
+           .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
+           .catch(() => [])) as string[],
+       )
+     } catch { /* ignore errors - empty set is fine */ }
+     
+     const mainSetsEligible = mainSets.map((s) => {
+       const live = s.entryCount ?? s.entries?.length ?? 0
+       const hist = s.prevPos?.count ?? 0
+       const posCount = Math.max(live, hist)
+       
+       // ALLOW axis Sets with synthetic entries even if posCount < realMinPos
+       // (new systems need a way to start generating positions)
+       const hasEntries = (s.entries?.length ?? 0) > 0
+       const isAxisSet = s.axisWindows && s.axisWindows.direction
+       if (posCount < realMinPos && !(isAxisSet && hasEntries)) {
+         // Real(active) continuous validity: if this Set currently has active Real/Live positions or is in active config keys, keep it valid (operator requirement for ongoing Real stage sets)
+         const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
+         if (!hasActiveReal) {
+           s.status = "invalid"
+           s.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
+           return s
+         }
+         // Force valid for active Real orders to prevent loss in progress processing
+         s.status = "valid_real"
+       }
+       return s
+     })
     // Don't filter out - keep all sets including marked-invalid ones for re-evaluation
     const skippedRealLowPos = mainSetsEligible.filter(s => s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")).length
     if (skippedRealLowPos > 0) {
