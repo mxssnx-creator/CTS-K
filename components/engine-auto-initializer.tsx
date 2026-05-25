@@ -34,7 +34,13 @@ export function EngineAutoInitializer() {
 
       try {
         console.log("[v0] [EngineAutoInitializer] Starting production initialization...")
-        
+
+        // Ensure the COMPLETE SITE has one unique instance (independent of connections)
+        // This makes the whole project/page one continuous unique session.
+        // Refresh or open in new tab → same unique site instance, no new overall progressions.
+        const { ensureUniqueSiteInstance } = await import("@/lib/redis-db")
+        await ensureUniqueSiteInstance().catch(() => {})
+
         // Seed essential production data first
         await seedProductionData({
           seedSettings: true,

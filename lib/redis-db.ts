@@ -2008,6 +2008,68 @@ export function isProductionEnvironment(): boolean {
   return false
 }
 
+/**
+ * Global Unique Site / Project / Page Instance
+ * 
+ * The COMPLETE SITE (independent of any individual connection) must be one
+ * single unique continuous instance.
+ * 
+ * - Created exactly once (first ever boot or after explicit full reset).
+ * - Every page refresh, new tab, independent open, cron, etc. reuses the
+ *   exact same site_session_id.
+ * - Prevents "starting new Overall Progression / Instances" on every visit.
+ * - "Just Unique" for the whole project.
+ */
+const GLOBAL_SITE_INSTANCE_KEY = "site:unique_instance"
+
+export async function ensureUniqueSiteInstance(): Promise<{ siteSessionId: string; isNew: boolean }> {
+  await initRedis()
+  const client = getRedisClient()
+  if (!client) {
+    return { siteSessionId: "fallback-" + Date.now(), isNew: true }
+  }
+
+  const existing = await client.hgetall(GLOBAL_SITE_INSTANCE_KEY).catch(() => null)
+
+  if (existing && existing.site_session_id) {
+    // Reuse the one and only unique site instance - just touch activity
+    await client.hset(GLOBAL_SITE_INSTANCE_KEY, {
+      last_activity: new Date().toISOString(),
+    }).catch(() => {})
+
+    return { siteSessionId: existing.site_session_id, isNew: false }
+  }
+
+  // First time ever (or after full reset) → create the single unique site instance
+  const newId = "site_" + Date.now() + "_" + Math.random().toString(36).slice(2, 12)
+  const now = new Date().toISOString()
+
+  await client.hset(GLOBAL_SITE_INSTANCE_KEY, {
+    site_session_id: newId,
+    created_at: now,
+    last_activity: now,
+    version: "1",
+  }).catch(() => {})
+
+  // Mirror into trade_engine:global so all monitoring sees the unique site instance
+  await client.hset("trade_engine:global", {
+    site_session_id: newId,
+    site_instance_created: now,
+  }).catch(() => {})
+
+  console.log(`[v0] [SiteInstance] Created the one unique site/project instance: ${newId}`)
+
+  return { siteSessionId: newId, isNew: true }
+}
+
+export async function getCurrentSiteInstanceId(): Promise<string | null> {
+  await initRedis()
+  const client = getRedisClient()
+  if (!client) return null
+  const data = await client.hgetall(GLOBAL_SITE_INSTANCE_KEY).catch(() => null)
+  return data?.site_session_id || null
+}
+
 // ========== Engine Connection Operations ==========
 
 export async function getActiveConnectionsForEngine(): Promise<any[]> {

@@ -1310,7 +1310,13 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
     return // Dev keeps the fast paths exactly as before
   }
 
-  console.log("[v0] [Migrations] PRODUCTION MODE — running COMPLETE COVERAGE repair (progress, counts, indexes, engine status)")
+    console.log("[v0] [Migrations] PRODUCTION MODE — running COMPLETE COVERAGE repair (progress, counts, indexes, engine status)")
+
+    // Ensure the entire Site/Project has ONE unique instance (the top-level requirement)
+    try {
+      const { ensureUniqueSiteInstance } = await import("@/lib/redis-db")
+      await ensureUniqueSiteInstance()
+    } catch {}
 
   try {
     // 1. Re-assert global engine status (same logic as ensureBaseConnections but unconditional in prod)
