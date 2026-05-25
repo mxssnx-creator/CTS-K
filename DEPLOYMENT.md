@@ -1,401 +1,366 @@
-# CTS v3 Deployment Configuration
+# Deployment Guide
 
-## Quick Start Deployment
+Complete instructions for deploying the Algorithmic Trading Engine to Vercel.
 
-### 1. Vercel (Recommended)
-```bash
-# Clone and deploy
-vercel --prod
+## Prerequisites
 
-# Or connect existing repo
-vercel link
-vercel env add NEXT_PUBLIC_APP_URL
-vercel env add KV_REST_API_URL
-vercel env add KV_REST_API_TOKEN
-vercel env add JWT_SECRET
-vercel deploy --prod
-```
+- Node.js 20+ 
+- npm or yarn
+- Vercel account (https://vercel.com)
+- GitHub repository connected to Vercel
+- Exchange API credentials (Bybit, BingX, OKX, etc.)
 
-### 2. Docker
-```bash
-# Build and run
-docker build -t cts-v3 .
-docker run -p 3001:3001 --env-file .env.local cts-v3
-
-# Or with Docker Compose
-docker-compose up --build
-```
-
-## Environment Variables Required
+## Environment Variables Setup
 
 ### Required Variables
+
 ```bash
-# App Configuration
-NEXT_PUBLIC_APP_URL=https://your-deployment-url.com
+# Application Core
+NODE_ENV=production
+NEXT_PUBLIC_APP_URL=https://your-domain.vercel.app
 
-# Redis Database (Required for production)
-KV_REST_API_URL=https://your-redis-endpoint.upstash.io
-KV_REST_API_TOKEN=your-redis-token
+# Security (generate 32+ character random strings)
+JWT_SECRET=<your-32-char-jwt-secret>
+SESSION_SECRET=<your-32-char-session-secret>
+ENCRYPTION_KEY=<your-32-char-encryption-key>
 
-# Authentication (Required)
-JWT_SECRET=your-very-secure-random-jwt-secret-at-least-32-characters
+# Redis/KV Store (Vercel KV recommended for production)
+KV_REST_API_URL=https://your-redis.vercel.app
+KV_REST_API_TOKEN=<your-redis-token>
 ```
 
-### Optional Variables
+### Exchange API Credentials
+
+Add one or more exchange credentials:
+
 ```bash
-# Exchange API Keys (for live trading)
-BYBIT_API_KEY=your-bybit-api-key
-BYBIT_API_SECRET=your-bybit-api-secret
-BINGX_API_KEY=your-bingx-api-key
-BINGX_API_SECRET=your-bingx-api-secret
-OKX_API_KEY=your-okx-api-key
-OKX_API_SECRET=your-okx-api-secret
-OKX_API_PASSPHRASE=your-okx-passphrase
+# BingX (recommended for testing)
+BINGX_API_KEY=<your-bingx-key>
+BINGX_API_SECRET=<your-bingx-secret>
+BINGX_TESTNET=false  # Set to true for paper trading
+
+# Bybit
+BYBIT_API_KEY=<your-bybit-key>
+BYBIT_API_SECRET=<your-bybit-secret>
+BYBIT_TESTNET=false
+
+# Additional exchanges (optional)
+OKX_API_KEY=<your-okx-key>
+OKX_API_SECRET=<your-okx-secret>
+OKX_PASSPHRASE=<your-okx-passphrase>
+OKX_TESTNET=false
+
+BINANCE_API_KEY=<your-binance-key>
+BINANCE_API_SECRET=<your-binance-secret>
+BINANCE_TESTNET=false
 ```
 
-## Deployment Platforms
+## Local Deployment Testing
 
-### Vercel Deployment
+### 1. Clone Repository
 
-1. **Connect Repository**
-   ```bash
-   vercel --prod
-   # Or connect via web interface
-   ```
-
-2. **Environment Variables**
-   ```bash
-   vercel env add NEXT_PUBLIC_APP_URL
-   vercel env add KV_REST_API_URL
-   vercel env add KV_REST_API_TOKEN
-   vercel env add JWT_SECRET
-   ```
-
-3. **Redis Setup**
-   - Go to Vercel Storage → Create KV Database
-   - Copy environment variables automatically set by Vercel
-
-4. **Deploy**
-   ```bash
-   vercel deploy --prod
-   ```
-
-### Docker Deployment
-
-#### Dockerfile
-```dockerfile
-FROM node:18-alpine
-
-WORKDIR /app
-
-# Copy package files
-COPY package*.json ./
-RUN npm ci --only=production
-
-# Copy source
-COPY . .
-
-# Build
-RUN npm run build
-
-EXPOSE 3001
-
-CMD ["npm", "start"]
-```
-
-#### docker-compose.yml
-```yaml
-version: '3.8'
-
-services:
-  cts-app:
-    build: .
-    ports:
-      - "3001:3001"
-    environment:
-      - NEXT_PUBLIC_APP_URL=http://localhost:3001
-      - KV_REST_API_URL=redis://redis:6379
-      - JWT_SECRET=your-jwt-secret-here
-    depends_on:
-      - redis
-    volumes:
-      - ./data:/app/data
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-
-volumes:
-  redis_data:
-```
-
-### Railway Deployment
-
-1. **Connect Repository**
-   - Import your GitHub repository
-   - Railway auto-detects Next.js
-
-2. **Environment Variables**
-   ```bash
-   NEXT_PUBLIC_APP_URL=${{ RAILWAY_STATIC_URL }}
-   KV_REST_API_URL=redis://your-redis-url
-   JWT_SECRET=your-jwt-secret
-   ```
-
-3. **Database**
-   - Add Redis database service
-   - Connect to application
-
-### Render Deployment
-
-1. **Create Web Service**
-   ```bash
-   # Build Command
-   npm run build
-
-   # Start Command
-   npm start
-   ```
-
-2. **Environment Variables**
-   ```bash
-   NEXT_PUBLIC_APP_URL=https://your-app.onrender.com
-   KV_REST_API_URL=redis://your-redis-url
-   JWT_SECRET=your-jwt-secret
-   ```
-
-## Deployment Scripts
-
-### deploy.sh - Automated Deployment
 ```bash
-#!/bin/bash
-set -e
-
-echo "🚀 Deploying CTS v3..."
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-# Check if .env.local exists
-if [ ! -f .env.local ]; then
-    echo -e "${RED}❌ .env.local not found. Copy .env.example to .env.local and configure${NC}"
-    exit 1
-fi
-
-# Install dependencies
-echo -e "${YELLOW}📦 Installing dependencies...${NC}"
-npm ci
-
-# Run checks
-echo -e "${YELLOW}🔍 Running type check...${NC}"
-npm run typecheck
-
-echo -e "${YELLOW}🧹 Running linter...${NC}"
-npm run lint
-
-# Build application
-echo -e "${YELLOW}🔨 Building application...${NC}"
-npm run build
-
-# Run health check if in development
-if [ "$NODE_ENV" != "production" ]; then
-    echo -e "${YELLOW}🏥 Running health check...${NC}"
-    timeout 30 npm start &
-    SERVER_PID=$!
-    sleep 5
-
-    if curl -f http://localhost:3001/health > /dev/null 2>&1; then
-        echo -e "${GREEN}✅ Health check passed${NC}"
-    else
-        echo -e "${RED}❌ Health check failed${NC}"
-        kill $SERVER_PID 2>/dev/null || true
-        exit 1
-    fi
-
-    kill $SERVER_PID 2>/dev/null || true
-fi
-
-echo -e "${GREEN}✅ Deployment preparation complete!${NC}"
-echo -e "${GREEN}🌐 Ready for production deployment${NC}"
+git clone https://github.com/your-repo.git
+cd your-repo
+npm install --legacy-peer-deps
 ```
 
-### vercel-deploy.sh - Vercel Specific
+### 2. Setup Local Environment
+
 ```bash
-#!/bin/bash
-set -e
+cp .env.example .env.local
+# Edit .env.local with your credentials
+```
 
-echo "🚀 Deploying to Vercel..."
+### 3. Run Local Development
 
-# Check if Vercel CLI is installed
-if ! command -v vercel &> /dev/null; then
-    echo "Installing Vercel CLI..."
-    npm i -g vercel
-fi
+```bash
+npm run dev
+# Open http://localhost:3002
+```
 
-# Login to Vercel (if not already logged in)
-vercel login
+### 4. Test Database & Redis
 
-# Link project (if not already linked)
-if [ ! -f .vercel/project.json ]; then
-    vercel link
-fi
+```bash
+# Check database status
+curl http://localhost:3002/api/health/database
 
-# Add environment variables
-echo "Setting up environment variables..."
-vercel env add NEXT_PUBLIC_APP_URL
-vercel env add KV_REST_API_URL
-vercel env add KV_REST_API_TOKEN
-vercel env add JWT_SECRET
+# Check system health
+curl http://localhost:3002/api/health
 
-# Deploy
-echo "Deploying to production..."
+# Initialize database (if needed)
+curl -X POST http://localhost:3002/api/install/database/init
+```
+
+## Vercel Deployment
+
+### 1. Connect GitHub Repository
+
+1. Go to https://vercel.com
+2. Click "Add New..." → "Project"
+3. Import your GitHub repository
+4. Select project root directory (or use default)
+
+### 2. Configure Environment Variables
+
+In Vercel Dashboard → Settings → Environment Variables:
+
+```
+1. Add all required environment variables from above
+2. Scope: Production, Preview, Development (as appropriate)
+3. Save changes
+```
+
+### 3. Configure Build Settings
+
+**Build Command:** 
+```
+bash scripts/vercel-build-setup.sh
+```
+
+**Install Command:**
+```
+npm install --legacy-peer-deps
+```
+
+**Output Directory:** `.next`
+
+### 4. Deploy
+
+```bash
+# Option A: Manual deployment via CLI
 vercel --prod
 
-echo "✅ Deployment to Vercel complete!"
+# Option B: Automatic deployment
+# Push to main/master branch - Vercel automatically deploys
+git push origin main
 ```
 
-## Production Checklist
+### 5. Monitor Deployment
 
-- [ ] Environment variables configured
-- [ ] Redis database connected and accessible
-- [ ] JWT secret set (32+ characters)
-- [ ] Exchange API keys configured (for live trading)
-- [ ] Build completes without errors
-- [ ] Application starts successfully
-- [ ] Health endpoints respond
-- [ ] Database connections work
-- [ ] API endpoints functional
-
-## Monitoring & Maintenance
-
-### Health Checks
 ```bash
-# Application health
-curl https://your-app.com/health
+# Check deployment logs in Vercel Dashboard:
+# Deployments → [Latest] → Logs
 
-# Database health
-curl https://your-app.com/api/health/database
-
-# System verification
-curl https://your-app.com/api/system/verify-complete
+# Or via CLI:
+vercel logs --prod
 ```
 
-### Logs
-- **Vercel**: Check Vercel dashboard logs
-- **Docker**: `docker logs cts-app`
-- **Railway/Render**: Check platform dashboard
+## Post-Deployment Verification
 
-### Backups
+After deployment completes, verify all systems:
+
+### 1. Run Verification Script
+
 ```bash
-# Export settings
-curl https://your-app.com/api/settings/export
+bash scripts/post-deploy-verify.sh
+```
 
-# Database backup (if using managed Redis)
-# Configure automatic backups in Redis provider
+### 2. Manual Endpoint Checks
+
+```bash
+# Health endpoints
+curl https://your-domain.vercel.app/api/health
+curl https://your-domain.vercel.app/api/health/database
+
+# Database status
+curl https://your-domain.vercel.app/api/install/database/status
+
+# Engine status
+curl https://your-domain.vercel.app/api/trade-engine/status
+
+# Settings
+curl https://your-domain.vercel.app/api/settings
+```
+
+### 3. Access Dashboard
+
+Open browser to: `https://your-domain.vercel.app/main`
+
+Should display:
+- ✓ Connection status
+- ✓ Active strategies
+- ✓ Live positions (if trading)
+- ✓ Trade history
+- ✓ System health
+
+## Database Migrations
+
+Migrations run automatically during deployment via `vercel-build-setup.sh`.
+
+### Manual Migration Execution
+
+If needed, manually trigger migrations:
+
+```bash
+# Check migration status
+curl https://your-domain.vercel.app/api/admin/migrations/status
+
+# Run migrations
+curl -X POST https://your-domain.vercel.app/api/admin/run-migrations
+
+# Reset database (CAUTION: Deletes all data)
+curl -X POST https://your-domain.vercel.app/api/admin/reset-and-init
 ```
 
 ## Troubleshooting
 
-### Build Issues
-```bash
-# Clear cache and rebuild
-rm -rf .next node_modules
-npm install
-npm run build
+### Build Fails with "Out of Memory"
+
+The build script includes `--max-old-space-size=8192`. If still failing:
+
+1. Check `vercel.json` `functions` memory is set to 3008+
+2. Reduce bundle size by disabling features
+3. Increase Vercel Pro plan limits
+
+### Redis Connection Error
+
+```
+Error: KV_REST_API_URL not set
 ```
 
-### Runtime Issues
+**Solution:**
+1. Set up Vercel KV in Vercel dashboard
+2. Environment variables should auto-populate
+3. Redeploy after KV is created
+
+### API Endpoints Returning 500
+
+**Check logs:**
 ```bash
-# Check environment variables
-echo $NEXT_PUBLIC_APP_URL
-echo $KV_REST_API_URL
-
-# Test Redis connection
-curl https://your-app.com/api/health/database
-
-# Check application logs
-# (Platform-specific)
+vercel logs --prod --follow
 ```
 
-### Database Issues
-```bash
-# Reset database (CAUTION: destroys all data)
-curl -X POST https://your-app.com/api/install/database/reset
+**Common causes:**
+- Missing environment variables → Add to Vercel dashboard
+- Redis initialization failed → Check database logs
+- Function timeout → Increase `maxDuration` in `vercel.json`
 
-# Reinitialize
-curl -X POST https://your-app.com/api/install/initialize
+### Cron Jobs Not Running
+
+Verify in Vercel dashboard:
+1. Settings → Cron Jobs should show both jobs
+2. Check execution in Logs
+3. Required: Production environment
+
+## Performance Optimization
+
+### 1. Redis Caching
+
+The inline Redis implementation provides:
+- In-memory data structure store
+- Automatic TTL cleanup every 60 seconds
+- Periodic disk snapshots every 5 minutes
+- ~80K ops/sec throughput
+
+For production high-traffic, use Vercel KV:
+```bash
+# Add to environment variables
+KV_REST_API_URL=https://your-kv.vercel.app
+KV_REST_API_TOKEN=<token>
 ```
 
-## Security Considerations
+### 2. Function Optimization
 
-- Use HTTPS in production
-- Set secure JWT secrets
-- Configure CORS properly
-- Enable rate limiting
-- Monitor for security vulnerabilities
-- Regular dependency updates
+Current settings in `vercel.json`:
+- Memory: 3008 MB
+- Timeout: 300 seconds (5 minutes)
+- Runtime: nodejs20.x
 
-#### Admin Access
-```bash
-ADMIN_SECRET=secure-admin-password-for-system-operations
+Adjust based on monitoring:
+
+```json
+{
+  "functions": {
+    "app/api/**/*.ts": {
+      "memory": 3008,
+      "maxDuration": 300
+    }
+  }
+}
 ```
 
-## Deployment Steps
+### 3. Static Asset Caching
 
-### Vercel Deployment
+Headers configured for:
+- Static files: 1-year cache
+- API: No cache (required for real-time data)
+- Security headers: Enabled by default
 
-1. **Connect Repository**
-   - Import your GitHub repository to Vercel
-   - Vercel will automatically detect Next.js
+## Rollback Procedure
 
-2. **Configure Environment Variables**
-   - Go to Project Settings → Environment Variables
-   - Add all required variables listed above
-   - For `NEXT_PUBLIC_APP_URL`, use your Vercel domain
+### Revert to Previous Deployment
 
-3. **Redis Setup (Vercel KV)**
-   - In Vercel dashboard, go to Storage → Create Database → KV
-   - Copy the environment variables provided by Vercel
-   - Add them to your project environment variables
+```bash
+# List recent deployments
+vercel list
 
-4. **Deploy**
-   - Push to main branch or trigger manual deployment
-   - Vercel will build and deploy automatically
+# Rollback to specific deployment
+vercel promote <deployment-id>
+```
 
-### Troubleshooting Deployment Issues
+### Or via GitHub:
 
-#### Build Fails
-- Check that all dependencies are installed: `bun install`
-- Verify TypeScript compilation: `bun run typecheck`
-- Check for linting errors: `bun run lint`
+```bash
+git revert <commit-hash>
+git push origin main
+# Vercel automatically redeploys
+```
 
-#### Runtime Errors
-- **Missing NEXT_PUBLIC_APP_URL**: Set to your deployment domain
-- **Redis Connection Failed**: Ensure Redis environment variables are correctly set
-- **API Route Errors**: Check that environment variables are accessible in server-side code
+## Monitoring & Alerts
 
-#### Common Issues
-- Environment variables are case-sensitive
-- Some platforms require variable names to be uppercase
-- Restart deployment after adding new environment variables
+### 1. Setup Vercel Analytics
 
-## Local Development
+```
+Vercel Dashboard → Settings → Analytics
+Enable for performance monitoring
+```
 
-1. Copy `.env.example` to `.env.local`
-2. Fill in the required values
-3. Run `bun run dev`
+### 2. Health Check Monitoring
 
-## Production Checklist
+```bash
+# Set up a cron to check health
+curl -s https://your-domain.vercel.app/api/health | grep '"status":"healthy"'
+```
 
-- [ ] NEXT_PUBLIC_APP_URL set correctly
-- [ ] Redis database configured and accessible
-- [ ] JWT_SECRET set to secure random value
-- [ ] Exchange API keys added (if using live trading)
-- [ ] Build completes successfully
-- [ ] Application loads without runtime errors
+### 3. Cron Job Monitoring
+
+Both cron jobs run every minute/5 minutes. Monitor in:
+- Vercel Dashboard → Cron Jobs
+- Check logs for failures
+
+## Production Best Practices
+
+1. **Backup Keys:** Store JWT_SECRET, SESSION_SECRET, ENCRYPTION_KEY in secure vault
+2. **API Key Rotation:** Rotate exchange API keys every 90 days
+3. **Rate Limiting:** Implement in production (not in dev)
+4. **Logging:** Enable structured logging in settings
+5. **Monitoring:** Setup alerts for failed cron jobs
+6. **Testing:** Test all strategies in paper-trading first
+7. **Scaling:** Monitor Redis usage; upgrade if needed
+
+## Support & Troubleshooting
+
+For deployment issues:
+
+1. Check Vercel logs: `vercel logs --prod`
+2. Test locally first: `npm run dev`
+3. Verify env vars are set correctly
+4. Check GitHub actions for CI/CD failures
+5. Review API health endpoints
+
+## Next Steps
+
+After successful deployment:
+
+1. **Verify Connections** → Settings → Connections → Test
+2. **Configure Strategies** → Settings → Strategies
+3. **Set Risk Limits** → Settings → Risk Management
+4. **Enable Paper Trading** → Live Trading → TESTNET mode
+5. **Monitor Dashboard** → Real-time updates active
+
+---
+
+**Last Updated:** 2026-05-15  
+**Version:** 1.0.0  
+**Status:** Production Ready

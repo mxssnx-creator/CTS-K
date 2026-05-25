@@ -1,42 +1,52 @@
-node_modules
-.next
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+
+# Dev server runtime artifacts
 dev.log
 dev.pid
+dev-server-runtime.log
+*.log
+*.pid
+
+# One-off root scripts and debug files
+/fix-lint-*.js
+/check-connections.ts
+/debug-redis.ts
+/proxy.ts
+/verify-redis-persistence.ts
+/clear-cache.sh
+/health-check.sh
+/deploy.sh
+/vercel-deploy.sh
+/run-test.sh
+/bunfig.toml
+
+# TypeScript incremental build info
 tsconfig.tsbuildinfo
+
+# Environment secrets
 .env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
+.env*.local
+
+# Local Redis data snapshots (can be GB-scale; never commit)
+.v0-data/
+redis-snapshot.json
+redis-snapshot.json.*
+
+# Duplicate / alternative lockfiles (project uses npm + package-lock.json)
+pnpm-lock.yaml
+bun.lock
+yarn.lock
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Root-level status/audit/checklist files (generated reports, never source)
+/*.txt
+/PRODUCTION_VERIFICATION_CHECKLIST.ts
+/SYSTEM_COMPLETE_VERIFICATION.ts
+/SYSTEM_VERIFICATION_CHECKLIST.ts
