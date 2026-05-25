@@ -4,13 +4,16 @@ import { runMigrations } from "@/lib/redis-migrations"
 let ran = false
 
 function shouldRunPreStartup(): boolean {
+  // PRODUCTION PARITY: Run ALL pre-startup on both dev and production (Node.js runtime only)
+  // This ensures: Redis init, migrations, settings defaults, connections seed, market data
+  // Production deployments MUST have the same feature set as dev
   if (process.env.NEXT_RUNTIME !== "nodejs") return false
-  // In production, we still need to run essential initialization (Redis, migrations)
-  // but we skip the UI/UX seeding and connection testing
   return true
 }
 
 function shouldRunDevOnlyPreStartup(): boolean {
+  // Skip connection testing only in production (expensive network calls)
+  // All OTHER seeding (market data, settings, connections) must run in both environments
   if (process.env.NEXT_RUNTIME !== "nodejs") return false
   if (process.env.NODE_ENV === "production") return false
   return true
@@ -140,11 +143,15 @@ export async function runPreStartup() {
     await initRedis()
     await runMigrations()
     
-    // Only run dev-specific seeding and testing in development
+    // ── Production parity: ALL pre-startup initialization runs in both dev and production ──
+    // The only difference is that production skips expensive network tests (testAllExchangeConnections)
+    // but includes all essential data seeding and configuration setup
+    await initializeDefaultSettings()
+    await seedPredefinedConnections()
+    await seedMarketData()
+    
+    // Connection testing is dev-only (expensive API calls, can be rate-limited)
     if (shouldRunDevOnlyPreStartup()) {
-      await initializeDefaultSettings()
-      await seedPredefinedConnections()
-      await seedMarketData()
       await testAllExchangeConnections()
     }
 
