@@ -647,14 +647,28 @@ export async function POST(request: Request) {
             updated_at: new Date().toISOString(),
           })
           
-          console.log(`${LOG_PREFIX} ✓ Main Engine started for ${connection.name}`)
-          await logProgressionEvent(connectionId, "engine_started", "info", "Main Trade Engine started via QuickStart", {
-            connectionId,
-            connectionName: connection.name,
-            exchange: exchangeName,
-            testPassed,
-          })
-        } catch (engineError) {
+            console.log(`${LOG_PREFIX} ✓ Main Engine started for ${connection.name}`)
+            await logProgressionEvent(connectionId, "engine_started", "info", "Main Trade Engine started via QuickStart", {
+              connectionId,
+              connectionName: connection.name,
+              exchange: exchangeName,
+              testPassed,
+            })
+
+            // Immediate evaluation kick — ensures the first Real/Live sets (and real
+            // exchange order attempts) are computed right now instead of waiting for
+            // the next 5-10 s timer tick. This is a major part of "it worked before".
+            setImmediate(() => {
+              try {
+                const coord = getGlobalTradeEngineCoordinator()
+                coord.refreshEngines().catch(() => {})
+                // The armed strategy processor will now see the fresh symbols +
+                // the Main/Real bootstrap relaxations and produce qualifying Live sets
+                // on its very first tick (or this refresh may trigger one).
+                console.log(`${LOG_PREFIX} Post-quickstart immediate evaluation kick dispatched for ${connectionId}`)
+              } catch { /* non-fatal */ }
+            })
+          } catch (engineError) {
           console.error(`${LOG_PREFIX} Failed to start engine:`, engineError)
           await logProgressionEvent(connectionId, "engine_start_error", "error", "Failed to start engine", {
             error: engineError instanceof Error ? engineError.message : String(engineError),
