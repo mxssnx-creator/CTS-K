@@ -1,0 +1,18 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "default_agent": "code",
+  "model": "x-ai/grok-code-fast-1",
+  "instructions": [
+    "AGENTS.md",
+    ".kilo/deployment.md"
+  ],
+  "permission": {
+    "bash": "allow",
+    "edit": {
+      "src/**": "allow",
+      "*.md": "allow",
+      "*": "ask"
+    },
+    "read": "allow"
+  }
+}
