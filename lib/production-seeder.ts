@@ -132,25 +132,34 @@ async function seedPredefinedConnections(): Promise<void> {
     // Get predefined connections
     const predefinedConnections = getPredefinedAsExchangeConnections()
     
+    // Enable BingX X01 for immediate trading (it has real credentials)
+    // Quick-start requires non-predefined connections, so we set is_predefined: false
+    // and mark it as enabled/active/live_trade for production use
+    const enabledConnections = predefinedConnections.map((conn, idx) => ({
+      ...conn,
+      // First connection (bingx-x01) gets enabled for immediate trading
+      is_enabled: "1",
+      is_active: idx === 0 ? "1" : "0",
+      is_live_trade: idx === 0 ? "1" : "0",
+      is_assigned: idx === 0 ? "1" : "0",
+      is_dashboard_inserted: idx === 0 ? "1" : "0",
+      is_enabled_dashboard: idx === 0 ? "1" : "0",
+      is_inserted: idx === 0 ? "1" : "0",
+      // Mark as NOT predefined so quick-start can find it (string "false" for Redis consistency)
+      is_predefined: "false",
+      active_symbols: idx === 0 ? JSON.stringify([]) : "[]",
+      live_volume_factor: idx === 0 ? "0.1" : "1",
+    }))
+    
     // Save individual connections to Redis (connection:{id} hashes)
-    for (const conn of predefinedConnections) {
+    for (const conn of enabledConnections) {
       await saveConnection(conn)
     }
     
-    // Enable one connection for immediate trading (BingX X01)
-    if (predefinedConnections.length > 0) {
-      await client.set(connectionsKey, JSON.stringify([
-        {
-          ...predefinedConnections[0],
-          is_enabled: true,
-          is_active: true,
-          is_live_trade: true,
-        },
-        ...predefinedConnections.slice(1)
-      ]))
-    }
+    // Store the connection list for quick lookup
+    await client.set(connectionsKey, JSON.stringify(enabledConnections))
     
-    console.log("[v0] [ProductionSeeder] ✅ Predefined connections seeded")
+    console.log(`[v0] [ProductionSeeder] ✅ Seeded ${enabledConnections.length} connections, bingx-x01 enabled for trading`)
   } catch (error) {
     console.error("[v0] [ProductionSeeder] ❌ Failed to seed connections:", error)
     throw error
@@ -210,8 +219,9 @@ async function seedProgressionState(): Promise<void> {
     const connectionsArray = JSON.parse(connections)
     
     // Create initial progression state for each connection
+    // is_enabled and is_active are stored as "1"/"0" strings in Redis
     for (const conn of connectionsArray) {
-      if (conn.is_enabled && conn.is_active) {
+      if (conn.is_enabled === "1" && conn.is_active === "1") {
         await ProgressionStateManager.archiveAndStartNewProgression(
           conn.id,
           Date.now()
