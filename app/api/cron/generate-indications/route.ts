@@ -443,10 +443,11 @@ export async function GET() {
     let totalMain = 0
     let totalReal = 0
 
-    const PROD_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","LINKUSDT","AVAXUSDT","MATICUSDT","LTCUSDT","DOTUSDT"]
-    const isProd = process.env.NODE_ENV === "production"
-    const cyclesPerCron = isProd ? 8 : 1
-    const symbolsPerConn = isProd ? PROD_SYMBOLS : []
+    // Production and dev run the same single cycle per cron invocation.
+    // Symbol list is always derived from the connection's configured symbols
+    // or the most volatile exchange symbol — never an artificial hardcoded list.
+    const cyclesPerCron = 1
+    const symbolsPerConn: string[] = []
 
     for (const connection of activeConnections) {
       const exchangeName = (connection.exchange || "bingx").toLowerCase()
@@ -483,10 +484,7 @@ export async function GET() {
         primarySymbol = await getMostVolatileSymbol(exchangeName)
       }
 
-      let symbolsToProcess = Array.from(new Set([primarySymbol, "BTCUSDT"].filter(Boolean)))
-      if (isProd && symbolsPerConn.length > 0) {
-        symbolsToProcess = symbolsPerConn
-      }
+      const symbolsToProcess = Array.from(new Set([primarySymbol, "BTCUSDT"].filter(Boolean)))
 
       for (let c = 0; c < cyclesPerCron; c++) {
         for (const symbol of symbolsToProcess) {
@@ -499,30 +497,11 @@ export async function GET() {
       }
     }
 
-    if (isProd) {
-      try {
-        for (let i = 0; i < 120; i++) {
-          const sk = `strategy_set:bingx-x01:BTCUSDT:main:prodsim:${i}`
-          await client.set(sk, JSON.stringify({ t: Date.now(), c: 12 + (i % 7) })).catch(() => {})
-        }
-        for (let i = 0; i < 80; i++) {
-          const sk = `strategy_set:bingx-x01:ETHUSDT:real:prodsim:${i}`
-          await client.set(sk, JSON.stringify({ t: Date.now(), c: 5 + (i % 4) })).catch(() => {})
-        }
-        const extraKeys = ["indications:live:cache", "strategies:realtime:batch", "config:axis:variants:prod", "market:agg:1s:pool"]
-        for (const k of extraKeys) {
-          await client.set(k, String(Date.now())).catch(() => {})
-          await client.expire(k, 300).catch(() => {})
-        }
-        const BASES = ["bingx-x01"]
-        for (const bid of BASES) {
-          await client.set(`prehistoric:${bid}:done`, "1").catch(() => {})
-          await client.set(`prehistoric:${bid}:firstpass:done`, "1").catch(() => {})
-          await client.expire(`prehistoric:${bid}:done`, 86400).catch(() => {})
-          await client.expire(`prehistoric:${bid}:firstpass:done`, 86400).catch(() => {})
-        }
-      } catch {}
-    }
+    // NOTE: Do NOT write fake prodsim strategy_set keys here.
+    // Do NOT set prehistoric:*:done flags here — that is the exclusive
+    // responsibility of the prehistoric engine after it finishes its real
+    // backfill run.  Fake flags written here would permanently suppress the
+    // prehistoric engine from running in production.
 
     return NextResponse.json({
       success: true,

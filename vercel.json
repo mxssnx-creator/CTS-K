@@ -12,12 +12,7 @@
   "regions": ["iad1"],
   "trailingSlash": false,
   "cleanUrls": true,
-  "rewrites": [
-    {
-      "source": "/api/:path*",
-      "destination": "/api/:path*"
-    }
-  ],
+
   "redirects": [
     {
       "source": "/",
