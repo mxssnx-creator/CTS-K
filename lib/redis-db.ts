@@ -1734,7 +1734,7 @@ export async function savePosition(position: any): Promise<void> {
     const liveKey = `live:position:${id}`
     try {
       // Persist JSON snapshot (7 day TTL)
-      await client.set(liveKey, JSON.stringify(position), { ex: 7 * 24 * 60 * 60 })
+      await client.set(liveKey, JSON.stringify(position), ({ ex: 7 * 24 * 60 * 60 } as any))
     } catch {
       // Some adapters don't support EX option — fall back to set only
       await client.set(liveKey, JSON.stringify(position))

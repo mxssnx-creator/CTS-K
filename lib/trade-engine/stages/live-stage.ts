@@ -145,8 +145,8 @@ async function incrementMetric(connectionId: string, metric: string, delta: numb
     } else {
       // Fallback for adapters without hincrby: read-modify-write (best-effort)
       const key = `progression:${connectionId}`
-      const hash = await client.hgetall(key).catch(() => ({} as Record<string, string>))
-      const current = parseInt(hash[metric] || "0", 10) || 0
+      const hash = (await client.hgetall(key).catch(() => ({} as Record<string, string>))) || {}
+      const current = parseInt(String(hash[metric] || "0"), 10) || 0
       await client.hset(key, { [metric]: String(current + delta) })
     }
   } catch (err) {
@@ -160,7 +160,11 @@ async function incrementOrdersBySymbol(connectionId: string, symbol: string, sid
     const key = `live_orders_by_symbol:${connectionId}`
     // hset field -> JSON string of { symbol, side, count }
     const existingRaw = await client.hget(key, symbol).catch(() => null)
-    let existing = existingRaw ? JSON.parse(existingRaw as string) : { symbol, side, count: 0 }
+    let existing: { symbol: string; side: string; count: number } = { symbol, side, count: 0 }
+    if (existingRaw) {
+      try { existing = JSON.parse(existingRaw as string) } catch { existing = { symbol, side, count: 0 } }
+    }
+
     existing.count = (existing.count || 0) + 1
     await client.hset(key, symbol, JSON.stringify(existing))
   } catch {
@@ -173,7 +177,7 @@ async function tryAcquireLock(connId: string, symbol: string, direction: string)
   const key = `live:lock:${connId}:${symbol}:${direction}`
   const token = `tok:${Date.now()}:${Math.random().toString(36).slice(2,8)}`
   try {
-    const r = await client.set(key, token, { ex: 300 })
+    const r = await client.set(key, token, ({ ex: 300 } as any))
     if (r === "OK") return token
     // Some adapters return "OK" for set; others return undefined on success
     // Fallback: if key doesn't exist after set attempt, treat as acquired
@@ -232,7 +236,7 @@ async function refreshLockTTL(connId: string, symbol: string, direction: string,
   const { getRedisClient } = await import("@/lib/redis-db")
   const client = getRedisClient()
   try {
-    await client.set(`live:lock:${connId}:${symbol}:${direction}`, String(Date.now()), { ex: Math.ceil(ttlMs / 1000) })
+    await client.set(`live:lock:${connId}:${symbol}:${direction}`, String(Date.now()), ({ ex: Math.ceil(ttlMs / 1000) } as any))
   } catch {
     // best-effort
   }
