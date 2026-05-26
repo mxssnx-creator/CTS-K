@@ -1,7 +1,6 @@
 "use client"
 
 import { useEffect, useRef } from "react"
-import { seedProductionData } from "@/lib/production-seeder"
 
 /**
  * EngineAutoInitializer — bootstraps the Global Trade Engine Coordinator
@@ -35,29 +34,19 @@ export function EngineAutoInitializer() {
       try {
         console.log("[v0] [EngineAutoInitializer] Starting production initialization...")
 
-        // Ensure the COMPLETE SITE has one unique instance (independent of connections)
-        // This makes the whole project/page one continuous unique session.
-        // Refresh or open in new tab → same unique site instance, no new overall progressions.
-        const { ensureUniqueSiteInstance } = await import("@/lib/redis-db")
-        await ensureUniqueSiteInstance().catch(() => {})
+        // Trigger server-side initialization endpoint which performs the
+        // unique site instance guarantee, seeds production data, and starts
+        // the background coordinator. This avoids importing server-only
+        // modules into a client component, which breaks the client bundle.
+        try {
+          await fetch("/api/system/initialize", { method: "POST", cache: "no-store" })
+        } catch {
+          /* non-critical */
+        }
 
-        // Seed essential production data first
-        await seedProductionData({
-          seedSettings: true,
-          seedConnections: true,
-          seedMarketData: true,
-          seedProgression: true
-        })
-        
-        // Start the global coordinator only. This endpoint does NOT touch
-        // per-connection assignment flags — it just ensures the background
-        // worker loops are running so already-enabled engines progress.
-        await fetch("/api/trade-engine/auto-start", {
-          method: "POST",
-          cache: "no-store",
-        }).catch(() => { /* non-critical */ })
-        
-        console.log("[v0] [EngineAutoInitializer] ✅ Production initialization completed")
+        // Also call auto-start to ensure coordinator loops are running
+        await fetch("/api/trade-engine/auto-start", { method: "POST", cache: "no-store" }).catch(() => {})
+        console.log("[v0] [EngineAutoInitializer] ✅ Production initialization (server-side) requested")
       } catch (error) {
         console.error("[v0] [EngineAutoInitializer] ❌ Production initialization failed:", error)
         // Don't throw - allow app to continue even if seeding fails
