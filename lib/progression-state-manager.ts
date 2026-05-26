@@ -295,6 +295,11 @@ return {
       intervalsProcessed: 0,
       indicationsCount: 0,
       strategiesCount: 0,
+      // Uniqueness / solidity snapshot fields (default empty for new progression)
+      progressSettingsSnapshot: {},
+      symbolCount: 0,
+      activeSymbolsHash: "",
+      startedForSettingsVersion: "",
       indicationCycleCount: 0,
       indicationLiveCycleCount: 0,
       strategyCycleCount: 0,
