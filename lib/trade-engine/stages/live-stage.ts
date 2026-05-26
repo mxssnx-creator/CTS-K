@@ -122,38 +122,129 @@ interface FillRecord {
 // package.  They are declared here so TypeScript can type-check call sites
 // even when the defining modules are not yet wired up.
 function pushStep(position: LivePosition, step: string, ok: boolean, detail: string): void {
-  /* live-stage progression helper — defined alongside stage pipeline */
+  try {
+    if (!position.progression) position.progression = []
+    position.progression.push({ step, timestamp: Date.now(), success: ok, details: detail })
+    // cap progression per-position to 200 entries to avoid unbounded growth
+    if (position.progression.length > 200) position.progression = position.progression.slice(-200)
+  } catch {
+    // non-critical
+  }
 }
 async function savePosition(position: LivePosition): Promise<void> {
-  /* stub — also exported from redis-db.ts */
+  const { savePosition: redisSave } = await import("@/lib/redis-db")
+  await redisSave(position as any)
 }
-async function incrementMetric(connectionId: string, metric: string, delta?: number): Promise<void> {
-  /* stub */
+async function incrementMetric(connectionId: string, metric: string, delta: number = 1): Promise<void> {
+  const { getRedisClient } = await import("@/lib/redis-db")
+  const client = getRedisClient()
+  try {
+    // Use hincrby for atomic counters; delta may be negative for decrements
+    if (typeof (client as any).hincrby === "function") {
+      await (client as any).hincrby(`progression:${connectionId}`, metric, delta)
+    } else {
+      // Fallback for adapters without hincrby: read-modify-write (best-effort)
+      const key = `progression:${connectionId}`
+      const hash = await client.hgetall(key).catch(() => ({} as Record<string, string>))
+      const current = parseInt(hash[metric] || "0", 10) || 0
+      await client.hset(key, { [metric]: String(current + delta) })
+    }
+  } catch (err) {
+    // metric failures should not throw the live pipeline
+  }
 }
 async function incrementOrdersBySymbol(connectionId: string, symbol: string, side: string, metric: string): Promise<void> {
-  /* stub */
+  const { getRedisClient } = await import("@/lib/redis-db")
+  const client = getRedisClient()
+  try {
+    const key = `live_orders_by_symbol:${connectionId}`
+    // hset field -> JSON string of { symbol, side, count }
+    const existingRaw = await client.hget(key, symbol).catch(() => null)
+    let existing = existingRaw ? JSON.parse(existingRaw as string) : { symbol, side, count: 0 }
+    existing.count = (existing.count || 0) + 1
+    await client.hset(key, symbol, JSON.stringify(existing))
+  } catch {
+    /* best-effort */
+  }
 }
 async function tryAcquireLock(connId: string, symbol: string, direction: string): Promise<string | null> {
-  /* stub */
-  return null
+  const { getRedisClient } = await import("@/lib/redis-db")
+  const client = getRedisClient()
+  const key = `live:lock:${connId}:${symbol}:${direction}`
+  const token = `tok:${Date.now()}:${Math.random().toString(36).slice(2,8)}`
+  try {
+    const r = await client.set(key, token, { ex: 300 })
+    if (r === "OK") return token
+    // Some adapters return "OK" for set; others return undefined on success
+    // Fallback: if key doesn't exist after set attempt, treat as acquired
+    const exists = await client.get(key)
+    if (!exists) return token
+    return null
+  } catch {
+    return null
+  }
 }
 async function findOpenLivePositionByDir(connId: string, symbol: string, side: string): Promise<LivePosition | null> {
-  /* stub */
+  const { getLivePositions } = await import("@/lib/trade-engine/stages/live-stage")
+  const positions = await getLivePositions(connId)
+  const norm = String(symbol || "").toUpperCase().replace(/[-_]/g, "")
+  for (const p of positions) {
+    const psym = String(p.symbol || "").toUpperCase().replace(/[-_]/g, "")
+    if (psym === norm && p.direction === side && (p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed")) {
+      return p
+    }
+  }
   return null
 }
 async function fetchCurrentPrice(symbol: string, connId?: string): Promise<number> {
-  /* stub */
-  return 0
+  const { getMarketData } = await import("@/lib/redis-db")
+  try {
+    const data = await getMarketData(symbol, "1m")
+    if (!data) return 0
+    // data.latest is expected format; fallback to first candle close
+    const latest = data.latest || (Array.isArray(data) ? data[data.length - 1] : null)
+    if (!latest) return 0
+    const price = parseFloat(String(latest.close ?? latest[4] ?? latest.price ?? 0)) || 0
+    return price
+  } catch {
+    return 0
+  }
 }
 async function accumulateIntoLivePosition(connId: string, existing: LivePosition, real: any, price: number, connector: any): Promise<LivePosition> {
-  /* stub */
+  // Accumulate by merging executedQuantity and volumeUsd, appending setKey
+  try {
+    const qty = real.quantity || real.executedQuantity || 0
+    const addedQty = Number(qty) || 0
+    existing.executedQuantity = (existing.executedQuantity || 0) + addedQty
+    existing.remainingQuantity = Math.max(0, (existing.quantity || 0) - (existing.executedQuantity || 0))
+    existing.averageExecutionPrice = ((existing.averageExecutionPrice || existing.entryPrice || 0) * ((existing.executedQuantity || 0) - addedQty) + price * addedQty) / Math.max(1e-12, (existing.executedQuantity || 0))
+    existing.volumeUsd = (existing.executedQuantity || 0) * (existing.averageExecutionPrice || price)
+    if (!existing.accumulatedSetKeys) existing.accumulatedSetKeys = []
+    if (real.setKey && !existing.accumulatedSetKeys.includes(real.setKey)) existing.accumulatedSetKeys.push(real.setKey)
+    existing.updatedAt = Date.now()
+    await savePosition(existing)
+  } catch (err) {
+    // best-effort
+  }
   return existing
 }
-async function refreshLockTTL(connId: string, symbol: string, direction: string, ttlMs?: number): Promise<void> {
-  /* stub */
+async function refreshLockTTL(connId: string, symbol: string, direction: string, ttlMs: number = 300000): Promise<void> {
+  const { getRedisClient } = await import("@/lib/redis-db")
+  const client = getRedisClient()
+  try {
+    await client.set(`live:lock:${connId}:${symbol}:${direction}`, String(Date.now()), { ex: Math.ceil(ttlMs / 1000) })
+  } catch {
+    // best-effort
+  }
 }
 async function releaseLock(connId: string, symbol: string, direction: string): Promise<void> {
-  /* stub */
+  const { getRedisClient } = await import("@/lib/redis-db")
+  const client = getRedisClient()
+  try {
+    await client.del(`live:lock:${connId}:${symbol}:${direction}`)
+  } catch {
+    // best-effort
+  }
 }
 function resolveMaxHoldMs(connId: string): number {
   /* stub */

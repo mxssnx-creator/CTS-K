@@ -1725,12 +1725,57 @@ export async function savePosition(position: any): Promise<void> {
   if (!id) {
     throw new Error("Position must have an id")
   }
-  
+
+  // Special-case live positions (keys prefixed with "live:") — the live
+  // pipeline uses JSON-string keys and open/closed indices under
+  // `live:position:${id}` and `live:positions:${connectionId}`. The
+  // legacy `position:${id}` hash form is preserved for non-live positions.
+  if (String(id).startsWith("live:")) {
+    const liveKey = `live:position:${id}`
+    try {
+      // Persist JSON snapshot (7 day TTL)
+      await client.set(liveKey, JSON.stringify(position), { ex: 7 * 24 * 60 * 60 })
+    } catch {
+      // Some adapters don't support EX option — fall back to set only
+      await client.set(liveKey, JSON.stringify(position))
+    }
+
+    const connId = position.connectionId || position.connection_id || "unknown"
+    if (!connId || connId === "unknown") {
+      return
+    }
+
+    // Terminal => move from open index -> closed archive idempotently
+    if (position.status === "closed") {
+      try {
+        // Remove any existing entries from open list, then push to closed list
+        await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)
+        await client.lpush(`live:positions:${connId}:closed`, id).catch(() => 0)
+        // Mark moved so closeLivePosition can detect duplicate increments
+        await client.set(`live:positions:${connId}:moved:${id}`, String(Date.now())).catch(() => null)
+        await client.expire(`live:positions:${connId}:moved:${id}`, 60 * 60).catch(() => 0)
+      } catch {
+        // best-effort
+      }
+    } else {
+      // Ensure id appears once in the open index (dedupe via lrem -> lpush)
+      try {
+        await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)
+        await client.lpush(`live:positions:${connId}`, id).catch(() => 0)
+      } catch {
+        // best-effort
+      }
+    }
+
+    return
+  }
+
+  // Non-live positions: maintain as a hash (legacy behaviour)
   const data = flattenForHmset({
     ...position,
     updated_at: new Date().toISOString(),
   })
-  
+
   await client.hset(`position:${id}`, data)
 }
 
