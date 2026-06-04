@@ -3750,11 +3750,83 @@ export async function reconcileLivePositions(
       errors: number
       protectionRearmed: number
     }
+    // ── Canonical-position-per-slot resolution (BUG 4) ────────────────
+    // The venue holds exactly ONE position per (symbol, direction). If
+    // Redis tracks more than one open position for the same slot
+    // (lock-expiry edge, restart mid-entry, or migrated legacy data),
+    // they ALL map to the same exchange position. Reconciling each one
+    // independently would (a) arm duplicate SL/TP orders against one
+    // venue position and (b) when that venue position closes, count one
+    // real close N times — the close-counter drift the operator reported.
+    //
+    // Resolve a single CANONICAL position id per slot up-front. The choice
+    // is stable and order-independent (so the parallel pool below is
+    // deterministic): prefer a system-owned position (has orderId), then
+    // the one actually filled (largest executedQuantity), then the oldest
+    // createdAt. Non-canonical duplicates are refreshed for the dashboard
+    // but never drive SL/TP arming, force-close, or close counters.
+    const canonicalIdBySlot = new Map<string, string>()
+    {
+      const bySlot = new Map<string, typeof openPositions>()
+      for (const p of openPositions) {
+        const slot = `${normSym(p.symbol)}|${p.direction}`
+        const arr = bySlot.get(slot)
+        if (arr) arr.push(p); else bySlot.set(slot, [p])
+      }
+      for (const [slot, group] of bySlot) {
+        if (group.length === 1) { canonicalIdBySlot.set(slot, group[0].id); continue }
+        const ranked = [...group].sort((a, b) => {
+          const ao = a.orderId ? 1 : 0, bo = b.orderId ? 1 : 0
+          if (ao !== bo) return bo - ao
+          const aq = a.executedQuantity || 0, bq = b.executedQuantity || 0
+          if (aq !== bq) return bq - aq
+          return (a.createdAt || 0) - (b.createdAt || 0)
+        })
+        canonicalIdBySlot.set(slot, ranked[0].id)
+        console.warn(
+          `${LOG_PREFIX} [reconcile] slot ${slot} has ${group.length} open Redis positions — ` +
+          `canonical=${ranked[0].id}; others pruned/refreshed without close-count.`,
+        )
+      }
+    }
+
     const processOne = async (pos: typeof openPositions[number]): Promise<PosDelta> => {
       const delta: PosDelta = { reconciled: 1, updated: 0, closed: 0, errors: 0, protectionRearmed: 0 }
       try {
         const mapKey = `${normSym(pos.symbol)}|${pos.direction}`
         const exPos = exchangeMap.get(mapKey)
+
+        // ── Non-canonical duplicate for this venue slot (BUG 4) ─────────
+        // Never drive SL/TP, force-close, or close counters (would double-
+        // count one venue position). Just keep the dashboard mark/PnL fresh
+        // when the slot is live, or prune the phantom Redis record when the
+        // venue slot is empty — without incrementing the close counter, so
+        // the canonical record alone owns the single real close.
+        if (canonicalIdBySlot.get(mapKey) !== pos.id) {
+          if (exPos) {
+            const mP = parseFloat(String(exPos.markPrice ?? exPos.indexPrice ?? exPos.lastPrice ?? "0"))
+            const uP = parseFloat(String(exPos.unrealizedProfit ?? exPos.unrealisedPnl ?? exPos.unrealizedPnl ?? "0"))
+            pos.exchangeData = {
+              ...pos.exchangeData,
+              markPrice: mP || pos.exchangeData?.markPrice,
+              unrealizedPnL: uP || pos.exchangeData?.unrealizedPnL,
+              syncedAt: Date.now(),
+            }
+            pos.updatedAt = Date.now()
+            await savePosition(pos)
+            delta.updated++
+          } else {
+            pos.status = "closed"
+            pos.closedAt = Date.now()
+            pos.closeReason = "duplicate_slot_pruned"
+            pos.updatedAt = Date.now()
+            // savePosition() moves it from the open index to the closed
+            // archive; intentionally NO closed/win counter increment here.
+            await savePosition(pos)
+            delta.updated++
+          }
+          return delta
+        }
 
         if (exPos) {
           const markPrice = parseFloat(String(exPos.markPrice ?? exPos.indexPrice ?? exPos.lastPrice ?? "0"))
@@ -3960,26 +4032,37 @@ export async function reconcileLivePositions(
           })
           pos.updatedAt = Date.now()
 
-          const openIndexKey   = `live:positions:${connectionId}`
           const closedIndexKey = `live:positions:${connectionId}:closed`
           const movedMarker    = `live:positions:${connectionId}:moved:${pos.id}`
 
-          await savePosition(pos)
+          // Read the dedupe marker BEFORE savePosition(). redis-db.savePosition()
+          // sets this very marker when status==="closed" and ALSO moves the id
+          // from the open index to the closed archive. Reading the marker after
+          // the call would therefore always be truthy, permanently skipping the
+          // close-counter increment below (externally-closed positions — SL/TP
+          // fills, liquidations, manual closes — were never counted). The marker
+          // is what dedupes this path against closeLivePosition().
           const alreadyMoved = await client.get(movedMarker).catch(() => null)
+
+          // Persists the JSON snapshot + moves the index + sets the marker.
+          await savePosition(pos)
 
           const progKey = `progression:${connectionId}`
           const writes: Promise<any>[] = [
             client.expire(progKey, 7 * 24 * 60 * 60).catch(() => {}),
             client.del(`live:lock:${connectionId}:${pos.symbol}:${pos.direction}`).catch(() => {}),
+            // Bound the closed archive + refresh its TTL (savePosition does the
+            // lpush move but not these housekeeping ops). Idempotent to repeat.
+            client.ltrim(closedIndexKey, 0, 4999).catch(() => {}),
+            client.expire(closedIndexKey, 30 * 24 * 60 * 60).catch(() => {}),
           ]
           if (!alreadyMoved) {
+            // Counter increments are the ONLY ops that must be deduped across
+            // the closeLivePosition + reconcile paths — the index move inside
+            // savePosition() is already idempotent, so we no longer repeat the
+            // lrem/lpush here (doing so double-pushed the id into the archive).
             writes.push(
               client.hincrby(progKey, "live_positions_closed_count", 1).catch(() => {}),
-              client.lrem(openIndexKey, 0, pos.id).catch(() => {}),
-              client.lpush(closedIndexKey, pos.id).catch(() => {}),
-              client.ltrim(closedIndexKey, 0, 4999).catch(() => {}),
-              client.expire(closedIndexKey, 30 * 24 * 60 * 60).catch(() => {}),
-              client.setex(movedMarker, 604800, "1").catch(() => {}),
             )
             if (realizedPnl > 0) {
               writes.push(client.hincrby(progKey, "live_wins_count", 1).catch(() => {}))
@@ -4913,7 +4996,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // compare-and-swap here because:
     //   (a) the lock is short-TTL (30 s) — a missed release just
     //       delays the next sync by at most that window.
-    //   (b) syncWithExchange is idempotent — losing the release
+    //   (b) syncWithExchange is idempotent �� losing the release
     //       can't corrupt state, only skip work.
     //   (c) the only path that bypassed the acquire (Redis-unreachable
     //       fail-open) explicitly sets lockAcquired=true so we don't

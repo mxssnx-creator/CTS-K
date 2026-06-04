@@ -484,6 +484,40 @@ export class StrategyCoordinator {
   private _activeKeysCache: { keys: Set<string>; cycleAt: number } | null = null
 
   /**
+   * Per-connection cache of the `setKey`s (and `parentSetKey`s) that
+   * currently back an OPEN live position. This is the AUTHORITATIVE,
+   * leak-free signal for "is this Real Set actively running on the
+   * exchange" — read straight from the live-positions index rather than
+   * the `active_config_keys` SET (which is keyed by config fingerprint,
+   * has no clean removal path for directly-written Real pseudo positions,
+   * and would otherwise exempt stale Sets from the PF/DDT gate forever).
+   *
+   * evaluateRealSets uses it to keep a Set valid_real while its live
+   * position is open even if PF/DDT dips this cycle. Computed once per
+   * ~10 s and reused across every symbol in the same cycle, so a 10-symbol
+   * connection loads the index once, not ten times.
+   */
+  private _liveSetKeysCache: { keys: Set<string>; at: number } | null = null
+
+  private async getOpenLiveSetKeys(): Promise<Set<string>> {
+    const cache = this._liveSetKeysCache
+    if (cache && Date.now() - cache.at < 10_000) return cache.keys
+    const keys = new Set<string>()
+    try {
+      const { getLivePositions } = await import("@/lib/trade-engine/stages/live-stage")
+      const positions = await getLivePositions(this.connectionId)
+      for (const p of positions as any[]) {
+        const status = String(p?.status || "")
+        if (status === "closed" || status === "rejected") continue
+        if (p?.setKey) keys.add(String(p.setKey))
+        if (p?.parentSetKey) keys.add(String(p.parentSetKey))
+      }
+    } catch { /* fail-open: empty set just means no exemption this cycle */ }
+    this._liveSetKeysCache = { keys, at: Date.now() }
+    return keys
+  }
+
+  /**
    * Monotonic counter incremented on every executeStrategyFlow call.
    * Used to gate TTL resets (expire) on the progression hash so they
    * fire once every 500 cycles instead of on every cycle.
@@ -1947,6 +1981,18 @@ export class StrategyCoordinator {
            .catch(() => [])) as string[],
        )
      } catch { /* ignore errors - empty set is fine */ }
+
+     // Merge in the AUTHORITATIVE set of Set keys that currently back an
+     // OPEN live position. active_config_keys (above) is keyed by config
+     // fingerprint and is not reliably populated for directly-written Real
+     // pseudo positions, so on its own it leaves Sets with live exposure
+     // unprotected from the PF/DDT gate. The live-positions index carries
+     // the real setKey/parentSetKey, giving a leak-free "is running" signal
+     // that the continuous-validity exemptions below depend on.
+     try {
+       const liveSetKeys = await this.getOpenLiveSetKeys()
+       for (const k of liveSetKeys) realActiveKeysForVP.add(k)
+     } catch { /* fail-open */ }
      
      const mainSetsEligible = mainSets.map((s) => {
        const live = s.entryCount ?? s.entries?.length ?? 0
@@ -1991,7 +2037,23 @@ export class StrategyCoordinator {
         if (s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")) {
           return false
         }
-        
+
+        // ── Active-Set continuous validity (operator requirement) ─────────
+        // A Set that currently backs an OPEN live position (registered in
+        // active_config_keys, or flagged _hasLivePositions) MUST stay
+        // valid_real until that position is closed — even if its PF/DDT
+        // temporarily dips below threshold this cycle. Without this exemption
+        // a transient metric wobble drops the Set from realQualifying →
+        // realSorted → netted → realPostHedge, so it is never persisted or
+        // dispatched, orphaning the live position from its Real-stage owner
+        // (reconcile/sync can no longer map it to a Set). This mirrors the
+        // exemption already applied at the min-pos gate above.
+        const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
+        if (hasActiveReal) {
+          s.status = "valid_real"
+          return true
+        }
+
         const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
                       s.avgDrawdownTime <= metrics.maxDrawdownTime
         if (passes) {
@@ -2172,11 +2234,20 @@ export class StrategyCoordinator {
       const realActiveKeysForVP = await (async () => {
         try {
           const c = getRedisClient()
-          return new Set<string>(
+          const base = new Set<string>(
             (await c
               .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
               .catch(() => [])) as string[],
           )
+          // Same authoritative enrichment as the validation gate above so the
+          // "running now" valid-positions counter agrees with the filter: a
+          // Set with an open live position counts as running regardless of the
+          // (unreliable) active_config_keys fingerprint set.
+          try {
+            const liveSetKeys = await this.getOpenLiveSetKeys()
+            for (const k of liveSetKeys) base.add(k)
+          } catch { /* fail-open */ }
+          return base
         } catch { return new Set<string>() }
       })()
       const accPipeline = getRedisClient().multi()
