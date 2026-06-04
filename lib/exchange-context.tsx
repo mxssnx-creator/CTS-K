@@ -16,30 +16,26 @@ interface ExchangeContextType {
 const ExchangeContext = createContext<ExchangeContextType | undefined>(undefined)
 
 export function ExchangeProvider({ children }: { children: ReactNode }) {
-  // Seed from localStorage for unique session persistence across reloads.
-  // This ensures the complete site (QuickStart, selections, etc.) keeps the
-  // user's current situation instead of resetting to defaults.
-  const [selectedExchange, setSelectedExchange] = useState<string | null>(() => {
-    if (typeof window === "undefined") return null
-    try { return localStorage.getItem("ex:selectedExchange") || null } catch { return null }
-  })
-  const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(() => {
-    if (typeof window === "undefined") return null
-    try { return localStorage.getItem("ex:selectedConnectionId") || null } catch { return null }
-  })
+  // IMPORTANT (hydration): these MUST initialise to the same value the server
+  // renders (null). Reading localStorage in the useState initialiser gave the
+  // client's first render a persisted value while the server rendered null,
+  // which mismatched on hydration and cascaded into every consumer (the
+  // QuickStart button text and all radix `useId` ids drifted). Instead we
+  // hydrate from localStorage in a post-mount effect below, so the first
+  // client render is byte-identical to SSR and React reconciles cleanly.
+  const [selectedExchange, setSelectedExchange] = useState<string | null>(null)
+  const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null)
   const [activeConnections, setActiveConnections] = useState<any[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const loadingRef = useRef(false)
   const lastLoadRef = useRef(0)
   // Use a ref to read selectedConnectionId inside the callback without stale closure
   const selectedConnectionIdRef = useRef<string | null>(null)
-  // Seed ref immediately (sync, before mount effects) from persisted value
-  if (typeof window !== "undefined") {
-    try {
-      const persisted = localStorage.getItem("ex:selectedConnectionId")
-      if (persisted) selectedConnectionIdRef.current = persisted
-    } catch { /* ignore */ }
-  }
+  // Skip-first-run guards so the persist effects don't write the initial null
+  // state to localStorage before hydration has restored the stored selection
+  // (that would wipe it). They begin persisting only on genuine changes.
+  const exPersistReady = useRef(false)
+  const connPersistReady = useRef(false)
   const LOAD_COOLDOWN = 10000 // 10 seconds between refreshes
 
   const loadActiveConnections = useCallback(async (options?: { force?: boolean }) => {
@@ -99,6 +95,20 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
 
   // Load on mount; also refresh when connections are toggled or added/removed
   useEffect(() => {
+    // Hydrate the persisted selection AFTER mount (see note on the useState
+    // declarations). Seed the ref synchronously BEFORE loadActiveConnections
+    // so the auto-select logic respects the restored connection instead of
+    // overwriting it with a default.
+    try {
+      const persistedConn = localStorage.getItem("ex:selectedConnectionId")
+      const persistedEx = localStorage.getItem("ex:selectedExchange")
+      if (persistedConn) {
+        selectedConnectionIdRef.current = persistedConn
+        setSelectedConnectionId(persistedConn)
+      }
+      if (persistedEx) setSelectedExchange(persistedEx)
+    } catch { /* localStorage may be unavailable */ }
+
     loadActiveConnections()
 
     const handleConnectionChange = () => {
@@ -121,6 +131,10 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
   // Persist selection changes to localStorage so reloads restore the exact
   // same session & situation (selected connection drives QuickStart etc.)
   useEffect(() => {
+    // Skip the initial mount run (state is still the null SSR default); only
+    // persist real selection changes so we never wipe the stored value before
+    // the hydration effect above has restored it.
+    if (!exPersistReady.current) { exPersistReady.current = true; return }
     try {
       if (selectedExchange) localStorage.setItem("ex:selectedExchange", selectedExchange)
       else localStorage.removeItem("ex:selectedExchange")
@@ -128,6 +142,7 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
   }, [selectedExchange])
 
   useEffect(() => {
+    if (!connPersistReady.current) { connPersistReady.current = true; return }
     try {
       if (selectedConnectionId) localStorage.setItem("ex:selectedConnectionId", selectedConnectionId)
       else localStorage.removeItem("ex:selectedConnectionId")
