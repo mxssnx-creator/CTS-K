@@ -3,7 +3,7 @@
  * Handles schema initialization and data migrations for all system components
  */
 
-import { getRedisClient, initRedis, setMigrationsRun, haveMigrationsRun } from "./redis-db"
+import { getRedisClient, ensureCoreRedis, setMigrationsRun, haveMigrationsRun } from "./redis-db"
 import { getBaseConnectionCredentials, type BaseConnectionId } from "./base-connection-credentials"
 
 interface Migration {
@@ -1599,7 +1599,7 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
     // Check if migrations have already run in this process
     if (haveMigrationsRun()) {
       const finalVer = Math.max(...migrations.map((m) => m.version))
-      await initRedis()
+      await ensureCoreRedis()
       const client = getRedisClient()
 
       // Keep process guard synced with persisted migration state.
@@ -1625,7 +1625,7 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
       return { success: true, message: "Already run in this process", version: finalVer }
     }
 
-    await initRedis()
+    await ensureCoreRedis()
     const client = getRedisClient()
 
      const persistedRunState = await client.get("_migrations_run")
@@ -1717,7 +1717,7 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
  */
 export async function rollbackMigration(): Promise<void> {
   try {
-    await initRedis()
+    await ensureCoreRedis()
     const client = getRedisClient()
     const versionStr = await client.get("_schema_version")
     const currentVersion = versionStr ? parseInt(versionStr as string) : 0
@@ -1742,7 +1742,7 @@ export async function rollbackMigration(): Promise<void> {
  */
 export async function getMigrationStatus(): Promise<any> {
   try {
-    await initRedis()
+    await ensureCoreRedis()
     const client = getRedisClient()
     const versionStr = await client.get("_schema_version")
     const currentVersion = versionStr ? parseInt(versionStr as string) : 0

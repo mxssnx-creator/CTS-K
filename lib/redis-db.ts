@@ -33,6 +33,20 @@ const globalForRedis = globalThis as unknown as {
   // from different module scopes share a single disk-read rather than racing
   // to overwrite each other's post-migration state.
   __redis_load_promise?: Promise<boolean>
+  // In-flight guard for the CORE init (client construction + snapshot load +
+  // ping), shared across module scopes. Migrations call ensureCoreRedis()
+  // instead of initRedis() so the init→runMigrations→init cycle can't deadlock.
+  __redis_core_promise?: Promise<void>
+  // In-flight guard for the FULL init (core + migrations). All callers await
+  // this single promise, so no request proceeds with un-migrated data — the
+  // race that existed when isConnected flipped true before migrations ran.
+  __redis_init_promise?: Promise<void>
+  // True once the on-disk snapshot has been loaded (or confirmed absent) for
+  // this process. Gated on its own flag — not on the presence of __redis_data —
+  // because the constructor always creates the data maps, so a sync getter that
+  // builds the instance early would otherwise make the loader think the
+  // snapshot was already applied and skip it, booting with an empty store.
+  __redis_snapshot_loaded?: boolean
 }
 
 export class InlineLocalRedis {
@@ -1132,66 +1146,126 @@ export class InlineLocalRedis {
 }
 
 let redisInstance: InlineLocalRedis | null = null
-let isConnected = false
+let isConnected = false          // FULLY ready: core + migrations complete
+let coreInitialized = false      // core ready: client constructed + snapshot loaded + ping ok
 let connectionsInitialized = false
 let migrationsRan = false
 
-export async function initRedis(): Promise<void> {
-  if (isConnected) return
+/**
+ * Ensure the CORE Redis client is ready: instance constructed, on-disk
+ * snapshot loaded, and ping verified. This deliberately does NOT run
+ * migrations.
+ *
+ * `runMigrations()` (in redis-migrations.ts) calls THIS — never initRedis() —
+ * to bring the store up. That breaks what would otherwise be a deadlock:
+ * initRedis() awaits a shared promise whose body awaits runMigrations(); if
+ * runMigrations() awaited initRedis() it would await the very promise it is
+ * running inside. Splitting core init out removes the cycle entirely.
+ *
+ * Idempotent and concurrency-safe: a single core-init promise is shared
+ * across all callers/module scopes via globalForRedis.
+ */
+export async function ensureCoreRedis(): Promise<void> {
+  if (coreInitialized && redisInstance) return
+  if (globalForRedis.__redis_core_promise) return globalForRedis.__redis_core_promise
 
-  if (!redisInstance) {
-    // Capture emptiness BEFORE construction. The constructor now only
-    // initialises the in-memory Maps without loading from disk, so after
-    // `new InlineLocalRedis()` the data structure exists but is empty.
-    // wasEmpty=true  → first boot, load the snapshot now (awaited, ordered before migrations)
-    // wasEmpty=false → hot-reload; data is already in globalForRedis.__redis_data
-    //                  from the previous module instance — do NOT reload the
-    //                  snapshot or it overwrites post-migration state.
-    const wasEmpty = !globalForRedis.__redis_data
-    redisInstance = new InlineLocalRedis()
-    if (wasEmpty) {
-      // Dedup concurrent loadFromDisk calls across module scopes. If another
-      // initRedis() already fired loadFromDisk in this process (via a
-      // concurrent route handler), wait for that promise instead of loading
-      // the snapshot a second time — the second load would overwrite
-      // post-migration writes (e.g. is_enabled_dashboard=1 from mig 021).
+  globalForRedis.__redis_core_promise = (async () => {
+    // Ensure the instance exists. A sync getter (getRedisClient/getClient) may
+    // have constructed it already; the constructor only initialises empty Maps
+    // and never loads the snapshot — that is done explicitly below.
+    if (!redisInstance) {
+      redisInstance = new InlineLocalRedis()
+    }
+
+    // Load the on-disk snapshot EXACTLY ONCE per process, gated on the global
+    // snapshot flag (not on data-map presence). This runs even when a sync
+    // getter built the empty instance first, and is skipped on hot-reload (the
+    // flag persists on globalThis), so we never overwrite live post-migration
+    // state. Concurrent callers across module scopes share one load promise.
+    if (!globalForRedis.__redis_snapshot_loaded) {
       if (!globalForRedis.__redis_load_promise) {
-        globalForRedis.__redis_load_promise = redisInstance.loadFromDisk().catch(() => false)
+        globalForRedis.__redis_load_promise = redisInstance
+          .loadFromDisk()
+          .then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
+          .catch(() => { globalForRedis.__redis_snapshot_loaded = true; return false })
         globalForRedis.__redis_load_promise.finally(() => {
           globalForRedis.__redis_load_promise = undefined
         })
       }
       await globalForRedis.__redis_load_promise
     }
-  }
 
-  isConnected = true
-
-  const pong = await redisInstance.ping()
-  if (pong !== "PONG") {
-    console.error("[v0] [Redis] Connection test failed")
-  }
-
-  if (!migrationsRan) {
-    try {
-      migrationsRan = true
-      const { runMigrations } = await import("@/lib/redis-migrations")
-      await runMigrations()
-    } catch (error) {
-      console.error("[v0] [Redis] Migration error:", error)
-      migrationsRan = true
+    const pong = await redisInstance.ping()
+    if (pong !== "PONG") {
+      console.error("[v0] [Redis] Connection test failed")
     }
-  }
+    coreInitialized = true
+  })()
 
-  if (!connectionsInitialized) {
-    connectionsInitialized = true
+  try {
+    await globalForRedis.__redis_core_promise
+  } finally {
+    // Always clear: on success coreInitialized guards the fast path; on failure
+    // the next caller must be able to retry from scratch.
+    globalForRedis.__redis_core_promise = undefined
   }
 }
 
+/**
+ * Full initialisation: core Redis + schema migrations. `isConnected` only
+ * becomes true AFTER migrations have completed, and every caller awaits the
+ * SAME shared promise. This closes the cold-start race where isConnected
+ * flipped true before migrations ran, letting concurrent route handlers read
+ * un-migrated data. Identical behaviour in dev (`next dev`) and production
+ * (`next start` / Vercel) — both invoke instrumentation.register() which calls
+ * this, and every server action / route guards on it via ensureRedisInitialized.
+ */
+export async function initRedis(): Promise<void> {
+  if (isConnected) return
+  if (globalForRedis.__redis_init_promise) return globalForRedis.__redis_init_promise
+
+  globalForRedis.__redis_init_promise = (async () => {
+    await ensureCoreRedis()
+
+    if (!migrationsRan) {
+      // runMigrations() calls ensureCoreRedis() internally (NOT initRedis), so
+      // there is no re-entrancy with the promise we are currently inside.
+      const { runMigrations } = await import("@/lib/redis-migrations")
+      await runMigrations()
+      migrationsRan = true
+    }
+
+    connectionsInitialized = true
+    isConnected = true
+  })()
+
+  try {
+    await globalForRedis.__redis_init_promise
+  } catch (error) {
+    // Boot must never crash the runtime. Log, reset retry state, and let the
+    // next caller re-attempt the full sequence (a transient migration failure
+    // should not permanently disable migrations for the whole process, which
+    // is exactly what the previous `migrationsRan = true`-on-failure did).
+    console.error("[v0] [Redis] initialization error (will retry on next call):", error)
+    migrationsRan = false
+  } finally {
+    // Clear the shared promise unless we fully succeeded, so retries get a
+    // fresh run. Once isConnected is true the top-of-function guard short-
+    // circuits and the promise is never consulted again.
+    if (!isConnected) {
+      globalForRedis.__redis_init_promise = undefined
+    }
+  }
+}
+
+// NOTE: these sync getters intentionally do NOT set isConnected/coreInitialized.
+// Flipping isConnected here was a latent hazard: if a getter ran before
+// initRedis() (e.g. import-time code), initRedis() would early-return and SKIP
+// MIGRATIONS and the snapshot load entirely. They now only guarantee a non-null
+// client; ensureCoreRedis()/initRedis() own readiness state and snapshot load.
 export function getClient(): InlineLocalRedis {
   if (!redisInstance) {
     redisInstance = new InlineLocalRedis()
-    isConnected = true
   }
   return redisInstance
 }
@@ -1199,7 +1273,6 @@ export function getClient(): InlineLocalRedis {
 export function getRedisClient(): InlineLocalRedis {
   if (!redisInstance) {
     redisInstance = new InlineLocalRedis()
-    isConnected = true
   }
   return redisInstance
 }
