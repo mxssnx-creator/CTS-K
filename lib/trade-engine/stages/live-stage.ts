@@ -177,13 +177,16 @@ async function tryAcquireLock(connId: string, symbol: string, direction: string)
   const key = `live:lock:${connId}:${symbol}:${direction}`
   const token = `tok:${Date.now()}:${Math.random().toString(36).slice(2,8)}`
   try {
-    const r = await client.set(key, token, ({ ex: 300 } as any))
-    if (r === "OK") return token
-    // Some adapters return "OK" for set; others return undefined on success
-    // Fallback: if key doesn't exist after set attempt, treat as acquired
-    const exists = await client.get(key)
-    if (!exists) return token
-    return null
+    // Atomic SET key token NX EX 300 — the ONLY correct dedup primitive.
+    // `NX` guarantees exclusivity (a second concurrent entry on the same
+    // symbol+direction gets `null` and falls through to the accumulate
+    // path); `EX` guarantees the lock self-expires so a crashed engine
+    // can never strand a slot. The previous lowercase `{ ex: 300 }` was
+    // silently ignored by the client (which honours only `{ EX, NX, XX }`),
+    // so the lock had neither a TTL nor exclusivity — every signal
+    // "acquired" it and duplicate exchange orders were possible.
+    const r = await client.set(key, token, { EX: 300, NX: true })
+    return r === "OK" ? token : null
   } catch {
     return null
   }
@@ -215,20 +218,113 @@ async function fetchCurrentPrice(symbol: string, connId?: string): Promise<numbe
   }
 }
 async function accumulateIntoLivePosition(connId: string, existing: LivePosition, real: any, price: number, connector: any): Promise<LivePosition> {
-  // Accumulate by merging executedQuantity and volumeUsd, appending setKey
+  // Accumulation (DCA / signal-stacking) MUST place a real exchange order
+  // for the added size — otherwise Redis `executedQuantity` inflates while
+  // the venue position does not, and the very next reconcile tick sees a
+  // size mismatch (or, worse, arms SL/TP for phantom contracts). The prior
+  // implementation merged quantities purely in memory; this is the bug fix.
   try {
-    const qty = real.quantity || real.executedQuantity || 0
-    const addedQty = Number(qty) || 0
-    existing.executedQuantity = (existing.executedQuantity || 0) + addedQty
-    existing.remainingQuantity = Math.max(0, (existing.quantity || 0) - (existing.executedQuantity || 0))
-    existing.averageExecutionPrice = ((existing.averageExecutionPrice || existing.entryPrice || 0) * ((existing.executedQuantity || 0) - addedQty) + price * addedQty) / Math.max(1e-12, (existing.executedQuantity || 0))
-    existing.volumeUsd = (existing.executedQuantity || 0) * (existing.averageExecutionPrice || price)
     if (!existing.accumulatedSetKeys) existing.accumulatedSetKeys = []
-    if (real.setKey && !existing.accumulatedSetKeys.includes(real.setKey)) existing.accumulatedSetKeys.push(real.setKey)
+
+    // ── Hard cap on merges per position ───────────────────────────────
+    if (existing.accumulatedSetKeys.length >= MAX_ACCUMULATIONS_PER_POSITION) {
+      pushStep(existing, "accumulate_skip", false, `cap reached (${MAX_ACCUMULATIONS_PER_POSITION} accumulations) — merge suppressed`)
+      await savePosition(existing)
+      return existing
+    }
+
+    // Idempotency: never merge the same Set twice into one position.
+    if (real.setKey && existing.accumulatedSetKeys.includes(real.setKey)) {
+      pushStep(existing, "accumulate_skip", false, `setKey ${real.setKey} already accumulated`)
+      await savePosition(existing)
+      return existing
+    }
+
+    if (!connector || typeof connector.placeOrder !== "function") {
+      pushStep(existing, "accumulate_skip", false, "exchange connector unavailable — accumulation deferred")
+      await savePosition(existing)
+      return existing
+    }
+
+    const symbol = String(real.symbol || existing.symbol || "")
+    const direction: "long" | "short" = (real.direction === "short" || existing.direction === "short") ? "short" : "long"
+    const exchangeSide: "buy" | "sell" = direction === "long" ? "buy" : "sell"
+
+    // ── Size the accumulation order the same way a fresh entry is sized ──
+    const volumeResult = await VolumeCalculator.calculateVolumeForConnection(
+      connId,
+      symbol,
+      price,
+      { tradeMode: "main" },
+    ).catch(() => null)
+    let addQty = volumeResult?.finalVolume || volumeResult?.volume || 0
+    if (!Number.isFinite(addQty) || addQty <= 0) {
+      // $5 notional fallback mirrors the primary-entry last-resort path.
+      addQty = price > 0 ? 5 / price : 0
+    }
+    if (!Number.isFinite(addQty) || addQty <= 0) {
+      pushStep(existing, "accumulate_skip", false, `could not size accumulation order for ${symbol}`)
+      await savePosition(existing)
+      return existing
+    }
+
+    // ── Place the real market order for the added size ──────────────────
+    let orderRes: any = null
+    try {
+      orderRes = await connector.placeOrder(
+        symbol,
+        exchangeSide,
+        addQty,
+        undefined,
+        "market",
+        { positionSide: direction === "long" ? "LONG" : "SHORT" },
+      )
+    } catch (err) {
+      pushStep(existing, "accumulate_order_error", false, err instanceof Error ? err.message : String(err))
+      await savePosition(existing)
+      return existing
+    }
+
+    const ok = !!orderRes?.success && !!(orderRes.orderId || orderRes.id)
+    if (!ok) {
+      pushStep(existing, "accumulate_order_failed", false, `exchange rejected accumulation: ${orderRes?.error || "unknown"}`)
+      await savePosition(existing)
+      return existing
+    }
+
+    // Prefer the venue's reported fill; fall back to requested qty/price.
+    const filledQty = parseFloat(String(orderRes.filledQty ?? orderRes.executedQty ?? orderRes.cumQty ?? "0")) || addQty
+    const filledPrice = parseFloat(String(orderRes.filledPrice ?? orderRes.avgPrice ?? orderRes.price ?? "0")) || price
+
+    const prevExec = existing.executedQuantity || 0
+    const prevAvg = existing.averageExecutionPrice || existing.entryPrice || 0
+    const newExec = prevExec + filledQty
+    existing.executedQuantity = newExec
+    existing.quantity = (existing.quantity || 0) + filledQty
+    existing.remainingQuantity = Math.max(0, (existing.quantity || 0) - newExec)
+    // Notional-weighted average entry across the original fill + this merge.
+    existing.averageExecutionPrice = newExec > 0 ? (prevAvg * prevExec + filledPrice * filledQty) / newExec : prevAvg
+    existing.volumeUsd = newExec * (existing.averageExecutionPrice || filledPrice)
+    if (!existing.fills) existing.fills = []
+    existing.fills.push({ timestamp: Date.now(), quantity: filledQty, price: filledPrice, fee: 0, feeAsset: "USDT" })
+    if (real.setKey) existing.accumulatedSetKeys.push(real.setKey)
     existing.updatedAt = Date.now()
+    pushStep(existing, "accumulate", true, `+${filledQty} @ ${filledPrice} (setKey=${real.setKey || "n/a"}, total=${newExec})`)
+    await incrementMetric(connId, "live_orders_accumulated_count")
     await savePosition(existing)
+
+    // ── Re-arm protection orders for the new, larger size ───────────────
+    // The existing SL/TP cover the pre-merge quantity; updateProtectionOrders
+    // re-sizes them to the accumulated executedQuantity.
+    try {
+      await updateProtectionOrders(connector, existing, "accumulate_rearm", null)
+      await savePosition(existing)
+    } catch (err) {
+      pushStep(existing, "accumulate_rearm_failed", false, err instanceof Error ? err.message : String(err))
+    }
   } catch (err) {
-    // best-effort
+    pushStep(existing, "accumulate_error", false, err instanceof Error ? err.message : String(err))
+    try { await savePosition(existing) } catch { /* best-effort */ }
   }
   return existing
 }
@@ -236,7 +332,10 @@ async function refreshLockTTL(connId: string, symbol: string, direction: string,
   const { getRedisClient } = await import("@/lib/redis-db")
   const client = getRedisClient()
   try {
-    await client.set(`live:lock:${connId}:${symbol}:${direction}`, String(Date.now()), ({ ex: Math.ceil(ttlMs / 1000) } as any))
+    // Uppercase `EX` is the only TTL key the client honours; the prior
+    // lowercase `ex` was dropped, so the refreshed key lived forever and
+    // a crashed engine left the slot locked permanently.
+    await client.set(`live:lock:${connId}:${symbol}:${direction}`, String(Date.now()), { EX: Math.ceil(ttlMs / 1000) })
   } catch {
     // best-effort
   }
@@ -251,8 +350,19 @@ async function releaseLock(connId: string, symbol: string, direction: string): P
   }
 }
 function resolveMaxHoldMs(connId: string): number {
-  /* stub */
-  return 0
+  // Delegate to the centralised engine-timings snapshot rather than a
+  // bespoke settings read. `maxPositionHoldMs` is the single source of
+  // truth (Redis `settings:system`, default 4h, `0` disables). The sync
+  // getter returns the last cached snapshot — refreshed off the hot path
+  // by `refreshEngineTimings()` — so the six reconcile/sweep call sites
+  // pay zero per-tick Redis cost. The previous `return 0` stub silently
+  // disabled the max-hold safety closer everywhere.
+  try {
+    const ms = getEngineTimings().maxPositionHoldMs
+    return Number.isFinite(ms) && ms > 0 ? ms : 0
+  } catch {
+    return 0
+  }
 }
 
 /**

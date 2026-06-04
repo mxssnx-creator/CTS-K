@@ -1836,6 +1836,11 @@ export class StrategyCoordinator {
             position_cost: positionCost,
             status: "open",
             position_level: "real",
+            // `set_id` is the canonical per-Set identity used by downstream
+            // Set-level dedup/tracking. It mirrors config_set_key here but is
+            // kept as an explicit field so consumers don't have to know which
+            // of the (historically divergent) key fields carries the Set id.
+            set_id: setKey,
             config_set_key: setKey,
             source_set_key: setKey,
             created_at: createdAtIso,
