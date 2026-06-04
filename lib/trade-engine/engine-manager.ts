@@ -1624,6 +1624,18 @@ export class TradeEngineManager {
   //   10-200ms, default 50ms). This removes the old "skip-when-busy" pattern that
   //   was causing the cycle time to climb to 4s+ and the engine to appear hung.
   private startIndicationProcessor(_intervalSeconds: number = 1): void {
+    // Idempotency guard: if this loop is already armed, tear the existing
+    // timer down before installing a new one. Each start*Processor ends by
+    // assigning `this.indicationTimer = setTimeout(...)`; without this guard
+    // a second invocation (any future restart/arm path) would overwrite the
+    // handle and orphan the prior self-rescheduling loop, leaving TWO tick
+    // loops running forever — doubling Redis/exchange load and corrupting
+    // cycle counters. rearmIfStalled guards externally, but the method must
+    // self-protect too.
+    if (this.indicationTimer) {
+      try { clearTimeout(this.indicationTimer); unregisterEngineTimer(this.indicationTimer) } catch { /* stale handle */ }
+      this.indicationTimer = undefined
+    }
     // Counter variables for metrics tracking - simplified to avoid closure issues
     let cycleCount = 0
     let attemptedCycles = 0
@@ -2107,6 +2119,12 @@ export class TradeEngineManager {
    * progressively up to 1s so the engine stops "spinning" on nothing.
    */
   private startStrategyProcessor(_intervalSeconds: number = 1): void {
+    // Idempotency guard — see startIndicationProcessor. Prevents a leaked
+    // duplicate heartbeat loop if this is ever (re)armed while already live.
+    if (this.strategyTimer) {
+      try { clearTimeout(this.strategyTimer); unregisterEngineTimer(this.strategyTimer) } catch { /* stale handle */ }
+      this.strategyTimer = undefined
+    }
     // ── ARCHITECTURAL CHANGE (three-progression refactor) ────────────────
     // Strategy evaluation no longer runs as an independent top-level
     // loop. It is now Phase 3 of the canonical shared ind+strat
@@ -2470,6 +2488,12 @@ export class TradeEngineManager {
    * (max 1s) across consecutive empty cycles.
    */
   private startRealtimeProcessor(_intervalSeconds: number = 1): void {
+    // Idempotency guard — see startIndicationProcessor. Prevents a leaked
+    // duplicate LivePositions loop if this is ever (re)armed while live.
+    if (this.realtimeTimer) {
+      try { clearTimeout(this.realtimeTimer); unregisterEngineTimer(this.realtimeTimer) } catch { /* stale handle */ }
+      this.realtimeTimer = undefined
+    }
     // ── ARCHITECTURAL CHANGE (three-progression refactor) ────────────────
     // This method NO LONGER runs per-position mark-to-market / TP / SL
     // (that work is now Phase 2 of the shared ind+strat pipeline, fired
@@ -2887,6 +2911,12 @@ export class TradeEngineManager {
   private startPrehistoricProgression(
     onFirstPassComplete?: () => void,
   ): void {
+    // Idempotency guard — see startIndicationProcessor. Prevents a leaked
+    // duplicate Prehistoric loop if this is ever (re)armed while live.
+    if (this.prehistoricTimer) {
+      try { clearTimeout(this.prehistoricTimer); unregisterEngineTimer(this.prehistoricTimer) } catch { /* stale handle */ }
+      this.prehistoricTimer = undefined
+    }
     let cycleCount = 0
     let firstPassDone = false
     const connId = this.connectionId

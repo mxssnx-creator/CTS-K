@@ -5200,12 +5200,48 @@ export async function syncLiveFromPseudo(
       })()
     const trailingStopPrice = parseFloat(String(pseudoPos?.trailing_stop_price || "0"))
 
+    // ── Set-scoped match (BUG 6) ──────────────────────────────────────
+    // Identify the Real Set that owns THIS pseudo position. Several pseudo
+    // positions (distinct Sets) can target the same symbol+side slot; the
+    // dedup lock collapses them onto ONE live position. Matching by
+    // symbol+side alone would let every Set's trailing tick rewrite that
+    // single live position's SL/TP with its own level, making the stop
+    // flap between unrelated Sets. Scope the match to the owning Set's key
+    // so each pseudo only steers the live position it actually backs.
+    const pseudoSetKey = String(
+      pseudoPos?.set_id || pseudoPos?.config_set_key || pseudoPos?.source_set_key || "",
+    ).trim()
+
     const livePositions = await getLivePositions(connectionId)
-    const matches = livePositions.filter((p: any) => {
+    const slotMatches = livePositions.filter((p: any) => {
       const liveSide: "long" | "short" =
         p.direction === "short" || p.side === "short" ? "short" : "long"
       return String(p.symbol || "").toUpperCase() === symbol && liveSide === side && p.status !== "closed"
     })
+    if (slotMatches.length === 0) return
+
+    // Prefer live positions whose setKey/parentSetKey matches this pseudo's
+    // owning Set. Only fall back to the unscoped slot matches when NONE of
+    // them carry a setKey we can compare against (legacy positions written
+    // before setKey propagation) or when the pseudo itself has no set id —
+    // in those cases symbol+side is the best signal available, preserving
+    // backward-compatible behaviour without silently dropping the sync.
+    let matches = slotMatches
+    if (pseudoSetKey) {
+      const scoped = slotMatches.filter((p: any) => {
+        const liveKey = String(p.setKey || p.parentSetKey || "").trim()
+        return liveKey === pseudoSetKey
+      })
+      const anyLiveKeyed = slotMatches.some((p: any) => String(p.setKey || p.parentSetKey || "").trim().length > 0)
+      if (scoped.length > 0) {
+        matches = scoped
+      } else if (anyLiveKeyed) {
+        // Live positions ARE keyed, but none belong to this Set → this
+        // pseudo does not own the slot's live exposure. Do not touch it.
+        return
+      }
+      // else: no live position is keyed → fall back to slot matches.
+    }
     if (matches.length === 0) return
 
     // Parallelize across matching live positions — each position's
