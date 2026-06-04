@@ -67,7 +67,7 @@ const _fs = await ensureFs(); await _fs!.writeFile(ACTIVE_CONNECTION_FILE, conne
   async getVolumeFactor(connectionId: string): Promise<{ live: number; preset: number } | null> {
     try {
       await this.initialize()
-      const content = await fs.readFile(VOLUME_CACHE_FILE, "utf-8")
+      const _fs = await ensureFs(); const content = await _fs!.readFile(VOLUME_CACHE_FILE, "utf-8")
 
       if (!content.trim()) return null
 
@@ -109,7 +109,7 @@ const _fs = await ensureFs(); const content = await _fs!.readFile(VOLUME_CACHE_F
   async getTestResults(connectionId: string): Promise<any> {
     try {
       await this.initialize()
-      const content = await fs.readFile(TEST_RESULTS_FILE, "utf-8")
+      const _fs = await ensureFs(); const content = await _fs!.readFile(TEST_RESULTS_FILE, "utf-8")
 
       if (!content.trim()) return null
 

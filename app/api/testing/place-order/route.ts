@@ -46,7 +46,7 @@ export async function POST(req: NextRequest) {
     if (forceSim || !connection.api_key || !connection.api_secret) {
       try {
         const { SimulatedConnector } = await import("@/lib/exchange-connectors/simulated-connector")
-        connector = new SimulatedConnector({ apiKey: connection.api_key, apiSecret: connection.api_secret }, "simulated")
+        connector = new SimulatedConnector({ apiKey: connection.api_key, apiSecret: connection.api_secret, isTestnet: false }, "simulated")
         console.log(`[PlaceOrder] Using SimulatedConnector for ${connectionId} (forceSim=${forceSim})`)
       } catch (simErr) {
         console.warn(`[PlaceOrder] Failed to create SimulatedConnector fallback:`, simErr)
