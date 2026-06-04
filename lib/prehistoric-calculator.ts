@@ -48,10 +48,16 @@ export class PrehistoricCalculator {
   /**
    * Process prehistoric data for a symbol
    */
-  async processSymbol(symbol: string, candles: CandleData[]): Promise<PrehistoricCalculationResult> {
+  async processSymbol(symbol: string, candles?: CandleData[]): Promise<PrehistoricCalculationResult> {
     const startTime = Date.now()
     let errors = 0
     const results: IndicatorResult[] = []
+
+    if (!candles || candles.length === 0) {
+      const client = getRedisClient()
+      const raw = await client.lrange(`prehistoric:${this.connectionId}:${symbol}:candles`, 0, -1)
+      candles = raw.map(r => JSON.parse(r))
+    }
 
     await this.logger.logPrehistoric(symbol, `Processing ${candles.length} candles...`)
 

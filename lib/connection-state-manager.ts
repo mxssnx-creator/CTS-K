@@ -1,4 +1,8 @@
-import fs from "fs/promises"
+let fs: typeof import('fs/promises') | null = null
+async function ensureFs() {
+  if (fs) return fs
+  try { fs = await import('fs/promises'); return fs } catch { fs = null; return null }
+}
 import { EventEmitter } from "events"
 import path from "path"
 
@@ -15,16 +19,16 @@ class ConnectionStateManager extends EventEmitter {
     if (this.initialized) return
 
     try {
-      await fs.mkdir(STATE_DIR, { recursive: true })
+      const fsMod = await ensureFs(); if (!fsMod) throw new Error('fs not available in this runtime'); await fsMod.mkdir(STATE_DIR, { recursive: true })
 
       // Initialize files if they don't exist
       const files = [ACTIVE_CONNECTION_FILE, SYNC_LOG_FILE, VOLUME_CACHE_FILE, TEST_RESULTS_FILE]
 
       for (const file of files) {
         try {
-          await fs.access(file)
+          const _fs = await ensureFs(); await _fs!.access(file)
         } catch {
-          await fs.writeFile(file, "", "utf-8")
+          const _fs2 = await ensureFs(); await _fs2!.writeFile(file, "", "utf-8")
         }
       }
 
@@ -39,7 +43,7 @@ class ConnectionStateManager extends EventEmitter {
   async getActiveConnection(): Promise<string | null> {
     try {
       await this.initialize()
-      const content = await fs.readFile(ACTIVE_CONNECTION_FILE, "utf-8")
+      const _fs = await ensureFs(); const content = await _fs!.readFile(ACTIVE_CONNECTION_FILE, "utf-8")
       return content.trim() || null
     } catch (error) {
       console.error("[ConnectionStateManager] Failed to read active connection:", error)
@@ -50,8 +54,8 @@ class ConnectionStateManager extends EventEmitter {
   async setActiveConnection(connectionId: string): Promise<void> {
     try {
       await this.initialize()
-      await fs.writeFile(ACTIVE_CONNECTION_FILE, connectionId, "utf-8")
-      await this.logSync("set_active", { connectionId, timestamp: new Date().toISOString() })
+const _fs = await ensureFs(); await _fs!.writeFile(ACTIVE_CONNECTION_FILE, connectionId, "utf-8")
+        await this.logSync("set_active", { connectionId, timestamp: new Date().toISOString() })
       this.emit("activeConnectionChanged", connectionId)
       console.log("[ConnectionStateManager] Active connection set:", connectionId)
     } catch (error) {
@@ -82,7 +86,7 @@ class ConnectionStateManager extends EventEmitter {
       let cache: Record<string, { live: number; preset: number }> = {}
 
       try {
-        const content = await fs.readFile(VOLUME_CACHE_FILE, "utf-8")
+const _fs = await ensureFs(); const content = await _fs!.readFile(VOLUME_CACHE_FILE, "utf-8")
         if (content.trim()) {
           cache = JSON.parse(content)
         }
@@ -92,7 +96,7 @@ class ConnectionStateManager extends EventEmitter {
 
       cache[connectionId] = { live, preset }
 
-      await fs.writeFile(VOLUME_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8")
+      const _fs = await ensureFs(); await _fs!.writeFile(VOLUME_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8")
       await this.logSync("update_volume", { connectionId, live, preset, timestamp: new Date().toISOString() })
       this.emit("volumeFactorChanged", connectionId, live, preset)
       console.log("[ConnectionStateManager] Volume factor updated:", connectionId)
@@ -124,7 +128,7 @@ class ConnectionStateManager extends EventEmitter {
       let cache: Record<string, any> = {}
 
       try {
-        const content = await fs.readFile(TEST_RESULTS_FILE, "utf-8")
+const _fs = await ensureFs(); const content = await _fs!.readFile(TEST_RESULTS_FILE, "utf-8")
         if (content.trim()) {
           cache = JSON.parse(content)
         }
@@ -137,7 +141,7 @@ class ConnectionStateManager extends EventEmitter {
         timestamp: new Date().toISOString(),
       }
 
-      await fs.writeFile(TEST_RESULTS_FILE, JSON.stringify(cache, null, 2), "utf-8")
+      const _fs = await ensureFs(); await _fs!.writeFile(TEST_RESULTS_FILE, JSON.stringify(cache, null, 2), "utf-8")
       this.emit("testResultsUpdated", connectionId, results)
       console.log("[ConnectionStateManager] Test results saved:", connectionId)
     } catch (error) {
@@ -149,7 +153,7 @@ class ConnectionStateManager extends EventEmitter {
   private async logSync(action: string, data: any): Promise<void> {
     try {
       const logEntry = `[${new Date().toISOString()}] ${action}: ${JSON.stringify(data)}\n`
-      await fs.appendFile(SYNC_LOG_FILE, logEntry, "utf-8")
+      const _fs = await ensureFs(); await _fs!.appendFile(SYNC_LOG_FILE, logEntry, "utf-8")
     } catch (error) {
       console.error("[ConnectionStateManager] Failed to write sync log:", error)
     }
@@ -158,7 +162,7 @@ class ConnectionStateManager extends EventEmitter {
   async getSyncLog(limit = 100): Promise<string[]> {
     try {
       await this.initialize()
-      const content = await fs.readFile(SYNC_LOG_FILE, "utf-8")
+      const _fs = await ensureFs(); const content = await _fs!.readFile(SYNC_LOG_FILE, "utf-8")
       const lines = content.trim().split("\n").filter(Boolean)
       return lines.slice(-limit)
     } catch (error) {
@@ -170,9 +174,9 @@ class ConnectionStateManager extends EventEmitter {
   async clearCache(): Promise<void> {
     try {
       await this.initialize()
-      await fs.writeFile(VOLUME_CACHE_FILE, "", "utf-8")
-      await fs.writeFile(TEST_RESULTS_FILE, "", "utf-8")
-      await this.logSync("clear_cache", { timestamp: new Date().toISOString() })
+const _fs = await ensureFs(); await _fs!.writeFile(VOLUME_CACHE_FILE, "", "utf-8")
+       await _fs!.writeFile(TEST_RESULTS_FILE, "", "utf-8")
+       await this.logSync("clear_cache", { timestamp: new Date().toISOString() })
       console.log("[ConnectionStateManager] Cache cleared")
     } catch (error) {
       console.error("[ConnectionStateManager] Failed to clear cache:", error)

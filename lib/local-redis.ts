@@ -436,6 +436,36 @@ class LocalRedis {
     return newValue
   }
 
+  // Hash increment helpers — mirror Redis HINCRBY/HINCRBYFLOAT behaviour
+  async hincrby(key: string, field: string, increment: number): Promise<number> {
+    if (this.isExpired(key)) {
+      this.data[key] = {}
+    }
+    if (!(key in this.data) || typeof this.data[key] === "string" || this.data[key] instanceof Set) {
+      this.data[key] = {}
+    }
+    const hash = this.data[key] as Record<string, string>
+    const current = parseInt(hash[field] || "0", 10) || 0
+    const next = current + Math.floor(increment)
+    hash[field] = String(next)
+    return next
+  }
+
+  async hincrbyfloat(key: string, field: string, increment: number): Promise<number> {
+    if (this.isExpired(key)) {
+      this.data[key] = {}
+    }
+    if (!(key in this.data) || typeof this.data[key] === "string" || this.data[key] instanceof Set) {
+      this.data[key] = {}
+    }
+    const hash = this.data[key] as Record<string, string>
+    const current = parseFloat(hash[field] || "0") || 0
+    const next = current + increment
+    // Preserve reasonable float precision
+    hash[field] = String(Math.round(next * 100) / 100)
+    return next
+  }
+
   async expire(key: string, seconds: number): Promise<number> {
     if (key in this.data && !this.isExpired(key)) {
       this.expiry[key] = Date.now() + seconds * 1000

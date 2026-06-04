@@ -184,7 +184,7 @@ export class ProductionErrorHandler {
             if (Date.now() > deadline) break
             const exitPrice = Number(pos.exchangeData?.markPrice) || pos.averageExecutionPrice || pos.entryPrice
             console.log(`[SHUTDOWN] Emergency-closing ${pos.symbol} @ ${exitPrice}`)
-            await closeLivePosition(connId, pos.id, exitPrice, connector, "shutdown").catch(() => {})
+            await closeLivePosition(connId, pos.id!, exitPrice, connector, "shutdown").catch(() => {})
           }
         } catch { /* per-connection errors must not abort other connections */ }
       }

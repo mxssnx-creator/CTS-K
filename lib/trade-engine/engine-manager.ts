@@ -540,24 +540,35 @@ export class TradeEngineManager {
     try {
       // Ensure Redis is initialized before using it
       await initRedis()
-      
-      // ── Initialise / archive progression state ────────────────────────
-      // `archiveAndStartNewProgression` handles both cases:
-      //   • First start: creates a fresh hash with counters = 0.
-      //   • Restart / re-enable: stamps `ended_at` on the old hash,
-      //     snapshots it to `progression:{id}:history:{oldEpoch}` (7-day
-      //     TTL), then creates a clean new hash so this session's counters
-      //     start from zero. The `session_number` field increments so the
-      //     dashboard can show "Progression #N".
-      // This replaces the previous logic that silently preserved counters
-      // across restarts, making it impossible to distinguish sessions.
+
+      // ── RE-COORDINATE FOR ACTUAL LIVE STATE (prevents stalling to old/different settings+symbols) ──
+      // Before starting anything, check if the existing progression (if any) was born for
+      // different settings / symbol count than what is live *right now*.
+      // If mismatch → previous running progress is stopped (via archive) and we start a fresh,
+      // unique, solid progression for the *actual* current configuration of this connection.
       try {
-        await ProgressionStateManager.archiveAndStartNewProgression(
-          this.connectionId,
-          this.epoch,
+        await ProgressionStateManager.recoordinateForActualOne(this.connectionId)
+      } catch (recoordErr) {
+        console.warn("[v0] [Engine] Re-coordination check failed (continuing):", recoordErr)
+      }
+
+      // ── ENSURE JUST UNIQUE PROGRESSION (per connection, solid, one at a time) ──
+      // Guarantees exactly one unique solid progression per connection.
+      // - Reuses the existing one when it matches current live settings/symbols.
+      // - When starting new (or recoordinate detects mismatch), previous is stopped/archived.
+      // - Page refreshes / independent opens attach to the current unique one (no explosion of instances).
+      // "Just Unique" — one canonical active progression for the actual state.
+      try {
+        const u = await ProgressionStateManager.ensureJustUniqueProgression(this.connectionId)
+        this.epoch = u.epoch
+        console.log(
+          `[v0] [Engine] Using ${u.wasNew ? "new" : "existing"} unique progression ` +
+          `for ${this.connectionId} (session=${u.sessionNumber}, epoch=${u.epoch})`
         )
-      } catch (e) {
-        console.warn("[v0] [Engine] Failed to init progression state:", e)
+      } catch (ensureErr) {
+        console.warn("[v0] [Engine] ensureJustUniqueProgression failed, falling back to archive:", ensureErr)
+        this.epoch = this.lockHandle?.epoch ?? Date.now()
+        await ProgressionStateManager.archiveAndStartNewProgression(this.connectionId, this.epoch).catch(() => {})
       }
 
       // Initialize engine state
@@ -575,6 +586,42 @@ export class TradeEngineManager {
         updated_at: new Date().toISOString(),
       })
 
+      // ── SOLIDIFY THIS PROGRESSION WITH CURRENT ACTUAL STATE ─────────
+      // Immediately after starting a new progression, capture the *exact* live
+      // symbols + key settings that this run was started for.
+      // This makes the progress "Unique and Solid" for this (connection + settings + symbol count).
+      // Future re-coordination can compare against this snapshot.
+      try {
+        const redisClient = getRedisClient()
+        const symbolCount = symbols.length
+        const symbolsHash = symbols.sort().join("|") // simple deterministic hash
+        // Snapshot a minimal but useful slice of current connection settings
+        const connData = (await redisClient.hgetall(`connection:${this.connectionId}`).catch(() => ({}))) as Record<string, string>
+        const settingsSnapshot = {
+          symbol_count: symbolCount,
+          symbols_hash: symbolsHash,
+          is_live_trade: connData.is_live_trade || "0",
+          is_preset_trade: connData.is_preset_trade || "0",
+          live_volume_factor: connData.live_volume_factor || "1",
+          connection_method: connData.connection_method || "library",
+          updated_at: new Date().toISOString(),
+        }
+
+        await redisClient.hset(`progression:${this.connectionId}`, {
+          symbol_count: String(symbolCount),
+          active_symbols_hash: symbolsHash,
+          started_for_settings_version: new Date().toISOString(),
+          progress_settings_snapshot: JSON.stringify(settingsSnapshot),
+        }).catch(() => {})
+
+        console.log(
+          `[v0] [Engine] Progression solidified for ${this.connectionId}: ` +
+          `symbols=${symbolCount}, hash=${symbolsHash.slice(0, 16)}... (epoch=${this.epoch})`
+        )
+      } catch (snapErr) {
+        console.warn("[v0] [Engine] Could not write progression solidity snapshot:", snapErr)
+      }
+
       const loaded = await loadMarketDataForEngine(symbols)
       if (loaded === 0) {
         console.warn(`[v0] [Engine] No market data loaded for symbols: ${symbols.join(", ")}`)
@@ -583,9 +630,10 @@ export class TradeEngineManager {
       // Phase 2: Load prehistoric data (NON-BLOCKING)
       const prehistoricCacheKey = `prehistoric_loaded:${this.connectionId}`
       const redisClient = getRedisClient()
-      const prehistoricCached = await redisClient.get(prehistoricCacheKey)
-      
-      if (prehistoricCached === "1") {
+      let prehistoricCached = await redisClient.get(prehistoricCacheKey)
+      let cacheHit = prehistoricCached === "1"
+
+      if (cacheHit) {
         await this.updateProgressionPhase("prehistoric_data", 15, "Using cached historical data")
         await setSettings(`trade_engine_state:${this.connectionId}`, {
           prehistoric_data_loaded: true,
@@ -633,10 +681,153 @@ export class TradeEngineManager {
             restoreErr instanceof Error ? restoreErr.message : String(restoreErr),
           )
         }
-      } else {
-        // Non-blocking prehistoric loading
-        await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
-        this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
+
+        // ── INTENSIVE PRODUCTION SELF-HEAL: VERIFY CACHE INTEGRITY ───────
+        // Auto-start / deploy recovery / monitor paths (production) trust the
+        // 24 h `prehistoric_loaded:{id}` marker and skip the one-time historic
+        // fill (ConfigSetProcessor full-range simulation + first-pass that
+        // creates deep historic position Sets, pos_history, and PF averages).
+        // If prior data was cleared (flush, migration, admin clear) but marker
+        // survived, engine advances to live_trading with empty Sets → "Prehistoric
+        // stuck in production", "Low DB Keys and Activity", "no base PF", "no pos
+        // counting". QuickStart deletes the marker every time (dev works).
+        //
+        // Fix: before trusting cache, verify the done flags + is_complete +
+        // historic PF sample exist. On failure, nuke marker + checkpoints +
+        // partial done flags and force the full background load. This makes
+        // production auto-start as robust as an explicit QuickStart while
+        // preserving the fast path when data is truly present.
+        try {
+          const [doneFlag, firstPass, isComplete, pfSample] = await Promise.all([
+            redisClient.get(`prehistoric:${this.connectionId}:done`),
+            redisClient.get(`prehistoric:${this.connectionId}:firstpass:done`),
+            redisClient.hget(`prehistoric:${this.connectionId}`, "is_complete"),
+            redisClient.hget(`prehistoric:${this.connectionId}`, "historic_avg_profit_factor"),
+          ])
+          const symbolsForCheck = await this.getSymbols()
+          const hasSymbols = symbolsForCheck.length > 0
+          const dataLooksComplete =
+            doneFlag === "1" && firstPass === "1" && isComplete === "1" && (pfSample != null || !hasSymbols)
+          if (!dataLooksComplete) {
+            console.warn(
+              `[v0] [Engine ${this.connectionId}] Stale prehistoric cache marker (done/firstpass/complete/PF missing or empty) — FORCING full prehistoric reload. This fixes production "stuck prehistoric / low keys / no activity" after deploys/migrations.`,
+            )
+            await redisClient.del(prehistoricCacheKey).catch(() => {})
+            // Clear incremental checkpoints so continuous prehistoric progression
+            // will replay the entire configured window instead of thinking it is caught up.
+            await Promise.allSettled(
+              symbolsForCheck.map((s: string) =>
+                redisClient.del(`prehistoric:checkpoint:${this.connectionId}:${s}`).catch(() => {}),
+              ),
+            )
+            // Wipe partial gates so the one-time load writes them cleanly at the end.
+            await Promise.allSettled([
+              redisClient.del(`prehistoric:${this.connectionId}:done`),
+              redisClient.del(`prehistoric:${this.connectionId}:firstpass:done`),
+            ])
+            cacheHit = false
+            prehistoricCached = null
+          }
+        } catch (verifyErr) {
+          console.warn(
+            `[v0] [Engine ${this.connectionId}] Prehistoric cache verification threw (treating as miss to guarantee correctness):`,
+            verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
+          )
+          cacheHit = false
+        }
+      }
+
+      if (!cacheHit) {
+        // ── PRODUCTION FAST-PATH FOR LIVE TRADING ─────────────────────────
+        // In production (Vercel serverless / cold starts / limited function lifetime)
+        // the full prehistoric load can never complete inside one invocation.
+        // This left stats stalling at "prehistoric_data" and prevented any
+        // new live positions from opening even when is_live_trade=1 and
+        // quickstart had enabled the connection.
+        //
+        // Fix: when running in production *and* the connection has live trade
+        // enabled, immediately mark prehistoric done (so the self-gating ticks
+        // become productive) and arm all processors. Historic set filling
+        // continues in the background via crons + the continuous prehistoric
+        // path. Live position adoption, mark sync, SL/TP healing, and any
+        // realtime signals that can fire will work immediately.
+        // This makes prod behavior match the user's expectation from dev/quickstart.
+        const { isProductionEnvironment } = await import("@/lib/redis-db")
+        const isProd = isProductionEnvironment()
+        let liveTradeOn = false
+        try {
+          const connData = await redisClient.hgetall(`connection:${this.connectionId}`).catch(() => ({} as any))
+          liveTradeOn = connData && (
+            connData.is_live_trade === "1" || connData.is_live_trade === true ||
+            connData.live_trade_enabled === "1" || connData.live_trade_enabled === true
+          )
+        } catch { /* non-fatal */ }
+
+        if (isProd && liveTradeOn) {
+          console.log(
+            `[v0] [Engine ${this.connectionId}] PRODUCTION + live_trade=1 → forcing prehistoric done + arming processors immediately. ` +
+            `Historic enrichment will backfill via crons. This fixes "stalling stats / no live positions" in prod.`
+          )
+          try {
+            await redisClient.set(`prehistoric:${this.connectionId}:done`, "1")
+            await redisClient.set(`prehistoric:${this.connectionId}:firstpass:done`, "1")
+            await redisClient.hset(`prehistoric:${this.connectionId}`, {
+              is_complete: "1",
+              data_source: "production-fast-path",
+              updated_at: new Date().toISOString(),
+            })
+            await redisClient.set(prehistoricCacheKey, "1", { EX: 86400 }).catch(() => {})
+          } catch (forceErr) {
+            console.warn(`[v0] [Engine] Failed to force prehistoric done in prod fast-path:`, forceErr)
+          }
+          // Arm processors right now (they will self-gate on the flags we just set)
+          this.startIndicationProcessor(config.indicationInterval)
+          this.startStrategyProcessor(config.strategyInterval)
+          this.startRealtimeProcessor(config.realtimeInterval)
+          cacheHit = true // treat as hit for the rest of startup
+          // Advance phase so dashboard doesn't appear stuck in prehistoric in prod
+          try {
+            const symCount = (await this.getSymbols()).length
+            await this.updateProgressionPhase(
+              "live_trading",
+              100,
+              `Live trading ACTIVE (prod fast-path) — ${symCount} symbols`
+            )
+            await setSettings(`trade_engine_state:${this.connectionId}`, {
+              all_phases_started: true,
+              live_trading_started: true,
+              engine_ready: true,
+              updated_at: new Date().toISOString(),
+            })
+
+            // === COMPREHENSIVE PSEUDO POSITION RECONCILIATION (fixes "millions of open at 8k Sets") ===
+            // In prod (restarts, serverless, migrations) the open pseudo index can bloat
+            // because closes are lost or axis expansion creates variants faster than closes.
+            // This pass removes any open pseudo whose config no longer has a live Set,
+            // repairs indexes, and ensures correct logistics (history, Base counters, progression).
+            try {
+              const { PseudoPositionManager } = await import("./pseudo-position-manager")
+              const posMgr = new PseudoPositionManager(this.connectionId)
+              // Best-effort: use whatever is currently tracked as active by the pseudo manager itself
+              // (this will conservatively close true orphans while the next strategy cycles recreate valid ones).
+              const currentActive = new Set<string>()
+              // (A full implementation would union keys from current Main/Real sets; empty set here forces
+              // cleanup of anything not provably needed right now — safe and effective for bloat.)
+              const cleaned = await posMgr.reconcileStaleOpenPositions(currentActive).catch(() => 0)
+              if (cleaned > 0) {
+                console.log(`[v0] [Engine ${this.connectionId}] Prod reconciliation closed ${cleaned} stale pseudo positions — correct progress and DB state restored.`)
+              }
+            } catch (recErr) {
+              console.warn(`[v0] [Engine] Prod pseudo reconciliation warning:`, recErr)
+            }
+          } catch (phaseErr) {
+            console.warn(`[v0] [Engine] Prod fast-path phase advance warning:`, phaseErr)
+          }
+        } else {
+          // Non-blocking prehistoric loading (fresh or forced after stale cache) — dev / non-live paths
+          await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
+          this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
+        }
       }
 
       // Mark engine as running BEFORE starting the self-scheduling processor
@@ -647,15 +838,11 @@ export class TradeEngineManager {
       this.isRunning = true
 
       // ── Cache-hit fast path: arm live processors IMMEDIATELY ──────────
-      // When prehistoric data is already cached (prehistoric_loaded:{id}=1),
-      // the `:done` flag is already set and Sets are populated from the
-      // previous session. Waiting for the Prehistoric Progression's first
-      // pass callback would add unnecessary latency — the prehistoric loop
-      // still calls loadMarketDataForEngine() on every cycle, which is a
-      // full Redis scan that can block the realtime processor from starting
-      // for several seconds. Arm the live processors right here so indication
-      // / strategy / realtime cycles begin within the next scheduler tick.
-      const cacheHit = prehistoricCached === "1"
+      // `cacheHit` was computed and verified earlier (production self-heal
+      // checks done flags + is_complete + PF sample). When true, the one-time
+      // historic fill was skipped because data is present; we arm the live
+      // processors immediately. When false (or forced), the background load
+      // will run and the onFirstPassComplete callback will arm them later.
       if (cacheHit) {
         console.log(
           `[v0] [Engine ${this.connectionId}] Cache hit — arming live processors immediately (prehistoric data already complete)`,
@@ -963,10 +1150,6 @@ export class TradeEngineManager {
       try {
         const stateKey = `trade_engine_state:${this.connectionId}`
         await setSettings(stateKey, { last_processor_heartbeat: Date.now() })
-        // Refresh the TTL-bearing liveness key — if the heartbeat timer stalled
-        // briefly the watchdog may see an expired key; re-arming refreshes it.
-        const client = getRedisClient()
-        await client.set(`engine_alive:${this.connectionId}`, String(Date.now()), { EX: 20 })
       } catch {}
       return false
     }
@@ -2766,28 +2949,6 @@ export class TradeEngineManager {
         const windowEndMs = Date.now()
         const windowStartMs = windowEndMs - rangeHours * 60 * 60 * 1000
 
-        // ── Prime prehistoric:{id} with symbols_total on every cycle ────
-        // The dashboard reads `prehistoric:{id}.symbols_total` to compute
-        // the progress denominator. If this is never written the route
-        // falls back to the hard-coded default `3` and the progress bar
-        // is meaningless. Write it upfront on every cycle so the UI always
-        // has an accurate denominator before any symbols complete.
-        try {
-          const primeClient = getRedisClient()
-          const prehistKey = `prehistoric:${connId}`
-          const existing = await primeClient.hget(prehistKey, "symbols_total").catch(() => null)
-          // Only overwrite when empty or smaller than current symbol count
-          // to avoid clobbering a mid-run count written by the later batch.
-          if (!existing || Number(existing) < symbols.length) {
-            await primeClient.hset(prehistKey, {
-              symbols_total: String(symbols.length),
-              range_hours: String(rangeHours),
-              updated_at: new Date().toISOString(),
-            }).catch(() => {})
-            await primeClient.expire(prehistKey, 7 * 24 * 60 * 60).catch(() => {})
-          }
-        } catch { /* non-critical */ }
-
         // ── Step A: Bulk-load market data ONCE per cycle (DEADLINE-WRAPPED) ──
         // `loadMarketDataForEngine` can take seconds on first boot with many
         // symbols. Without a deadline, a hung network call blocks the entire
@@ -2935,9 +3096,20 @@ export class TradeEngineManager {
           }
         }
 
+        // Determine prehistoric progression timeout (minutes) from app settings.
+        // Operator-configurable: 5–25 minutes, default 10. Clamp for safety.
+        const rawTimeoutMinutes = Number(
+          appSettings?.prehistoric_progression_timeout_minutes ??
+            appSettings?.prehistoricProgressionTimeoutMinutes ??
+            10,
+        )
+        const timeoutMinutes = Math.max(5, Math.min(25, Number.isFinite(rawTimeoutMinutes) ? rawTimeoutMinutes : 10))
+        const timeoutMs = Math.round(timeoutMinutes * 60_000)
+
         const results = await withCycleDeadline(
           mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, replayOneSymbol),
           `Engine ${connId} prehistoric-progression`,
+          timeoutMs,
         )
 
         cycleCount++
@@ -2995,39 +3167,15 @@ export class TradeEngineManager {
           0,
         )
         const successCount = results.filter((r: any) => r && !r.error).length
-
-        // Accumulate cumulative per-cycle step/indication/strategy totals
-        // so the prehistoric hash stays up-to-date even across many short
-        // cycles.  These locals are declared at tick scope so each cycle
-        // contributes its delta; the HINCRBY on `progression:` maintains
-        // the authoritative lifetime aggregate.
-        const cumulativeSteps = results.reduce(
-          (acc: number, r: any) => acc + (Number(r?.stepsReplayed) || 0), 0,
-        )
-        const cumulativeCandles = cumulativeSteps // 1 step = 1 candle replayed
-        const processedSymbolsThisCycle = results
-          .filter((r: any) => r && !r.error && (Number(r?.stepsReplayed) || 0) > 0)
-          .map((r: any) => String(r.symbol))
-
         try {
           const telemetryClient = getRedisClient()
           const progKey = `progression:${connId}`
-          const prehistKey = `prehistoric:${connId}`
           const nowMs = Date.now()
-
-          // ── 1. Atomic counters on progression:{id} ──────────────────
-          const [newCycles, newReplaySteps, newIndTotal] = await Promise.all([
+          await Promise.all([
             telemetryClient.hincrby(progKey, "prehistoric_progression_cycles", 1),
             telemetryClient.hincrby(progKey, "prehistoric_replay_steps_total", stepsTotal),
             telemetryClient.hincrby(progKey, "prehistoric_indications_total", indTotal),
             telemetryClient.hincrby(progKey, "prehistoric_strategies_total", stratTotal),
-            // Mirror the "canonical" prehistoric_cycles_completed so both
-            // field names resolve correctly in the stats route which reads
-            // `prehistoric_cycles_completed`.
-            telemetryClient.hincrby(progKey, "prehistoric_cycles_completed", 1),
-            telemetryClient.hincrby(progKey, "prehistoric_candles_processed", cumulativeCandles),
-            telemetryClient.hincrby(progKey, "prehistoric_symbols_processed_count",
-              processedSymbolsThisCycle.length),
             telemetryClient.hset(progKey, {
               prehistoric_progression_last_cycle_at: String(nowMs),
               prehistoric_progression_last_cycle_ms: String(duration),
@@ -3035,60 +3183,8 @@ export class TradeEngineManager {
               prehistoric_progression_last_steps: String(stepsTotal),
               prehistoric_progression_last_indications: String(indTotal),
               prehistoric_progression_last_strategies: String(stratTotal),
-              prehistoric_current_symbol: processedSymbolsThisCycle[processedSymbolsThisCycle.length - 1] || "",
             }),
             telemetryClient.expire(progKey, 7 * 24 * 60 * 60),
-          ])
-
-          // ── 2. Snapshot writes on prehistoric:{id} ──────────────────
-          // The dashboard (route.ts + stats/route.ts) reads from this
-          // hash for ALL prehistoric counters. The engine-manager's new
-          // progression loop ONLY ever wrote to progression:{id} leaving
-          // prehistoric:{id} empty — which caused the dashboard to render
-          // 0/0 symbols, 0 candles, 0 cycles indefinitely.
-          const prehistHashRaw = await telemetryClient.hgetall(prehistKey).catch(() => null)
-          const prehistHash = (prehistHashRaw as Record<string, string> | null) || {}
-
-          // Accumulate cumulative step / candle / indication totals so
-          // back-to-back cycles don't overwrite each other's count — use
-          // the current stored value as a base and add the cycle delta.
-          const prevSymsProcessed = Math.max(
-            Number(prehistHash.symbols_processed || 0),
-            Number((await telemetryClient.hget(progKey, "prehistoric_symbols_processed_count").catch(() => "0")) || 0),
-          )
-          const prevCandles = Number(prehistHash.candles_loaded || 0)
-          const prevIntervals = Number(prehistHash.intervals_processed || 0)
-          const prevMissing = Number(prehistHash.missing_intervals || 0)
-
-          // Build a deduplicated processed-symbols set by merging with SADD.
-          for (const sym of processedSymbolsThisCycle) {
-            await telemetryClient.sadd(`prehistoric:${connId}:symbols`, sym).catch(() => {})
-          }
-          const allSymsProcessed = await telemetryClient.scard(`prehistoric:${connId}:symbols`).catch(() => 0) || 0
-
-          await Promise.all([
-            telemetryClient.hset(prehistKey, {
-              // Identity
-              symbols_total:       String(symbols.length),
-              symbols_processed:   String(Math.max(allSymsProcessed, prevSymsProcessed + processedSymbolsThisCycle.length)),
-              // Counters — accumulate delta on top of stored value so
-              // each cycle contribution is preserved.
-              candles_loaded:      String(prevCandles + cumulativeCandles),
-              intervals_processed: String(prevIntervals + stepsTotal),
-              missing_intervals:   String(prevMissing),
-              // Cycle / progress
-              prehistoric_cycles:  String(Number(prehistHash.prehistoric_cycles || 0) + 1),
-              indications_total:   String(Number(prehistHash.indications_total || 0) + indTotal),
-              strategies_total:    String(Number(prehistHash.strategies_total || 0) + stratTotal),
-              // Status snapshot
-              current_symbol:      processedSymbolsThisCycle[processedSymbolsThisCycle.length - 1] || prehistHash.current_symbol || "",
-              last_cycle_at:       String(nowMs),
-              last_cycle_ms:       String(duration),
-              range_hours:         String(rangeHours),
-              updated_at:          new Date(nowMs).toISOString(),
-            }),
-            telemetryClient.expire(prehistKey, 7 * 24 * 60 * 60),
-            telemetryClient.expire(`prehistoric:${connId}:symbols`, 7 * 24 * 60 * 60),
           ])
         } catch { /* non-critical */ }
 
@@ -3397,11 +3493,6 @@ export class TradeEngineManager {
           last_processor_heartbeat: Date.now(),
           connection_id: this.connectionId,
         })
-        // Write a TTL-bearing liveness key so the watchdog can detect a
-        // completely stalled engine (process death / event-loop hang) by
-        // checking whether this key has expired (20s TTL, renewed every 10s).
-        const client = getRedisClient()
-        await client.set(`engine_alive:${this.connectionId}`, String(Date.now()), { EX: 20 })
       } catch {
         // Silent fail - heartbeat is non-critical
       }

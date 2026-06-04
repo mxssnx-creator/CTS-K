@@ -144,6 +144,14 @@ export interface ProgressionState {
   indicationsCount?: number
   strategiesCount?: number
 
+  // ── UNIQUENESS / SOLIDITY SNAPSHOT (prevents "stalling to different one") ──
+  // Captured at the exact moment this progression session was born.
+  // Makes every progress for a connection unique to its (settings + symbol list) at start time.
+  progressSettingsSnapshot?: Record<string, any>
+  symbolCount?: number
+  activeSymbolsHash?: string
+  startedForSettingsVersion?: string
+
   // ── Per-processor cycle counters (cumulative, hincrby) ─────────────
   // Each processor (indication / strategy / realtime) writes these
   // atomically on every tick. They survive engine restarts and are the
@@ -191,53 +199,58 @@ export class ProgressionStateManager {
          return this.getDefaultState(connectionId)
        }
 
-       return {
-         connectionId,
-         // Session identity
-         sessionNumber: data.session_number ? parseInt(data.session_number, 10) : undefined,
-         epoch: data.epoch ? Number(data.epoch) : undefined,
-         startedAt: data.started_at ? Number(data.started_at) : undefined,
-         endedAt: data.ended_at ? Number(data.ended_at) : undefined,
-         cyclesCompleted: parseInt(data.cycles_completed || "0", 10),
-         successfulCycles: parseInt(data.successful_cycles || "0", 10),
-         failedCycles: parseInt(data.failed_cycles || "0", 10),
-         totalTrades: parseInt(data.total_trades || "0", 10),
-         successfulTrades: parseInt(data.successful_trades || "0", 10),
-         totalProfit: parseFloat(data.total_profit || "0"),
-         cycleSuccessRate: parseFloat(data.cycle_success_rate || "0"),
-         tradeSuccessRate: parseFloat(data.trade_success_rate || "0"),
-         lastCycleTime: data.last_cycle_time ? new Date(data.last_cycle_time) : undefined,
-         lastUpdate: new Date(data.last_update || new Date()),
-         prehistoricCyclesCompleted: parseInt(data.prehistoric_cycles_completed || "0", 10),
-         prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? JSON.parse(data.prehistoric_symbols_processed) : [],
-         prehistoricPhaseActive: data.prehistoric_phase_active === "true",
-         prehistoricCandlesProcessed: parseInt(data.prehistoric_candles_processed || "0", 10),
-         prehistoricSymbolsProcessedCount: parseInt(data.prehistoric_symbols_processed_count || "0", 10),
-         indicationsDirectionCount: parseInt(data.indications_direction_count || "0", 10),
-         indicationsMoveCount: parseInt(data.indications_move_count || "0", 10),
-         indicationsActiveCount: parseInt(data.indications_active_count || "0", 10),
-         indicationsActiveAdvancedCount: parseInt(data.indications_active_advanced_count || "0", 10),
-         indicationsOptimalCount: parseInt(data.indications_optimal_count || "0", 10),
-         indicationsAutoCount: parseInt(data.indications_auto_count || "0", 10),
-         strategiesBaseTotal: parseInt(data.strategies_base_total || "0", 10),
-         strategiesMainTotal: parseInt(data.strategies_main_total || "0", 10),
-         strategiesRealTotal: parseInt(data.strategies_real_total || "0", 10),
-         strategyEvaluatedBase: parseInt(data.strategies_base_evaluated || "0", 10),
-         strategyEvaluatedMain: parseInt(data.strategies_main_evaluated || "0", 10),
-         strategyEvaluatedReal: parseInt(data.strategies_real_evaluated || "0", 10),
-         cycleTimeMs: parseInt(data.cycle_time_ms || "0", 10),
-         intervalsProcessed: parseInt(data.intervals_processed || "0", 10),
-         indicationsCount: parseInt(data.indications_count || "0", 10),
-         strategiesCount: parseInt(data.strategies_count || "0", 10),
-         // Per-processor cycle counters (cumulative, atomic)
-         indicationCycleCount: parseInt(data.indication_cycle_count || "0", 10),
-         indicationLiveCycleCount: parseInt(data.indication_live_cycle_count || "0", 10),
-         strategyCycleCount: parseInt(data.strategy_cycle_count || "0", 10),
-         strategyLiveCycleCount: parseInt(data.strategy_live_cycle_count || "0", 10),
-         realtimeCycleCount: parseInt(data.realtime_cycle_count || "0", 10),
-         realtimeLiveCycleCount: parseInt(data.realtime_live_cycle_count || "0", 10),
-         framesProcessed: parseInt(data.frames_processed || "0", 10),
-       }
+return {
+          connectionId,
+          // Session identity
+          sessionNumber: data.session_number ? parseInt(data.session_number, 10) : undefined,
+          epoch: data.epoch ? Number(data.epoch) : undefined,
+          startedAt: data.started_at ? Number(data.started_at) : undefined,
+          endedAt: data.ended_at ? Number(data.ended_at) : undefined,
+          cyclesCompleted: parseInt(data.cycles_completed || "0", 10),
+          successfulCycles: parseInt(data.successful_cycles || "0", 10),
+          failedCycles: parseInt(data.failed_cycles || "0", 10),
+          totalTrades: parseInt(data.total_trades || "0", 10),
+          successfulTrades: parseInt(data.successful_trades || "0", 10),
+          totalProfit: parseFloat(data.total_profit || "0"),
+          cycleSuccessRate: parseFloat(data.cycle_success_rate || "0"),
+          tradeSuccessRate: parseFloat(data.trade_success_rate || "0"),
+          lastCycleTime: data.last_cycle_time ? new Date(data.last_cycle_time) : undefined,
+          lastUpdate: new Date(data.last_update || new Date()),
+          prehistoricCyclesCompleted: parseInt(data.prehistoric_cycles_completed || "0", 10),
+          prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? JSON.parse(data.prehistoric_symbols_processed) : [],
+          prehistoricPhaseActive: data.prehistoric_phase_active === "true",
+          prehistoricCandlesProcessed: parseInt(data.prehistoric_candles_processed || "0", 10),
+          prehistoricSymbolsProcessedCount: parseInt(data.prehistoric_symbols_processed_count || "0", 10),
+          indicationsDirectionCount: parseInt(data.indications_direction_count || "0", 10),
+          indicationsMoveCount: parseInt(data.indications_move_count || "0", 10),
+          indicationsActiveCount: parseInt(data.indications_active_count || "0", 10),
+          indicationsActiveAdvancedCount: parseInt(data.indications_active_advanced_count || "0", 10),
+          indicationsOptimalCount: parseInt(data.indications_optimal_count || "0", 10),
+          indicationsAutoCount: parseInt(data.indications_auto_count || "0", 10),
+          strategiesBaseTotal: parseInt(data.strategies_base_total || "0", 10),
+          strategiesMainTotal: parseInt(data.strategies_main_total || "0", 10),
+          strategiesRealTotal: parseInt(data.strategies_real_total || "0", 10),
+          strategyEvaluatedBase: parseInt(data.strategies_base_evaluated || "0", 10),
+          strategyEvaluatedMain: parseInt(data.strategies_main_evaluated || "0", 10),
+          strategyEvaluatedReal: parseInt(data.strategies_real_evaluated || "0", 10),
+          cycleTimeMs: parseInt(data.cycle_time_ms || "0", 10),
+          intervalsProcessed: parseInt(data.intervals_processed || "0", 10),
+          indicationsCount: parseInt(data.indications_count || "0", 10),
+          strategiesCount: parseInt(data.strategies_count || "0", 10),
+          // Uniqueness / solidity snapshot fields (captured at progression start)
+          progressSettingsSnapshot: data.progress_settings_snapshot ? JSON.parse(data.progress_settings_snapshot) : {},
+          symbolCount: data.symbol_count ? parseInt(data.symbol_count, 10) : 0,
+          activeSymbolsHash: data.active_symbols_hash || "",
+          startedForSettingsVersion: data.started_for_settings_version || "",
+          // Per-processor cycle counters (cumulative, atomic)
+          indicationCycleCount: parseInt(data.indication_cycle_count || "0", 10),
+          indicationLiveCycleCount: parseInt(data.indication_live_cycle_count || "0", 10),
+          strategyCycleCount: parseInt(data.strategy_cycle_count || "0", 10),
+          strategyLiveCycleCount: parseInt(data.strategy_live_cycle_count || "0", 10),
+          realtimeCycleCount: parseInt(data.realtime_cycle_count || "0", 10),
+          realtimeLiveCycleCount: parseInt(data.realtime_live_cycle_count || "0", 10),
+          framesProcessed: parseInt(data.frames_processed || "0", 10),
+        }
     } catch (error) {
       console.error(`[v0] Failed to get progression state for ${connectionId}:`, error)
       return this.getDefaultState(connectionId)
@@ -282,6 +295,11 @@ export class ProgressionStateManager {
       intervalsProcessed: 0,
       indicationsCount: 0,
       strategiesCount: 0,
+      // Uniqueness / solidity snapshot fields (default empty for new progression)
+      progressSettingsSnapshot: {},
+      symbolCount: 0,
+      activeSymbolsHash: "",
+      startedForSettingsVersion: "",
       indicationCycleCount: 0,
       indicationLiveCycleCount: 0,
       strategyCycleCount: 0,
@@ -760,6 +778,14 @@ export class ProgressionStateManager {
         strategies_base_evaluated: "0",
         strategies_main_evaluated: "0",
         strategies_real_evaluated: "0",
+
+        // Uniqueness snapshot fields (filled by engine-manager immediately after start
+        // with the *actual* live settings + symbols for this specific progression run).
+        // This guarantees each connection's progress is solid and isolated to what it was started for.
+        symbol_count: "0",
+        active_symbols_hash: "",
+        started_for_settings_version: "",
+        progress_settings_snapshot: "{}",
       })
 
       console.log(
@@ -769,6 +795,163 @@ export class ProgressionStateManager {
     } catch (error) {
       console.error(`[v0] Failed to archive/start progression for ${connectionId}:`, error)
       return 1
+    }
+  }
+
+  /**
+   * Re-coordinate the progression for the *actual* current live state of the connection.
+   *
+   * If the active progression's snapshot (symbol count, settings hash, etc.) differs
+   * from what is currently live in `connection:${id}` + symbol list, this forces a
+   * clean stop of the previous running progress + starts a brand new unique one.
+   *
+   * Call this on settings change, symbol list edit, connection toggle, etc.
+   * Guarantees: previous progress is stopped (via archive + epoch bump), new one is
+   * solid for the actual current configuration.
+   */
+  static async recoordinateForActualOne(connectionId: string): Promise<void> {
+    try {
+      await initRedis()
+      const client = getRedisClient()
+      if (!client) return
+
+      const key = `progression:${connectionId}`
+      const existing = await client.hgetall(key).catch(() => null)
+      if (!existing || Object.keys(existing).length === 0) {
+        // No active progress — nothing to re-coordinate
+        return
+      }
+
+      // Resolve current live state
+      const connData = (await client.hgetall(`connection:${connectionId}`).catch(() => ({}))) as Record<string, string>
+      // Best effort: ask engine for current symbols (or fall back to stored)
+      let currentSymbols: string[] = []
+      try {
+        const state = (await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({}))) as Record<string, string>
+        if (state.symbols) currentSymbols = JSON.parse(state.symbols)
+      } catch {}
+      if (currentSymbols.length === 0) {
+        // fallback
+        const cd = connData as Record<string, string>
+        currentSymbols = (cd.active_symbols ? JSON.parse(cd.active_symbols) : [])
+      }
+
+      const liveSymbolCount = currentSymbols.length
+      const liveSymbolsHash = currentSymbols.sort().join("|")
+      const liveSnapshot = {
+        symbol_count: liveSymbolCount,
+        symbols_hash: liveSymbolsHash,
+        is_live_trade: connData.is_live_trade,
+        is_preset_trade: connData.is_preset_trade,
+        updated_at: new Date().toISOString(),
+      }
+
+      const storedSymbolCount = parseInt(existing.symbol_count || "0", 10)
+      const storedHash = existing.active_symbols_hash || ""
+
+      const mismatch = storedSymbolCount !== liveSymbolCount || storedHash !== liveSymbolsHash
+
+      if (mismatch) {
+        console.log(
+          `[v0] [Progression] Re-coordination needed for ${connectionId}: ` +
+          `stored symbols=${storedSymbolCount} vs live=${liveSymbolCount}. ` +
+          `Stopping previous progress and starting fresh for actual state.`
+        )
+
+        // Force archive + new start (this stops previous via the archive logic + new epoch)
+        const newEpoch = Date.now()
+        await this.archiveAndStartNewProgression(connectionId, newEpoch)
+
+        // Immediately solidify the new one with the *actual* live data
+        await client.hset(key, {
+          symbol_count: String(liveSymbolCount),
+          active_symbols_hash: liveSymbolsHash,
+          started_for_settings_version: new Date().toISOString(),
+          progress_settings_snapshot: JSON.stringify(liveSnapshot),
+          prehistoric_phase_active: "false",
+        }).catch(() => {})
+      }
+    } catch (err) {
+      console.warn(`[v0] [Progression] recoordinateForActualOne failed for ${connectionId}:`, err)
+    }
+  }
+
+  /**
+   * Ensure there is exactly ONE UNIQUE solid progression for this connection,
+   * matched to the *actual current* live settings and symbol count.
+   *
+   * - Uses recoordinate logic internally for snapshot match.
+   * - If no active or the active one is for different state → archive old (stop previous), start fresh unique one.
+   * - If active one matches current live state → attach to it (keeps the progression unique, no new instance).
+   *
+   * This keeps "Just Unique": one solid unique progression per connection at any time.
+   * Page refreshes / independent opens attach to the current unique one when the live state matches.
+   * No concurrent multiple progressions/instances for the same connection.
+   */
+  static async ensureJustUniqueProgression(
+    connectionId: string
+  ): Promise<{ sessionNumber: number; epoch: number; wasNew: boolean }> {
+    try {
+      await initRedis()
+      const client = getRedisClient()
+      if (!client) {
+        const epoch = Date.now()
+        const session = await this.archiveAndStartNewProgression(connectionId, epoch)
+        return { sessionNumber: session, epoch, wasNew: true }
+      }
+
+      // First, make sure we are coordinated to actual current state
+      await this.recoordinateForActualOne(connectionId)
+
+      const key = `progression:${connectionId}`
+      const existing = await client.hgetall(key).catch(() => null)
+
+      const now = Date.now()
+      const nowIso = new Date(now).toISOString()
+
+      if (existing && Object.keys(existing).length > 0 && existing.engine_started === "true") {
+        // There is already one unique active progression (recoordinate ensured it matches current live state)
+        const sessionNumber = parseInt(existing.session_number || "1", 10)
+        const epoch = Number(existing.epoch) || now
+
+        // Light attach: update activity timestamps, keep the same unique session/epoch
+        await client.hset(key, {
+          last_update: nowIso,
+          last_visited: nowIso,
+          engine_started: "true",
+        }).catch(() => {})
+
+        await client.expire(key, 7 * 24 * 60 * 60).catch(() => {})
+
+        console.log(
+          `[v0] [Progression] Attached to existing unique progression for ${connectionId} ` +
+          `(session=${sessionNumber}, epoch=${epoch})`
+        )
+
+        return { sessionNumber, epoch, wasNew: false }
+      }
+
+      // No active unique progression (or it was cleaned by recoordinate) → start one
+      const newEpoch = now
+      const newSession = await this.archiveAndStartNewProgression(connectionId, newEpoch)
+
+      await client.hset(key, {
+        last_visited: nowIso,
+        last_update: nowIso,
+        engine_started: "true",
+      }).catch(() => {})
+
+      console.log(
+        `[v0] [Progression] Started unique progression for ${connectionId} ` +
+        `(session=${newSession}, epoch=${newEpoch})`
+      )
+
+      return { sessionNumber: newSession, epoch: newEpoch, wasNew: true }
+    } catch (error) {
+      console.error(`[v0] ensureJustUniqueProgression failed for ${connectionId}:`, error)
+      const fallbackEpoch = Date.now()
+      const fallbackSession = await this.archiveAndStartNewProgression(connectionId, fallbackEpoch).catch(() => 1)
+      return { sessionNumber: fallbackSession, epoch: fallbackEpoch, wasNew: true }
     }
   }
 }

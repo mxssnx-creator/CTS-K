@@ -32,9 +32,12 @@ EXPOSE 3001
 ENV NODE_ENV=production
 ENV PORT=3001
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3001/api/health || exit 1
+# Production coordination memory hint (completeStartup + auto-start self-heal for bingx-x01)
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+
+# Health check (includes engine coordination status)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:3001/api/health && curl -f http://localhost:3001/api/trade-engine/status || exit 1
 
 # Start the application
 CMD ["npm", "start"]

@@ -1022,4 +1022,62 @@ export class PseudoPositionManager {
     this.activePositionsCache = null
     this.cacheTimestamp = 0
   }
+
+  /**
+   * RECONCILIATION: Fix "millions of open pseudo positions at 8k Sets" bloat.
+   *
+   * Called on engine start (especially prod fast-path / auto-start) and
+   * periodically. Closes any open pseudo positions whose configSetKey is no
+   * longer present in the currently active strategy Sets. This prevents
+   * unbounded growth when axis expansion + restarts + incomplete closes
+   * leave orphaned positions.
+   *
+   * Also repairs the active_config_keys and direction indexes as a side effect.
+   *
+   * Returns number of positions closed during reconciliation.
+   */
+  async reconcileStaleOpenPositions(activeConfigSetKeys: Set<string>): Promise<number> {
+    try {
+      const client = getRedisClient()
+      const openIds = await client.smembers(this.positionsSetKey())
+      if (!openIds || openIds.length === 0) return 0
+
+      let closed = 0
+      const pipeline = client.multi()
+
+      for (const id of openIds) {
+        const hash = await client.hgetall(this.positionKey(id)).catch(() => ({} as any))
+        const key = hash?.config_set_key || hash?.configSetKey || ""
+        if (key && !activeConfigSetKeys.has(key)) {
+          // Stale — close it with reconciliation reason so logistics (history, Base, counters) run
+          pipeline.hset(this.positionKey(id), {
+            status: "closed",
+            closed_at: new Date().toISOString(),
+            close_reason: "reconciliation_stale_set",
+          })
+          pipeline.srem(this.positionsSetKey(), id)
+          if (key) {
+            pipeline.srem(this.activeConfigKeysSetKey(), key)
+          }
+          const side = hash?.side
+          if (side === "long" || side === "short") {
+            pipeline.srem(this.activeByDirectionKey(side), id)
+          }
+          pipeline.expire(this.positionKey(id), 604800)
+          closed++
+        }
+      }
+
+      if (closed > 0) {
+        await pipeline.exec()
+        this.invalidateCache()
+        await this.updateActivePositionsCount().catch(() => {})
+        console.log(`[v0] [PseudoPosMgr] Reconciled and closed ${closed} stale pseudo positions (no longer in active Sets)`)
+      }
+      return closed
+    } catch (err) {
+      console.error("[v0] [PseudoPosMgr] Reconciliation failed:", err)
+      return 0
+    }
+  }
 }

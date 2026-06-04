@@ -34,6 +34,11 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
 
   try {
     console.log("[v0] [Auto-Start] Starting trade engine auto-initialization (sync mode)...")
+
+    // Make the COMPLETE SITE one unique instance (independent of connections)
+    const { ensureUniqueSiteInstance } = await import("./redis-db")
+    await ensureUniqueSiteInstance().catch(() => {})
+
     const coordinator = getGlobalTradeEngineCoordinator()
     
     // Check if Global Trade Engine Coordinator is running

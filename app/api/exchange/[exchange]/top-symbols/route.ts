@@ -151,6 +151,19 @@ async function fetchMostVolatileSymbols(
     return { symbol: fallback, priceChangePercent: 0, symbols: [{ symbol: fallback, priceChangePercent: 0 }] }
   }
 
+  // Dev/test safety: if the fetched list contains obviously bogus symbols (long names,
+  // no real market data in sandbox, etc.), replace the tail with a safe major-symbol set
+  // so quickstart with symbolCount=10 or higher never hands the engine untradeable junk.
+  const SAFE_MAJORS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LTCUSDT", "LINKUSDT"]
+  const looksBogus = (s: string) => s.length > 10 || !/USDT$/.test(s) || /AEON|B2US|HANA|INUS|TAG|HOOLI|MAGASOL|SPORTFUN|TIMI/.test(s)
+  if (tickers.some(t => looksBogus(t.symbol))) {
+    const clean = tickers.filter(t => !looksBogus(t.symbol))
+    const needed = Math.max(0, safeLimit - clean.length)
+    const extras = SAFE_MAJORS.filter(s => !clean.some(c => c.symbol === s)).slice(0, needed)
+      .map(s => ({ symbol: s, priceChangePercent: 0.5 }))
+    tickers = [...clean, ...extras].slice(0, safeLimit)
+  }
+
   // Sort by absolute price change % descending — highest volatility first
   tickers.sort((a, b) => b.priceChangePercent - a.priceChangePercent)
 

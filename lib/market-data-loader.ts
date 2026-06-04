@@ -178,15 +178,15 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
   try {
     await initRedis()
     const client = getClient()
-    // Check if data is already cached in this process — applies to both dev
-    // and production. In production a serverless warm instance should not
-    // re-fetch 86k candles when Redis already has fresh data from a prior
-    // invocation in the same container.
-    const checkKey = `market_data:BTCUSDT:1s`
-    const existing = await client.get(checkKey)
-    if (existing) {
-      console.log(`[v0] [MarketData] Data already cached in Redis, skipping reload`)
-      return 0 // Already loaded
+    const isDev = process.env.NODE_ENV === "development"
+    
+    if (isDev) {
+      const checkKey = `market_data:BTCUSDT:1s`
+      const existing = await client.get(checkKey)
+      if (existing) {
+        console.log(`[v0] [MarketData] Dev-mode: data already cached, skipping reload`)
+        return 0 // Already loaded in this dev session
+      }
     }
   } catch (_) {
     // Proceed normally if the check fails

@@ -1725,12 +1725,57 @@ export async function savePosition(position: any): Promise<void> {
   if (!id) {
     throw new Error("Position must have an id")
   }
-  
+
+  // Special-case live positions (keys prefixed with "live:") — the live
+  // pipeline uses JSON-string keys and open/closed indices under
+  // `live:position:${id}` and `live:positions:${connectionId}`. The
+  // legacy `position:${id}` hash form is preserved for non-live positions.
+  if (String(id).startsWith("live:")) {
+    const liveKey = `live:position:${id}`
+    try {
+      // Persist JSON snapshot (7 day TTL)
+      await client.set(liveKey, JSON.stringify(position), ({ ex: 7 * 24 * 60 * 60 } as any))
+    } catch {
+      // Some adapters don't support EX option — fall back to set only
+      await client.set(liveKey, JSON.stringify(position))
+    }
+
+    const connId = position.connectionId || position.connection_id || "unknown"
+    if (!connId || connId === "unknown") {
+      return
+    }
+
+    // Terminal => move from open index -> closed archive idempotently
+    if (position.status === "closed") {
+      try {
+        // Remove any existing entries from open list, then push to closed list
+        await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)
+        await client.lpush(`live:positions:${connId}:closed`, id).catch(() => 0)
+        // Mark moved so closeLivePosition can detect duplicate increments
+        await client.set(`live:positions:${connId}:moved:${id}`, String(Date.now())).catch(() => null)
+        await client.expire(`live:positions:${connId}:moved:${id}`, 60 * 60).catch(() => 0)
+      } catch {
+        // best-effort
+      }
+    } else {
+      // Ensure id appears once in the open index (dedupe via lrem -> lpush)
+      try {
+        await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)
+        await client.lpush(`live:positions:${connId}`, id).catch(() => 0)
+      } catch {
+        // best-effort
+      }
+    }
+
+    return
+  }
+
+  // Non-live positions: maintain as a hash (legacy behaviour)
   const data = flattenForHmset({
     ...position,
     updated_at: new Date().toISOString(),
   })
-  
+
   await client.hset(`position:${id}`, data)
 }
 
@@ -1989,6 +2034,85 @@ export function haveMigrationsRun(): boolean {
 
 export function setMigrationsRun(value: boolean): void {
   globalMigrationState.__migrations_run = value
+}
+
+/**
+ * Returns true when running in a production or Vercel preview environment.
+ * Used to decide whether to run expensive "complete coverage" repair passes
+ * on every cold start (required for correct migration state + non-zero counts).
+ */
+export function isProductionEnvironment(): boolean {
+  if (typeof process === "undefined") return false
+  const env = process.env.NODE_ENV
+  const vercelEnv = process.env.VERCEL_ENV || process.env.VERCEL
+  // Treat "production" and "preview" (Vercel PR previews) as "production mode" for migrations.
+  if (env === "production") return true
+  if (vercelEnv === "production" || vercelEnv === "preview") return true
+  // Fallback for common hosting hints
+  if (process.env.CI === "true" || process.env.VERCEL_GIT_COMMIT_SHA) return true
+  return false
+}
+
+/**
+ * Global Unique Site / Project / Page Instance
+ * 
+ * The COMPLETE SITE (independent of any individual connection) must be one
+ * single unique continuous instance.
+ * 
+ * - Created exactly once (first ever boot or after explicit full reset).
+ * - Every page refresh, new tab, independent open, cron, etc. reuses the
+ *   exact same site_session_id.
+ * - Prevents "starting new Overall Progression / Instances" on every visit.
+ * - "Just Unique" for the whole project.
+ */
+const GLOBAL_SITE_INSTANCE_KEY = "site:unique_instance"
+
+export async function ensureUniqueSiteInstance(): Promise<{ siteSessionId: string; isNew: boolean }> {
+  await initRedis()
+  const client = getRedisClient()
+  if (!client) {
+    return { siteSessionId: "fallback-" + Date.now(), isNew: true }
+  }
+
+  const existing = await client.hgetall(GLOBAL_SITE_INSTANCE_KEY).catch(() => null)
+
+  if (existing && existing.site_session_id) {
+    // Reuse the one and only unique site instance - just touch activity
+    await client.hset(GLOBAL_SITE_INSTANCE_KEY, {
+      last_activity: new Date().toISOString(),
+    }).catch(() => {})
+
+    return { siteSessionId: existing.site_session_id, isNew: false }
+  }
+
+  // First time ever (or after full reset) → create the single unique site instance
+  const newId = "site_" + Date.now() + "_" + Math.random().toString(36).slice(2, 12)
+  const now = new Date().toISOString()
+
+  await client.hset(GLOBAL_SITE_INSTANCE_KEY, {
+    site_session_id: newId,
+    created_at: now,
+    last_activity: now,
+    version: "1",
+  }).catch(() => {})
+
+  // Mirror into trade_engine:global so all monitoring sees the unique site instance
+  await client.hset("trade_engine:global", {
+    site_session_id: newId,
+    site_instance_created: now,
+  }).catch(() => {})
+
+  console.log(`[v0] [SiteInstance] Created the one unique site/project instance: ${newId}`)
+
+  return { siteSessionId: newId, isNew: true }
+}
+
+export async function getCurrentSiteInstanceId(): Promise<string | null> {
+  await initRedis()
+  const client = getRedisClient()
+  if (!client) return null
+  const data = await client.hgetall(GLOBAL_SITE_INSTANCE_KEY).catch(() => null)
+  return data?.site_session_id || null
 }
 
 // ========== Engine Connection Operations ==========

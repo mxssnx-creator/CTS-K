@@ -469,6 +469,24 @@ export async function POST(request: Request) {
       await client.expire(`prehistoric:${connectionId}`, 86400)
     } catch { /* non-critical */ }
     console.log(`${LOG_PREFIX}: [3/4] Stored symbols in trade_engine_state: ${symbols.join(", ")}`)
+
+    // === DEV MODE COMPLETENESS FIX ===
+    // Immediately kick off prehistoric load for the exact quickstart symbols
+    // so that the full pipeline (prehistoric → indications → strategies base/main/real → real/live)
+    // is ready faster for Dev Mode testing (3-symbol minimal volume etc.).
+    // This makes "ReRun Dev Mode Test" show loaded data and non-zero counts much sooner.
+    if (symbols.length > 0) {
+      (async () => {
+        try {
+           const { SymbolDataProcessor } = await import('@/lib/symbol-data-processor')
+           const processor = new SymbolDataProcessor(connectionId)
+           await processor.loadPrehistoricDataConcurrent(symbols, 'bingx')
+          console.log(`${LOG_PREFIX}: [3.5] Best-effort prehistoric load triggered for quickstart symbols: ${symbols.join(', ')}`)
+        } catch (e) {
+          console.warn(`${LOG_PREFIX}: Prehistoric preload for quickstart symbols failed (non-fatal):`, e)
+        }
+      })()
+    }
     
      const isAssigned = updated.is_assigned === "1" || updated.is_assigned === true
      const isMainEnabled = updated.is_enabled_dashboard === "1" || updated.is_enabled_dashboard === true
@@ -647,14 +665,28 @@ export async function POST(request: Request) {
             updated_at: new Date().toISOString(),
           })
           
-          console.log(`${LOG_PREFIX} ✓ Main Engine started for ${connection.name}`)
-          await logProgressionEvent(connectionId, "engine_started", "info", "Main Trade Engine started via QuickStart", {
-            connectionId,
-            connectionName: connection.name,
-            exchange: exchangeName,
-            testPassed,
-          })
-        } catch (engineError) {
+            console.log(`${LOG_PREFIX} ✓ Main Engine started for ${connection.name}`)
+            await logProgressionEvent(connectionId, "engine_started", "info", "Main Trade Engine started via QuickStart", {
+              connectionId,
+              connectionName: connection.name,
+              exchange: exchangeName,
+              testPassed,
+            })
+
+            // Immediate evaluation kick — ensures the first Real/Live sets (and real
+            // exchange order attempts) are computed right now instead of waiting for
+            // the next 5-10 s timer tick. This is a major part of "it worked before".
+            setImmediate(() => {
+              try {
+                const coord = getGlobalTradeEngineCoordinator()
+                coord.refreshEngines().catch(() => {})
+                // The armed strategy processor will now see the fresh symbols +
+                // the Main/Real bootstrap relaxations and produce qualifying Live sets
+                // on its very first tick (or this refresh may trigger one).
+                console.log(`${LOG_PREFIX} Post-quickstart immediate evaluation kick dispatched for ${connectionId}`)
+              } catch { /* non-fatal */ }
+            })
+          } catch (engineError) {
           console.error(`${LOG_PREFIX} Failed to start engine:`, engineError)
           await logProgressionEvent(connectionId, "engine_start_error", "error", "Failed to start engine", {
             error: engineError instanceof Error ? engineError.message : String(engineError),
@@ -718,10 +750,11 @@ export async function POST(request: Request) {
       real: toNumber(await client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0)),
     }
     
-    // Pseudo positions by type
+    // Pseudo positions by type — Real stage counts are active/open validated only (reconciled)
     const basePseudoPositions = await client.scard(`base_pseudo:${connectionId}`).catch(() => 0)
     const mainPseudoPositions = await client.scard(`main_pseudo:${connectionId}`).catch(() => 0)
     const realPseudoPositions = await client.scard(`real_pseudo:${connectionId}`).catch(() => 0)
+    const realPseudoActive = realPseudoPositions
     
     // Live positions (real exchange positions)
     const livePositionsCount = await client.scard(`positions:${connectionId}:live`).catch(() => 0)
@@ -765,22 +798,23 @@ export async function POST(request: Request) {
        strategyCounts,
        strategyEvaluated,
       
-      // Pseudo positions by type
-      pseudoPositions: {
-        base: basePseudoPositions,
-        baseByIndicationType: {
-          direction: await client.scard(`base_pseudo:${connectionId}:direction`).catch(() => 0),
-          move: await client.scard(`base_pseudo:${connectionId}:move`).catch(() => 0),
-          active: await client.scard(`base_pseudo:${connectionId}:active`).catch(() => 0),
-          optimal: await client.scard(`base_pseudo:${connectionId}:optimal`).catch(() => 0),
-        },
-        main: mainPseudoPositions,
-        real: realPseudoPositions,
-        // Cascade pipeline — NOT a sum. `total` is the final-stage (Real) count;
-        // Base/Main pseudos are intermediate filter stages of the SAME underlying
-        // pseudo-positions, so summing would multi-count the same entries.
-        total: realPseudoPositions,
-      },
+       // Pseudo positions by type
+       pseudoPositions: {
+         base: basePseudoPositions,
+         baseByIndicationType: {
+           direction: await client.scard(`base_pseudo:${connectionId}:direction`).catch(() => 0),
+           move: await client.scard(`base_pseudo:${connectionId}:move`).catch(() => 0),
+           active: await client.scard(`base_pseudo:${connectionId}:active`).catch(() => 0),
+           optimal: await client.scard(`base_pseudo:${connectionId}:optimal`).catch(() => 0),
+         },
+         main: mainPseudoPositions,
+         real: realPseudoPositions,
+         realActive: realPseudoActive,
+         realActiveOpenValidated: realPseudoActive,
+         // Cascade pipeline — NOT a sum. `total` and real* reflect only active/open validated Real-stage positions
+         // (closed/invalidated/mirrored ones are removed via reconciliation + closeOrInvalidateRealPseudo).
+         total: realPseudoPositions,
+       },
       
       // Live positions
       livePositions: livePositionsCount,
@@ -794,7 +828,7 @@ export async function POST(request: Request) {
     console.log(`${LOG_PREFIX}: === COMPREHENSIVE STATS ===`)
     console.log(`${LOG_PREFIX}: Symbols: ${symbols.length}, Prehistoric: ${prehistoricSymbols}`)
     console.log(`${LOG_PREFIX}: Indications - Direction: ${directionIndications}, Move: ${moveIndications}, Active: ${activeIndications}, Optimal: ${optimalIndications}`)
-    console.log(`${LOG_PREFIX}: Pseudo Positions - Base: ${basePseudoPositions}, Main: ${mainPseudoPositions}, Real: ${realPseudoPositions}`)
+    console.log(`${LOG_PREFIX}: Pseudo Positions - Base: ${basePseudoPositions}, Main: ${mainPseudoPositions}, Real(active/open validated Stage Real): ${realPseudoPositions}`)
     console.log(`${LOG_PREFIX}: Live Positions: ${livePositionsCount}, Cycle Duration: ${cycleDuration}ms`)
     
     return NextResponse.json({

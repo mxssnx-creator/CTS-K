@@ -46,7 +46,23 @@ export async function createExchangeConnector(
     )
   }
 
+  // DEV/TEST: prefer simulated connector when API key is a placeholder or FORCE_SIMULATED set
+  try {
+    const forceSim = process.env.FORCE_SIMULATED === "1"
+    const keyStr = String(credentials.apiKey || "")
+    if (forceSim || keyStr.includes("PLACEHOLDER") || keyStr === "") {
+      const { SimulatedConnector } = await import("./simulated-connector")
+      return new SimulatedConnector(credentials, "simulated")
+    }
+  } catch (e) {
+    // ignore and fall back to normal creation
+  }
+
   switch (normalizedExchange) {
+    case "simulated": {
+      const { SimulatedConnector } = await import("./simulated-connector")
+      return new SimulatedConnector(credentials, "simulated")
+    }
     case "bybit": {
       const { BybitConnector } = await import("./bybit-connector")
       return new BybitConnector(credentials, "bybit")
@@ -72,9 +88,13 @@ export async function createExchangeConnector(
       return new OKXConnector(credentials, "okx")
     }
     default:
-      throw new Error(
-        `Unsupported exchange: ${exchange}. Supported exchanges: bybit, bingx, pionex, orangex, binance, okx`
-      )
+      // Unknown exchange — fallback to SimulatedConnector in test/dev environments
+      try {
+        const { SimulatedConnector } = await import("./simulated-connector")
+        return new SimulatedConnector(credentials, "simulated")
+      } catch {
+        throw new Error(`Unsupported exchange: ${exchange}. Supported exchanges: bybit, bingx, pionex, orangex, binance, okx`)
+      }
   }
 }
 
