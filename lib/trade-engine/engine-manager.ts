@@ -581,8 +581,12 @@ export class TradeEngineManager {
       await this.updateProgressionPhase("market_data", 8, "Loading market data...")
       const symbols = await this.getSymbols()
       await setSettings(`trade_engine_state:${this.connectionId}`, {
-        symbols: symbols,
-        active_symbols: symbols,
+        // Store as JSON so readers can JSON.parse reliably. Storing a raw array
+        // here let the Redis emulator coerce it to a comma-joined string, which
+        // then threw "Unexpected token" in recoordinateForActualOne's
+        // JSON.parse(state.symbols). JSON.stringify keeps both sides consistent.
+        symbols: JSON.stringify(symbols),
+        active_symbols: JSON.stringify(symbols),
         updated_at: new Date().toISOString(),
       })
 
@@ -3689,7 +3693,7 @@ export class TradeEngineManager {
     return this.settingsVersion
   }
 
-  // ───���────────────────────────────────────────────────────────────────
+  // ───���─────────────────────────────────────────────────���──────────────
   //  Live settings reload
   // ────────────────���───────────────────────────────────────────────────
 

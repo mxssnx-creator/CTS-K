@@ -824,16 +824,42 @@ return {
 
       // Resolve current live state
       const connData = (await client.hgetall(`connection:${connectionId}`).catch(() => ({}))) as Record<string, string>
+      // Robustly parse a symbols field that may be stored either as a JSON
+      // array (current format) or a legacy comma/pipe-joined string. The old
+      // code did a bare JSON.parse on a comma-joined value ("BTCUSDT,ETH...")
+      // which threw "Unexpected token 'B'" and aborted re-coordination.
+      const parseSymbols = (raw: string | undefined | null): string[] => {
+        if (!raw) return []
+        const s = String(raw).trim()
+        if (!s) return []
+        if (s.startsWith("[")) {
+          try {
+            const arr = JSON.parse(s)
+            return Array.isArray(arr) ? arr.map(String) : []
+          } catch {
+            /* fall through to delimiter split */
+          }
+        }
+        return s
+          .split(/[,|]/)
+          .map((x) => x.trim())
+          .filter(Boolean)
+      }
+
       // Best effort: ask engine for current symbols (or fall back to stored)
       let currentSymbols: string[] = []
-      try {
-        const state = (await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({}))) as Record<string, string>
-        if (state.symbols) currentSymbols = JSON.parse(state.symbols)
-      } catch {}
+      // NOTE: setSettings() stores under a `settings:` prefix, so the engine
+      // state hash lives at `settings:trade_engine_state:{id}`. The previous
+      // read used the unprefixed key and therefore never found the symbols,
+      // silently falling back to the connection's active_symbols every time.
+      const state = (await client
+        .hgetall(`settings:trade_engine_state:${connectionId}`)
+        .catch(() => ({}))) as Record<string, string>
+      currentSymbols = parseSymbols(state.symbols)
       if (currentSymbols.length === 0) {
-        // fallback
+        // fallback to the connection's active_symbols
         const cd = connData as Record<string, string>
-        currentSymbols = (cd.active_symbols ? JSON.parse(cd.active_symbols) : [])
+        currentSymbols = parseSymbols(cd.active_symbols)
       }
 
       const liveSymbolCount = currentSymbols.length
