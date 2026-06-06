@@ -1997,7 +1997,16 @@ export class TradeEngineManager {
           if (cycleCount % 500 === 1) {
             writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
           }
-          if (Object.keys(indicationTypeCounts).length > 0) {
+          // GATE ON REAL PRODUCTION: `indicationTypeCounts` is intentionally
+          // left empty here (per-type counters are written authoritatively by
+          // trackIndicationStats inside the processor). The cumulative
+          // `indications_count` and the "live" cycle counter must therefore be
+          // gated on the REAL produced total — `totalIndications` — not on the
+          // always-empty indicationTypeCounts map. The previous guard
+          // (`Object.keys(indicationTypeCounts).length > 0`) was always false,
+          // so indications_count / indication_live_cycle_count never advanced
+          // and the dashboard's total-indications tile was stuck at 0.
+          if (totalIndications > 0) {
             writes.push(client.hincrby(redisKey, "indication_live_cycle_count", 1))
             for (const [type, count] of Object.entries(indicationTypeCounts)) {
               writes.push(client.hincrby(redisKey, `indications_${type}_count`, count))

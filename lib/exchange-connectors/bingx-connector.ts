@@ -59,6 +59,16 @@ export class BingXConnector extends BaseExchangeConnector {
   // forced resync+retry. A 60s window absorbs all realistic latency/skew so
   // requests succeed first try. Verified live: 5/5 balance requests code 0.
   private recvWindowMs: number = 60_000
+  // Deliberate "be slightly late" bias (ms) subtracted from every signed
+  // timestamp. BingX's recvWindow is ONE-SIDED: it tolerates timestamps that
+  // lag server time (serverTime - timestamp <= recvWindow) but rejects any
+  // timestamp that is AHEAD of server time almost immediately, returning code
+  // 100421 "timestamp mismatch". On the high-RTT Vercel→BingX link the midpoint
+  // offset estimate is noisy, so a clock running even slightly fast sends future
+  // timestamps and every request fails. By always biasing the timestamp to sit
+  // ~2s behind our best estimate of server time, we trade harmless lateness
+  // (absorbed by the 60s recvWindow) for the elimination of fatal earliness.
+  private timestampLagMs: number = 2_000
   // Cross-instance throttle for the "Failed to sync" log so a network blip
   // across many connector instances doesn't flood output.
   private static lastSyncFailLogTs = 0
@@ -161,18 +171,22 @@ export class BingXConnector extends BaseExchangeConnector {
         const rtt = t1 - t0
         const localMidpoint = t0 + rtt / 2
         const measured = serverTime - localMidpoint
-        // Adopt only when the measured offset clearly exceeds the noise band
-        // (half-RTT uncertainty plus a small margin). Otherwise keep 0.
-        const noise = rtt / 2 + 50
-        const newOffset = Math.abs(measured) > noise ? measured : 0
+        // ALWAYS adopt the measured offset. The previous noise-band gate kept
+        // offset=0 whenever |measured| < rtt/2, which on this high-RTT link
+        // meant the clock was effectively never corrected — and a VM clock
+        // running fast then sent future timestamps that BingX rejected with
+        // 100421. The downstream timestampLagMs bias makes a slightly-too-large
+        // offset harmless (we'd just be a touch later, absorbed by recvWindow),
+        // so adopting the raw estimate is strictly safer than ignoring it.
+        const newOffset = measured
         this.timeOffset = newOffset
         // Record the ACTUAL completion time so the throttle window isn't
         // shortened by the round-trip we just spent.
         this.lastTimeSync = t1
-        if (Math.abs(newOffset) > 100 || Math.abs(measured) > 100) {
+        if (Math.abs(measured) > 100) {
           this.log(
-            `[v0] Server time sync: applied offset=${newOffset.toFixed(0)}ms ` +
-              `(measured=${measured.toFixed(0)}ms, rtt=${rtt}ms, noiseBand=±${noise.toFixed(0)}ms)`,
+            `[v0] Server time sync: offset=${newOffset.toFixed(0)}ms ` +
+              `(rtt=${rtt}ms, lag=${this.timestampLagMs}ms)`,
           )
         }
       }
@@ -210,7 +224,10 @@ export class BingXConnector extends BaseExchangeConnector {
     // BingX rejects as code 100421 "Null timestamp or timestamp mismatch".
     // Fall back to raw local time so requests stay valid.
     const offset = Number.isFinite(this.timeOffset) ? this.timeOffset : 0
-    return Date.now() + offset
+    // Subtract the lag bias so the timestamp sits safely BEHIND server time.
+    // BingX rejects future timestamps (100421) but tolerates lagging ones up to
+    // recvWindow (60s), so being deliberately ~2s late is the safe direction.
+    return Date.now() + offset - this.timestampLagMs
   }
 
   /**
