@@ -6,13 +6,18 @@ export async function GET() {
   try {
     await initRedis()
     const status = await getMigrationStatus()
-    
+
     return NextResponse.json({
-      current_version: status.latestVersion,
-      target_version: 11,
-      total_migrations: 11,
+      // currentVersion = version actually applied in Redis;
+      // latestVersion = highest migration the code defines (currently 22).
+      // Both are derived dynamically so this never drifts from the real
+      // migration set the way the previously hardcoded "11" did.
+      current_version: status.currentVersion,
+      target_version: status.latestVersion,
+      total_migrations: status.latestVersion,
+      pending: Array.isArray(status.pendingMigrations) ? status.pendingMigrations.length : 0,
       message: status.message,
-      is_up_to_date: status.latestVersion >= 11,
+      is_up_to_date: status.isMigrated,
     })
   } catch (error) {
     console.error("[v0] Migrations info error:", error)

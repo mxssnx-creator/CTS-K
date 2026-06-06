@@ -13,12 +13,13 @@ export async function POST() {
     await initRedis()
     const result = await runMigrations()
 
+    // Report the REAL migration result instead of hardcoded counts. The
+    // previous static `applied: 5` misrepresented every run (the system is at
+    // schema v22 and runMigrations() returns { success, message, version }).
     return NextResponse.json({
-      success: true,
-      applied: 5,
-      skipped: 0,
-      failed: 0,
-      message: "Redis migrations completed automatically",
+      success: result.success !== false,
+      version: result.version,
+      message: result.message ?? "Redis migrations completed",
     })
   } catch (error: any) {
     console.error("[v0] Migration API error:", error)
