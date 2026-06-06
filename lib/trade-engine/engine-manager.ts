@@ -2030,17 +2030,15 @@ export class TradeEngineManager {
         this.componentHealth.indications.cycleCount = cycleCount
         this.componentHealth.indications.successRate = cycleCount > 0 ? ((cycleCount - errorCount) / cycleCount) * 100 : 100
 
-        // PROGRESSION CONTRACT: the global cycles_completed counter represents
-        // meaningful live progress (indications were generated), not churn.
-        // Skip the increment for empty warmup/prehistoric ticks — that keeps
-        // the dashboard success-rate honest and prevents cycles_completed from
-        // drifting into the tens of thousands while nothing has happened yet.
-        if (processedThisCycle > 0) {
-          try {
-            await ProgressionStateManager.incrementCycle(this.connectionId, true, processedThisCycle)
-          } catch (incError) {
-            console.error(`[v0] [Engine] Cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
-          }
+        // PROGRESSION CONTRACT: every tick counts as a completed cycle so the
+        // dashboard can observe that the engine is alive and advancing.
+        // “Productive” ticks still advance successful_cycles and indication
+        // counters below; empty/clean ticks still drive completion rate.
+        const hadWork = processedThisCycle > 0
+        try {
+          await ProgressionStateManager.incrementCycle(this.connectionId, hadWork, hadWork ? processedThisCycle : 0)
+        } catch (incError) {
+          console.error(`[v0] [Engine] Cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
         }
 
         // Persist non-counter snapshot data every 100 cycles to reduce Redis writes.
@@ -2098,7 +2096,9 @@ export class TradeEngineManager {
         errorCount++
         this.componentHealth.indications.errorCount++
         // Track failed cycle on every error to keep progression counters accurate.
-        await ProgressionStateManager.incrementCycle(this.connectionId, false, 0)
+        try {
+          await ProgressionStateManager.incrementCycle(this.connectionId, false, 0)
+        } catch { /* non-critical */ }
         await logProgressionEvent(
           this.connectionId,
           "indications",
@@ -2407,14 +2407,14 @@ export class TradeEngineManager {
           await Promise.all(writes)
         } catch { /* non-critical */ }
 
-        // Only count productive strategy cycles toward cycles_completed
-        // (see same-pattern comment in indication processor).
-        if (evaluatedThisCycle > 0) {
-          try {
-            await ProgressionStateManager.incrementCycle(this.connectionId, true, evaluatedThisCycle)
-          } catch (incError) {
-            console.error(`[v0] [Engine] Strategy cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
-          }
+        // PROGRESSION CONTRACT: every tick counts as a completed cycle.
+        // Productive ticks still advance successful_cycles and strategy
+        // counters below; empty/clean ticks still drive completion rate.
+        const hadWork = evaluatedThisCycle > 0
+        try {
+          await ProgressionStateManager.incrementCycle(this.connectionId, hadWork, hadWork ? evaluatedThisCycle : 0)
+        } catch (incError) {
+          console.error(`[v0] [Engine] Strategy cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
         }
 
         // Persist non-counter snapshot data every 50 cycles to reduce Redis writes.
