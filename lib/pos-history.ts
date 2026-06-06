@@ -51,6 +51,36 @@ import { getRedisClient } from "@/lib/redis-db"
 const TTL_SECONDS = 90 * 24 * 60 * 60 // 90 days — the run window we care about
 const OVERALL_BUCKET = "_overall"
 
+// ── Windowed (last-N) ring list ─────────────────────────────────────────
+//
+// The cumulative hash above answers "lifetime PF/DDT". But the operator
+// spec — and the Strategy-Coordination Settings copy — actually want the
+// eval gates to use the AVERAGE over the *last N completed positions*, not
+// the all-time mean. A lifetime mean is sticky: a Set that was great for
+// 500 positions then degraded keeps a healthy lifetime PF long after it
+// should have been demoted. A rolling window reacts.
+//
+// We keep a bounded per-bucket Redis LIST alongside the hash. Each closed
+// position is `lpush`ed as a compact "pnl|ddt" record and the list is
+// `ltrim`med to RING_CAP so memory never grows with run length (this is
+// the same bounded-memory discipline as the rest of the engine — see the
+// Real-stage safety ceiling). Readers `lrange` the most-recent N and
+// average PF (∑max(0,pnl) / ∑max(0,-pnl)) and DDT over just that window.
+//
+// RING_CAP is the hard storage cap; callers pass the actual window N they
+// want (always ≤ RING_CAP). 600 comfortably covers the largest eval window
+// in play (Real/Main eval counts + the 550 DDT cap) with headroom.
+const RING_CAP = 600
+
+function listKey(
+  connectionId: string,
+  symbol: string,
+  indicationType: string,
+  direction: string,
+): string {
+  return `pos_ring:${connectionId}:${symbol}:${indicationType}:${direction}`
+}
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 export interface PosHistoryStats {
@@ -71,6 +101,32 @@ export interface PosHistoryStats {
 }
 
 const EMPTY: PosHistoryStats = {
+  count: 0,
+  successRate: 0,
+  profitFactor: 0,
+  avgDDT: 0,
+  hasSignal: false,
+}
+
+/**
+ * Windowed performance over the last N closed positions of a bucket.
+ * This is what the Base/Main/Real eval gates consume (the spec's
+ * "average val for specific last count of positions").
+ */
+export interface PosWindowStats {
+  /** Positions actually present in the window (≤ requested N). */
+  count: number
+  /** Wins / count over the window, or 0 when empty. */
+  successRate: number
+  /** Windowed profit factor: ∑max(0,pnl) / ∑max(0,-pnl). 0 = no data, 99 = all-wins cap. */
+  profitFactor: number
+  /** Mean drawdown minutes per position over the window. */
+  avgDDT: number
+  /** count >= requested threshold. */
+  hasSignal: boolean
+}
+
+const EMPTY_WINDOW: PosWindowStats = {
   count: 0,
   successRate: 0,
   profitFactor: 0,
@@ -188,6 +244,21 @@ export function recordPosClosed(input: RecordPosClosedInput): void {
   if (ddtX10 > 0)           client.hincrby(o, "ddt_num_x10",  ddtX10)
   client.expire(o, TTL_SECONDS)
 
+  // Windowed ring list (last-N). One compact "pnl|ddt" record per close,
+  // capped at RING_CAP so memory is bounded regardless of run length. We
+  // lpush (newest at head) then ltrim to [0, RING_CAP-1]; readers lrange
+  // the head N. Both per-bucket and overall rings are maintained so the
+  // eval gates and the dashboard "any-symbol" tile can both read windows.
+  const ringRecord = `${pnl.toFixed(6)}|${ddt.toFixed(3)}`
+  const ringK = listKey(connectionId, cleanSymbol, cleanType, cleanDir)
+  client.lpush(ringK, ringRecord)
+  client.ltrim(ringK, 0, RING_CAP - 1)
+  client.expire(ringK, TTL_SECONDS)
+  const ringO = listKey(connectionId, OVERALL_BUCKET, OVERALL_BUCKET, OVERALL_BUCKET)
+  client.lpush(ringO, ringRecord)
+  client.ltrim(ringO, 0, RING_CAP - 1)
+  client.expire(ringO, TTL_SECONDS)
+
   if (owned) {
     // Fire-and-forget — caller didn't need atomicity with anything else.
     // Errors are intentionally swallowed: this is observability, not control.
@@ -293,6 +364,151 @@ export async function getPosHistoryBatch(
     })
   } catch {
     /* return whatever we accumulated; missing entries default to EMPTY in callers */
+  }
+  return out
+}
+
+// ── Windowed (last-N) readers ────────────────────────────────────────────
+
+/**
+ * Average a list of "pnl|ddt" ring records into PosWindowStats.
+ *
+ * `pfWindow` bounds how many of the most-recent records feed the PF /
+ * success-rate / count figures. `ddtWindow` independently bounds how many
+ * feed the avgDDT figure — the operator spec wants DDT averaged over its
+ * own (larger, ≤550) sample while PF uses a tighter recency window. When
+ * `ddtWindow` is omitted it falls back to `pfWindow` (single-window mode).
+ */
+function deriveWindow(
+  records: string[],
+  pfWindow: number,
+  ddtWindow?: number,
+): PosWindowStats {
+  if (!records || records.length === 0) return EMPTY_WINDOW
+  // records arrive newest-first (lpush head).
+  const pfN = Math.max(1, pfWindow)
+  const ddtN = Math.max(1, ddtWindow ?? pfWindow)
+  let wins = 0
+  let num = 0
+  let den = 0
+  let n = 0
+  let ddtSum = 0
+  let ddtCount = 0
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i]
+    const sep = rec.indexOf("|")
+    if (sep < 0) continue
+    const pnl = Number(rec.slice(0, sep))
+    const ddt = Number(rec.slice(sep + 1))
+    // PF / count window
+    if (i < pfN && Number.isFinite(pnl)) {
+      n++
+      if (pnl > 0) {
+        wins++
+        num += pnl
+      } else {
+        den += -pnl
+      }
+    }
+    // DDT window (independent size)
+    if (i < ddtN && Number.isFinite(ddt) && ddt > 0) {
+      ddtSum += ddt
+      ddtCount++
+    }
+  }
+  if (n === 0) return EMPTY_WINDOW
+  const profitFactor = den > 0 ? num / den : (num > 0 ? 99 : 0)
+  return {
+    count: n,
+    successRate: wins / n,
+    profitFactor,
+    avgDDT: ddtCount > 0 ? ddtSum / ddtCount : 0,
+    hasSignal: n >= pfN,
+  }
+}
+
+/**
+ * Windowed PF/DDT over the last `window` closed positions of a bucket.
+ * `window` (and optional `ddtWindow`) are clamped to RING_CAP. This is the
+ * spec-correct "average of the last N positions" used by the eval gates.
+ */
+export async function getPosWindow(
+  connectionId: string,
+  symbol: string,
+  indicationType: string,
+  direction: "long" | "short",
+  window = 25,
+  ddtWindow?: number,
+): Promise<PosWindowStats> {
+  try {
+    const pfN = Math.min(RING_CAP, Math.max(1, Math.floor(window)))
+    const ddtN = Math.min(RING_CAP, Math.max(1, Math.floor(ddtWindow ?? window)))
+    const fetchN = Math.max(pfN, ddtN)
+    const client = getRedisClient()
+    const records = (await client.lrange(
+      listKey(connectionId, symbol, indicationType, direction),
+      0,
+      fetchN - 1,
+    )) as string[]
+    return deriveWindow(records, pfN, ddtN)
+  } catch {
+    return EMPTY_WINDOW
+  }
+}
+
+/** Connection-level windowed rollup across all buckets. */
+export async function getPosWindowOverall(
+  connectionId: string,
+  window = 25,
+  ddtWindow?: number,
+): Promise<PosWindowStats> {
+  try {
+    const pfN = Math.min(RING_CAP, Math.max(1, Math.floor(window)))
+    const ddtN = Math.min(RING_CAP, Math.max(1, Math.floor(ddtWindow ?? window)))
+    const fetchN = Math.max(pfN, ddtN)
+    const client = getRedisClient()
+    const records = (await client.lrange(
+      listKey(connectionId, OVERALL_BUCKET, OVERALL_BUCKET, OVERALL_BUCKET),
+      0,
+      fetchN - 1,
+    )) as string[]
+    return deriveWindow(records, pfN, ddtN)
+  } catch {
+    return EMPTY_WINDOW
+  }
+}
+
+/**
+ * Batch windowed reader — last-N stats for many (type × direction) pairs
+ * of one symbol in a single round-trip. Mirrors getPosHistoryBatch so the
+ * Base stage can fetch windows without N+1 lrange calls.
+ */
+export async function getPosWindowBatch(
+  connectionId: string,
+  symbol: string,
+  pairs: Array<{ indicationType: string; direction: "long" | "short" }>,
+  window = 25,
+  ddtWindow?: number,
+): Promise<Map<string, PosWindowStats>> {
+  const out = new Map<string, PosWindowStats>()
+  if (pairs.length === 0) return out
+  try {
+    const pfN = Math.min(RING_CAP, Math.max(1, Math.floor(window)))
+    const ddtN = Math.min(RING_CAP, Math.max(1, Math.floor(ddtWindow ?? window)))
+    const fetchN = Math.max(pfN, ddtN)
+    const client = getRedisClient()
+    const pipeline = client.multi()
+    for (const p of pairs) {
+      pipeline.lrange(listKey(connectionId, symbol, p.indicationType, p.direction), 0, fetchN - 1)
+    }
+    const results = (await (pipeline as any).exec()) as any[]
+    pairs.forEach((p, i) => {
+      const raw = results?.[i]
+      const records = (Array.isArray(raw) ? raw[1] : raw) as string[] | null | undefined
+      out.set(`${p.indicationType}|${p.direction}`, deriveWindow(records || [], pfN, ddtN))
+    })
+  } catch {
+    /* partial results ok; callers default missing to EMPTY_WINDOW */
   }
   return out
 }

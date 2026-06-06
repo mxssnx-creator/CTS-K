@@ -864,19 +864,37 @@ export class ConfigSetProcessor {
                 const direction = p.direction === "short" ? "short" : "long"
                 const indicationType = p.indication_type || config.type || "unknown"
                 const resultPct = Number(p.result) || 0
-                // recordPosClosed expects pnl in quote currency. The
-                // prehistoric position result is a percentage; we
-                // scale to a unit-equivalent so the pf_num_x1000 /
-                // pf_den_x1000 ratios in pos_history remain meaningful
-                // (they're always read as ratios downstream). Sign
-                // is preserved, magnitude in percentage points.
+                // Per-position drawdown TIME = how long the trade was held
+                // (entry → exit), in minutes. Both fields are either epoch-ms
+                // numbers or ISO strings (see the prices[].time origin), so we
+                // normalise to ms before differencing. Previously this was
+                // hardcoded to 0, which made the downstream DDT gate a dead
+                // no-op (Set.avgDrawdownTime was always 0). The realised
+                // duration is the correct signal: a Set that sits in trades
+                // for hours has materially worse drawdown-time risk than one
+                // that resolves in minutes, and the Main/Real gate is meant
+                // to reject the former.
+                const toMs = (t: unknown): number => {
+                  if (typeof t === "number") return t
+                  if (typeof t === "string") {
+                    const n = Number(t)
+                    if (Number.isFinite(n) && n > 0) return n
+                    const parsed = Date.parse(t)
+                    return Number.isFinite(parsed) ? parsed : 0
+                  }
+                  return 0
+                }
+                const entryMs = toMs(p.entry_time)
+                const exitMs = toMs(p.exit_time)
+                const drawdownMinutes =
+                  entryMs > 0 && exitMs > entryMs ? (exitMs - entryMs) / 60000 : 0
                 recordPosClosed({
                   connectionId: this.connectionId,
                   symbol: p.symbol || symbol,
                   indicationType,
                   direction,
                   pnl: resultPct,
-                  drawdownMinutes: 0,
+                  drawdownMinutes,
                   pipeline,
                 })
               }

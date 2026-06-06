@@ -585,6 +585,31 @@ export class StrategyCoordinator {
   private _prevPosMinCountAt = 0
   private readonly _prevPosMinCountTtlMs = 30_000
 
+  /**
+   * 30-second per-instance cache for `connection_settings.prevPosWindow` —
+   * the size N of the last-N rolling window the eval gates average PF/DDT
+   * over. Distinct from `prevPosMinCount` (which is the *minimum* sample
+   * count before the blend activates at all): a Set needs at least
+   * `prevPosMinCount` closed positions for the historic signal to be
+   * trusted, and once trusted the PF/DDT are the mean of the most recent
+   * `prevPosWindow` of them. Sentinel `-1` = not yet loaded.
+   */
+  private _prevPosWindowValue = -1
+  private _prevPosWindowAt = 0
+  private readonly _prevPosWindowTtlMs = 30_000
+
+  /**
+   * 30-second per-instance cache for `connection_settings.ddtCapPositions` —
+   * the maximum number of recent positions averaged into a Set's drawdown
+   * time (DDT). Operator spec: "Calculate DDT by available but max 550
+   * pos." DDT uses a wider sample than PF because drawdown-duration risk is
+   * a slower-moving structural property of a strategy, whereas PF recency
+   * matters more for promotion. Default 550, clamped to RING_CAP (600).
+   */
+  private _ddtCapValue = -1
+  private _ddtCapAt = 0
+  private readonly _ddtCapTtlMs = 30_000
+
   // ── Profit factor thresholds per stage (system-wide defaults) ──────
   //
   // Spec: "Change at Main Trade PF for Base, Main, Real, Live to
@@ -1042,10 +1067,12 @@ export class StrategyCoordinator {
     // direction) bucket this symbol is about to produce a Base Set for,
     // then attach + min-blend below. Fresh boots / new buckets return
     // {count:0, ...} which is treated as "no signal yet" → no blend.
-    let posMap: Map<string, import("@/lib/pos-history").PosHistoryStats> = new Map()
+    let posMap: Map<string, import("@/lib/pos-history").PosWindowStats> = new Map()
     let prevPosMinCount = 5
+    let prevPosWindow = 25
+    let ddtCapPositions = 550
     try {
-      const { getPosHistoryBatch } = await import("@/lib/pos-history")
+      const { getPosWindowBatch } = await import("@/lib/pos-history")
       const pairs = Array.from(setMap.values()).map((g) => ({
         indicationType: g.indicationType,
         direction: g.direction,
@@ -1064,8 +1091,19 @@ export class StrategyCoordinator {
       // value on this code path.
       try {
         const cachedAge = Date.now() - this._prevPosMinCountAt
-        if (this._prevPosMinCountValue >= 0 && cachedAge < this._prevPosMinCountTtlMs) {
+        const winAge = Date.now() - this._prevPosWindowAt
+        const ddtAge = Date.now() - this._ddtCapAt
+        if (
+          this._prevPosMinCountValue >= 0 &&
+          cachedAge < this._prevPosMinCountTtlMs &&
+          this._prevPosWindowValue >= 0 &&
+          winAge < this._prevPosWindowTtlMs &&
+          this._ddtCapValue >= 0 &&
+          ddtAge < this._ddtCapTtlMs
+        ) {
           prevPosMinCount = this._prevPosMinCountValue
+          prevPosWindow = this._prevPosWindowValue
+          ddtCapPositions = this._ddtCapValue
         } else {
           const client = getRedisClient()
           const cs = (await client.hgetall(
@@ -1075,9 +1113,33 @@ export class StrategyCoordinator {
           if (Number.isFinite(v) && v >= 1) prevPosMinCount = Math.min(50, Math.floor(v))
           this._prevPosMinCountValue = prevPosMinCount
           this._prevPosMinCountAt = Date.now()
+          // prevPosWindow: the PF rolling window size. Clamp [1, 600] to match
+          // the pos-history RING_CAP. Default 25.
+          const w = Number(cs?.prevPosWindow || "")
+          if (Number.isFinite(w) && w >= 1) prevPosWindow = Math.min(600, Math.floor(w))
+          this._prevPosWindowValue = prevPosWindow
+          this._prevPosWindowAt = Date.now()
+          // ddtCapPositions: the DDT averaging window (Settings → Strategies →
+          // Main). "Calculate DDT by available but max 550 pos." Clamp
+          // [1, 600] to RING_CAP. Default 550.
+          const d = Number(cs?.ddtCapPositions || "")
+          if (Number.isFinite(d) && d >= 1) ddtCapPositions = Math.min(600, Math.floor(d))
+          this._ddtCapValue = ddtCapPositions
+          this._ddtCapAt = Date.now()
         }
       } catch { /* default stays */ }
-      posMap = await getPosHistoryBatch(this.connectionId, symbol, pairs, prevPosMinCount)
+      // Windowed (last-N) stats — the spec-correct "average of the last N
+      // positions" rather than a lifetime mean. PF uses prevPosWindow; DDT
+      // uses its own (wider) ddtCapPositions window. The blend still only
+      // activates once the bucket has at least prevPosMinCount samples
+      // (checked below via .count).
+      posMap = await getPosWindowBatch(
+        this.connectionId,
+        symbol,
+        pairs,
+        prevPosWindow,
+        ddtCapPositions,
+      )
     } catch (posErr) {
       console.warn(`[v0] [StrategyFlow] ${symbol} prev-pos prefetch failed:`, posErr)
     }
@@ -1141,6 +1203,14 @@ export class StrategyCoordinator {
           ? Math.min(rawAvgPF, posStats!.profitFactor)
           : rawAvgPF
 
+        // ── Drawdown-time from historic window ────────────────────────────
+        // The Set's avgDrawdownTime was previously hardcoded to 0, which made
+        // the Main/Real DDT gate a dead no-op (a `> maxDrawdownTime` test can
+        // never fire against 0). We now seed it from the windowed historic
+        // mean drawdown minutes (avgDDT) once the bucket has enough samples.
+        // Without sufficient history we leave it 0 (= "no DDT signal yet",
+        // gate stays open — bootstrap path), matching the PF-blend bootstrap.
+        const avgDDT = blendActive ? posStats!.avgDDT : 0
 
         const set: StrategySet = {
           setKey,
@@ -1148,7 +1218,7 @@ export class StrategyCoordinator {
           direction: group.direction,
           avgProfitFactor: avgPF,
           avgConfidence: avgConf,
-          avgDrawdownTime: 0,
+          avgDrawdownTime: avgDDT,
           entryCount: entries.length,
           entries,
           createdAt: new Date().toISOString(),
@@ -4022,7 +4092,14 @@ export class StrategyCoordinator {
         if (idx >= maxEntries) break outer
         // Project the base entry through the variant config
         const pf  = Math.max(metrics.minProfitFactor, baseEntry.profitFactor * cfg.pfBias)
-        const ddt = baseEntry.drawdownTime + cfg.ddtBias
+        // Per-entry drawdownTime is 0 at Base (entries are raw indication
+        // slots), so seed it from the parent Base Set's historic windowed
+        // DDT (baseSet.avgDrawdownTime). Without this floor the variant DDT
+        // would always be just `cfg.ddtBias`, leaving the Real/Live DDT gate
+        // blind to realised drawdown-duration risk. The variant bias is then
+        // applied on top so Block/DCA/etc. can shift the structural baseline.
+        const baseDDT = baseEntry.drawdownTime > 0 ? baseEntry.drawdownTime : (baseSet.avgDrawdownTime || 0)
+        const ddt = baseDDT + cfg.ddtBias
         if (ddt > metrics.maxDrawdownTime) continue
 
         entries.push({
