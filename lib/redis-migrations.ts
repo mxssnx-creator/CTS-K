@@ -1106,7 +1106,22 @@ const migrations: Migration[] = [
 
       // Union of every connection id source so we don't miss disabled /
       // template connections (they still get evaluated when toggled on).
+      // The CANONICAL source is `keys("connection:*")` — the same one
+      // getAllConnections uses — because nobody populates a `connections`
+      // SET and `connections:main:enabled` only holds ENABLED ids, so a
+      // disabled connection would otherwise never get its defaults seeded
+      // and would silently run built-ins the moment it's toggled on.
       const idSet = new Set<string>()
+      try {
+        const connKeys = (await client.keys("connection:*")) || []
+        for (const k of connKeys) {
+          if (typeof k !== "string") continue
+          // Skip the `connection_settings:*` hashes themselves.
+          if (k.startsWith("connection_settings:")) continue
+          const id = k.slice("connection:".length)
+          if (id) idSet.add(id)
+        }
+      } catch { /* keys() unavailable — fall through to the set-based sources */ }
       for (const setName of ["connections", "connections:main:enabled"]) {
         try {
           const ids = (await client.smembers(setName)) || []
