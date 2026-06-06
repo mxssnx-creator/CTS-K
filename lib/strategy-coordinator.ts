@@ -2206,9 +2206,31 @@ export class StrategyCoordinator {
     // toggles ��� removing this funnel cap lifts the ceiling without
     // sacrificing control.
     // For future use: if we need to re-cap (e.g. for perf), read the
-    // operator's `maxRealSets` setting and apply it here. For now,
-    // slice(0, Infinity) is a no-op.
-    const realSets = realPostHedge.slice(0, this.config.maxRealSets ?? Infinity)
+    // operator's `maxRealSets` setting and apply it here.
+    //
+    // ── MEMORY-SAFETY CEILING (not a funnel cap) ─────────────────────────
+    // Real Sets remain "unlimited" by product spec, but slicing to a literal
+    // Infinity let `realPostHedge` carry every qualifying Set — and each Set
+    // is a full object with an `entries[]` array. On a dense symbol the Real
+    // stage produced ~2400 Sets/cycle; held alongside their Main parents and
+    // the per-Set detail hashes in the in-process Redis emulator, a burst of
+    // concurrent cycles drove next-server RSS to ~7.3GB and triggered an OOM
+    // SIGKILL (verified via dmesg: anon-rss 7334448kB). The Sets are already
+    // sorted best-first (winnerPool ordering above), so an operator who sets
+    // no explicit `maxRealSets` still keeps the highest-quality Sets; only a
+    // pathological long tail is dropped. The ceiling is deliberately far
+    // above any realistic per-symbol Set count so normal multi-symbol runs
+    // are unaffected — it exists purely to keep the process from being killed.
+    const REAL_SETS_SAFETY_CEILING = 12000
+    const realSetsCap = this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING
+    const realSets = realPostHedge.slice(0, realSetsCap)
+    if (realPostHedge.length > realSetsCap) {
+      console.warn(
+        `[v0] [RealStage] ${this.connectionId}: ${realPostHedge.length} Real Sets exceeds ` +
+        `safety ceiling ${realSetsCap}; keeping top ${realSetsCap} by rank. ` +
+        `Set maxRealSets in Settings to override.`,
+      )
+    }
 
     // ── Real-stage tuner — per-variant adjustments from Base prev-pos ──
     //
