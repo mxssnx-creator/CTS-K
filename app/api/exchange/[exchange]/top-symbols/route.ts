@@ -145,16 +145,29 @@ async function fetchMostVolatileSymbols(
     // Silently handle - will use fallback below
   }
 
+  // Safe, liquid major pairs used both to pad a partially-bogus list and as a
+  // multi-symbol fallback when the public exchange API is unreachable.
+  const SAFE_MAJORS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LTCUSDT", "LINKUSDT"]
+
   if (tickers.length === 0) {
-    // Fallback: return known safe default
-    const fallback = FALLBACK[exchange] || "BTCUSDT"
-    return { symbol: fallback, priceChangePercent: 0, symbols: [{ symbol: fallback, priceChangePercent: 0 }] }
+    // Fallback: the public ticker API was unreachable / returned nothing after
+    // filtering (common in sandboxed dev, transient outages in prod). Honour the
+    // requested count instead of collapsing to a single symbol — otherwise a
+    // 10-symbol quickstart silently starts with just 1. Lead with the exchange's
+    // preferred default, then fill from the safe-majors list, de-duplicated.
+    const preferred = FALLBACK[exchange] || "BTCUSDT"
+    const ordered = [preferred, ...SAFE_MAJORS.filter(s => s !== preferred)]
+    const fallbackSymbols = ordered.slice(0, safeLimit).map((symbol, i) => ({
+      symbol,
+      // Tiny descending synthetic volatility keeps a stable, sensible sort order.
+      priceChangePercent: i === 0 ? 0 : 0.5,
+    }))
+    return { symbol: preferred, priceChangePercent: 0, symbols: fallbackSymbols }
   }
 
   // Dev/test safety: if the fetched list contains obviously bogus symbols (long names,
   // no real market data in sandbox, etc.), replace the tail with a safe major-symbol set
   // so quickstart with symbolCount=10 or higher never hands the engine untradeable junk.
-  const SAFE_MAJORS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LTCUSDT", "LINKUSDT"]
   const looksBogus = (s: string) => s.length > 10 || !/USDT$/.test(s) || /AEON|B2US|HANA|INUS|TAG|HOOLI|MAGASOL|SPORTFUN|TIMI/.test(s)
   if (tickers.some(t => looksBogus(t.symbol))) {
     const clean = tickers.filter(t => !looksBogus(t.symbol))

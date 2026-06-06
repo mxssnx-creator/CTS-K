@@ -103,7 +103,13 @@ export class BingXConnector extends BaseExchangeConnector {
       // case error and keeps the offset well inside the window even on
       // slow links.
       const t0 = Date.now()
-      const response = await fetch(`${this.getBaseUrl()}/openApi/v1/public/time`, {
+      // BingX server-time endpoint. The documented `/openApi/v1/public/time`
+      // path returns `100400 "this api is not exist"` — the working endpoint
+      // is the swap server-time route, which returns
+      // `{ code: 0, data: { serverTime: <ms> } }`. Using the wrong path meant
+      // syncServerTime() never parsed a serverTime, the offset stayed 0, and
+      // signed requests intermittently failed with code 109400.
+      const response = await fetch(`${this.getBaseUrl()}/openApi/swap/v2/server/time`, {
         method: "GET",
         headers: { "Content-Type": "application/json" },
       })

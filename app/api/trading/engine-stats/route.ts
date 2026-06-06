@@ -103,6 +103,33 @@ export async function GET(req: Request) {
       // non-critical
     }
 
+    // ── 4b. Resolve the real configured symbol count ─────────────────────────────
+    // Previously this was hard-coded to 1, so the dashboard always showed "1"
+    // even when quickstart enabled 10 symbols. Read the connection's
+    // active_symbols (JSON string[]) and fall back to the progression hash's
+    // symbol list if present.
+    let symbolCount = 0
+    try {
+      const conn = (await redis.hgetall(`connection:${connectionId}`).catch(() => ({}))) as Record<string, any> || {}
+      const rawSymbols = conn.active_symbols
+      if (typeof rawSymbols === "string" && rawSymbols.length > 0) {
+        try {
+          const parsed = JSON.parse(rawSymbols)
+          if (Array.isArray(parsed)) symbolCount = parsed.filter((s) => typeof s === "string" && s.length > 0).length
+        } catch {
+          // active_symbols may be a bare comma-separated string in older data
+          symbolCount = rawSymbols.split(",").map((s) => s.trim()).filter(Boolean).length
+        }
+      }
+      // Fallback: progression hash may track the processed-symbol count.
+      if (symbolCount === 0) {
+        const ps = parseInt(progHash.symbols_total || progHash.symbol_count || "0", 10)
+        if (Number.isFinite(ps) && ps > 0) symbolCount = ps
+      }
+    } catch {
+      // non-critical — leave at 0 if unavailable
+    }
+
     // ── 5. Build response ────────────────────────────────────────────────────────
     // Canonical "total strategies" = REAL-stage count (the final filtered output).
     // Base → Main → Real → Live is a cascade filter (eval → filter → adjust → promote).
@@ -147,7 +174,7 @@ export async function GET(req: Request) {
         cycleCount: realtimeCycleCount,
       },
       metadata: {
-        symbolCount: 1,
+        symbolCount,
       },
     })
   } catch (error) {
