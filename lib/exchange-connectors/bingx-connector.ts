@@ -113,10 +113,28 @@ export class BingXConnector extends BaseExchangeConnector {
       //     otherwise the true skew is effectively zero and we keep offset=0
       //     (raw local time), which sits comfortably inside ±1000ms here.
       const t0 = Date.now()
-      const response = await fetch(`${this.getBaseUrl()}/openApi/swap/v2/server/time`, {
-        method: "GET",
-        headers: { "Content-Type": "application/json" },
-      })
+      // Bound the request and tolerate a single transient network blip. The
+      // Vercel→BingX link occasionally drops a connection ("fetch failed"); a
+      // single quick retry avoids a failed sync without hammering the endpoint.
+      const fetchTime = async () => {
+        const ctrl = new AbortController()
+        const timer = setTimeout(() => ctrl.abort(), 8000)
+        try {
+          return await fetch(`${this.getBaseUrl()}/openApi/swap/v2/server/time`, {
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+            signal: ctrl.signal,
+          })
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+      let response: Response
+      try {
+        response = await fetchTime()
+      } catch {
+        response = await fetchTime() // one retry on transient failure
+      }
       const t1 = Date.now()
       const data = await response.json().catch(() => null as any)
 
@@ -148,9 +166,17 @@ export class BingXConnector extends BaseExchangeConnector {
         }
       }
     } catch (err) {
-      // Fall back to local time; worst case we'll hit timestamp errors
-      // and retry with a fresh sync.
-      this.log(`[v0] Failed to sync server time: ${String(err).slice(0, 80)}`)
+      // Sync failed (transient network issue or both attempts aborted). This is
+      // non-fatal: recvWindow=60000 absorbs any realistic clock skew, so signed
+      // requests still succeed with the existing (or zero) offset. Back off so we
+      // don't re-attempt every engine cycle, and throttle the log so a sustained
+      // outage across many connectors doesn't flood output.
+      const now = Date.now()
+      this.lastTimeSync = now - this.timeSyncIntervalMs + 10_000 // retry in ~10s
+      if (now - BingXConnector.lastSyncFailLogTs > 30_000) {
+        BingXConnector.lastSyncFailLogTs = now
+        this.log(`[v0] Failed to sync server time (non-fatal, recvWindow covers skew): ${String(err).slice(0, 80)}`)
+      }
     } finally {
       // Clear the in-flight slot once this sync completes (success or fail).
       // Future callers will either pass the throttle check (if we just
