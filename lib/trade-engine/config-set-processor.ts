@@ -728,6 +728,36 @@ export class ConfigSetProcessor {
       return results
     }
 
+    // ── Adaptive signal threshold ───────────────────────────────────────
+    // Previously the gate was a hard-coded `adjustedMagnitude > 0.005`
+    // (0.5%). That works on live exchange data (real volatility) but in the
+    // sandbox the exchange fetch fails and we fall back to SYNTHETIC candles
+    // that step only ~±0.0167%/bar. The windowed-average delta on that data
+    // is ~0.01–0.05% — always below 0.5% — so prehistoric produced ZERO
+    // indications (verified: candles=99 → indications=0) even though the
+    // identical candles yielded strategies. That left every prehistoric Set
+    // with no indication context.
+    //
+    // Fix: scale the threshold to the series' own volatility. We measure the
+    // mean absolute bar-to-bar relative move and require the windowed delta
+    // to exceed a fraction of it, clamped to a sane band. On live data this
+    // resolves close to the original 0.5%; on flat synthetic data it drops
+    // proportionally so meaningful relative moves still register.
+    let volSum = 0
+    let volN = 0
+    for (let k = 1; k < prices.length; k++) {
+      const prev = prices[k - 1]
+      if (prev > 0) {
+        volSum += Math.abs(prices[k] - prev) / prev
+        volN++
+      }
+    }
+    const avgBarVol = volN > 0 ? volSum / volN : 0
+    // Threshold = 1.5× the typical bar move, clamped to [0.0002, 0.005].
+    // Upper clamp preserves the legacy 0.5% ceiling for high-volatility data;
+    // lower clamp keeps a noise floor so a dead-flat series still gates out.
+    const signalThreshold = Math.min(0.005, Math.max(0.0002, avgBarVol * 1.5))
+
     for (let i = 0; i < Math.min(prices.length - steps, 50); i++) {
       const windowPrices = prices.slice(i, i + steps)
       const firstHalf = windowPrices.slice(0, Math.floor(steps / 2))
@@ -746,7 +776,7 @@ export class ConfigSetProcessor {
       let signal: "buy" | "sell" | "neutral" = "neutral"
       let value = 0
 
-      if (adjustedMagnitude > 0.005) {
+      if (adjustedMagnitude > signalThreshold) {
         if (direction > 0) {
           signal = "buy"
           value = adjustedMagnitude * 100
