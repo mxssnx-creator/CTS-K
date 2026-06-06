@@ -92,57 +92,58 @@ export class BingXConnector extends BaseExchangeConnector {
     // trigger a fresh sync once the TTL expires.
     this.syncPromise = (async () => {
     try {
-      // NTP-style sampling. A single midpoint estimate carries up to ±rtt/2 of
-      // error from asymmetric latency. On the Vercel→BingX link the RTT can spike
-      // past 1s, so one sample produced wildly wrong offsets (e.g. +612ms measured
-      // when the true skew was ~150ms), pushing every signed request OUTSIDE the
-      // venue's ±1000ms window → code 100421 on the first attempt, recovered only
-      // by a costly resync+retry on every single call.
+      // Sync the local→exchange clock offset so signed requests land inside
+      // BingX's strict ±1000ms timestamp window.
       //
-      // BingX server-time endpoint: the documented `/openApi/v1/public/time` path
-      // returns `100400 "this api is not exist"`; the working route is the swap
-      // server-time endpoint, which returns `{ code: 0, data: { serverTime } }`.
-      //
-      // Strategy: take a few quick samples, keep the one with the LOWEST RTT
-      // (least uncertainty), then only adopt the offset when it is statistically
-      // significant — larger than the measurement noise (rtt/2 + margin). If the
-      // measured offset sits within the noise band the real skew is effectively
-      // zero, so we keep offset=0 (raw local time) rather than apply a risky
-      // correction that could itself break the ±1000ms window.
-      let best: { offset: number; rtt: number; serverTime: number } | null = null
-      const SAMPLES = 3
-      for (let i = 0; i < SAMPLES; i++) {
-        const s0 = Date.now()
-        const resp = await fetch(`${this.getBaseUrl()}/openApi/swap/v2/server/time`, {
-          method: "GET",
-          headers: { "Content-Type": "application/json" },
-        })
-        const s1 = Date.now()
-        const body = await resp.json().catch(() => null)
-        if (!body || !(body.code === 0 || body.code === "0")) continue
-        const serverTime = Number(body.data?.serverTime || body.serverTime || body.time || 0)
-        if (!(serverTime > 0)) continue
-        const rtt = s1 - s0
-        const localMidpoint = s0 + rtt / 2
-        const offset = serverTime - localMidpoint
-        if (!best || rtt < best.rtt) best = { offset, rtt, serverTime }
-        // A sub-300ms RTT is already accurate enough; stop early.
-        if (rtt < 300) break
+      // Hard-won details encoded here:
+      //  1. Endpoint: the documented `/openApi/v1/public/time` returns
+      //     `100400 "this api is not exist"`. The working route is the swap
+      //     server-time endpoint: `{ code: 0, data: { serverTime } }`.
+      //  2. Even ERROR responses carry the server clock. When the endpoint is
+      //     rate-limited it returns `{ code: 100410, ..., timestamp: <ms> }`.
+      //     That top-level `timestamp` is BingX server time and is perfectly
+      //     usable, so we extract it as a fallback instead of giving up.
+      //  3. Use a SINGLE request. Hammering this endpoint with several samples
+      //     trips the per-endpoint rate limiter (100410), which is exactly what
+      //     we're trying to avoid.
+      //  4. High, asymmetric RTT on the Vercel→BingX link makes the midpoint
+      //     offset estimate noisy (±rtt/2). A spurious +600ms correction can
+      //     itself push requests out of the window (code 100421 / 109400). So we
+      //     only ADOPT the offset when it exceeds the measurement noise band;
+      //     otherwise the true skew is effectively zero and we keep offset=0
+      //     (raw local time), which sits comfortably inside ±1000ms here.
+      const t0 = Date.now()
+      const response = await fetch(`${this.getBaseUrl()}/openApi/swap/v2/server/time`, {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      })
+      const t1 = Date.now()
+      const data = await response.json().catch(() => null as any)
+
+      // Prefer the documented success shape; fall back to the top-level
+      // `timestamp` that BingX includes even on rate-limit / error responses.
+      let serverTime = 0
+      if (data) {
+        serverTime = Number(data.data?.serverTime || data.serverTime || data.time || 0)
+        if (!(serverTime > 0)) serverTime = Number(data.timestamp || 0)
       }
 
-      if (best) {
-        // Adopt the offset only when it clearly exceeds the measurement noise.
-        const noise = best.rtt / 2 + 50 // half-RTT uncertainty + small margin
-        const newOffset = Math.abs(best.offset) > noise ? best.offset : 0
+      if (serverTime > 0) {
+        const rtt = t1 - t0
+        const localMidpoint = t0 + rtt / 2
+        const measured = serverTime - localMidpoint
+        // Adopt only when the measured offset clearly exceeds the noise band
+        // (half-RTT uncertainty plus a small margin). Otherwise keep 0.
+        const noise = rtt / 2 + 50
+        const newOffset = Math.abs(measured) > noise ? measured : 0
         this.timeOffset = newOffset
-        // Set lastTimeSync to the actual completion time so the throttle window
-        // isn't shortened by the round-trip(s) we just spent sampling.
-        this.lastTimeSync = Date.now()
-        if (Math.abs(newOffset) > 100 || Math.abs(best.offset) > 100) {
+        // Record the ACTUAL completion time so the throttle window isn't
+        // shortened by the round-trip we just spent.
+        this.lastTimeSync = t1
+        if (Math.abs(newOffset) > 100 || Math.abs(measured) > 100) {
           this.log(
             `[v0] Server time sync: applied offset=${newOffset.toFixed(0)}ms ` +
-              `(measured=${best.offset.toFixed(0)}ms, bestRtt=${best.rtt}ms, ` +
-              `noiseBand=±${noise.toFixed(0)}ms)`,
+              `(measured=${measured.toFixed(0)}ms, rtt=${rtt}ms, noiseBand=±${noise.toFixed(0)}ms)`,
           )
         }
       }
@@ -167,7 +168,12 @@ export class BingXConnector extends BaseExchangeConnector {
    * Returns local time + pre-computed offset from the last sync.
    */
   private getTimestamp(): number {
-    return Date.now() + this.timeOffset
+    // Defensive: if timeOffset ever becomes non-finite, `Date.now() + NaN`
+    // yields NaN and the signed request goes out with `timestamp=NaN`, which
+    // BingX rejects as code 100421 "Null timestamp or timestamp mismatch".
+    // Fall back to raw local time so requests stay valid.
+    const offset = Number.isFinite(this.timeOffset) ? this.timeOffset : 0
+    return Date.now() + offset
   }
 
   /**
@@ -188,7 +194,13 @@ export class BingXConnector extends BaseExchangeConnector {
   private async resyncOnTimestampError(data: any): Promise<boolean> {
     const code = String(data?.code ?? "")
     const msg  = String(data?.msg ?? "").toLowerCase()
-    if (code === "109400" && msg.includes("timestamp")) {
+    // 109400 = "timestamp is invalid" (drift outside the ±1000ms window).
+    // 100421 = "Null timestamp or timestamp mismatch" — also a timestamp-class
+    //          error recoverable by a fresh server-time sync.
+    const isTimestampError =
+      (code === "109400" && msg.includes("timestamp")) ||
+      code === "100421"
+    if (isTimestampError) {
       // Force a fresh sync: clear both the throttle gate AND any in-flight
       // shared promise so syncServerTime() issues a new HTTP call instead of
       // coalescing onto the stale-offset promise that was already resolved.
@@ -2382,7 +2394,7 @@ export class BingXConnector extends BaseExchangeConnector {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
       
-      this.log(`��� Margin adjusted for ${symbol}`)
+      this.log(`✓ Margin adjusted for ${symbol}`)
       return {
         success: true,
         symbol: data.data?.symbol,
