@@ -395,7 +395,7 @@ export class GlobalTradeEngineCoordinator {
         connectionId,
         indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
         strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-        realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+        realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
       }
       await this.startEngine(connectionId, config)
     } catch (err) {
@@ -514,7 +514,7 @@ export class GlobalTradeEngineCoordinator {
             connectionId: connection.id,
             indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
             strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
           }
           
           await this.startEngine(connection.id, config)
@@ -679,7 +679,7 @@ export class GlobalTradeEngineCoordinator {
               engine_type: "main", // Main Trade Engine for indications, strategies, pseudo positions
               indicationInterval: settings.mainEngineIntervalMs ? Math.max(1, settings.mainEngineIntervalMs / 1000) : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? Math.max(1, settings.strategyUpdateIntervalMs / 1000) : 10,
-              realtimeInterval: settings.realtimeIntervalMs ? Math.max(1, settings.realtimeIntervalMs / 1000) : 3,
+              realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
             }
             
             await this.startEngine(connection.id, config)
@@ -772,7 +772,7 @@ export class GlobalTradeEngineCoordinator {
               engine_type: "main", // Main Trade Engine for indications, strategies, pseudo positions
               indicationInterval: settings.mainEngineIntervalMs ? Math.max(1, settings.mainEngineIntervalMs / 1000) : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? Math.max(1, settings.strategyUpdateIntervalMs / 1000) : 10,
-              realtimeInterval: settings.realtimeIntervalMs ? Math.max(1, settings.realtimeIntervalMs / 1000) : 3,
+              realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
             }
             
             await this.startEngine(connection.id, config)
@@ -959,7 +959,7 @@ export class GlobalTradeEngineCoordinator {
               connectionId,
               indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-              realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+              realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
 
             await this.startEngine(connectionId, config)
@@ -1177,22 +1177,6 @@ export class GlobalTradeEngineCoordinator {
               Number(state.last_processor_heartbeat) ||
               (state.last_processor_heartbeat ? new Date(state.last_processor_heartbeat).getTime() : 0) ||
               (state.last_indication_run ? new Date(state.last_indication_run).getTime() : 0)
-
-            // ── engine_alive TTL check ─────────────────────────────────
-            // The heartbeat timer writes `engine_alive:{connId}` with a
-            // 20s TTL every 10s. If this key is absent the engine is
-            // completely stalled (process death / event-loop hang). In
-            // that case synthesise a stale lastHb so the stall path fires.
-            try {
-              const { getRedisClient: _getRC } = await import("@/lib/redis-db")
-              const _rc = _getRC()
-              const aliveTs = await _rc.get(`engine_alive:${connectionId}`)
-              if (!aliveTs && lastHb > 0 && now - lastHb > STALL_THRESHOLD_MS) {
-                // engine_alive expired AND heartbeat is stale — confirmed stall
-                console.warn(`[v0] [Watchdog] engine_alive key expired for ${connectionId} — confirmed stall`)
-                // The existing stall path will handle escalation below.
-              }
-            } catch { /* best-effort */ }
             if (lastHb === 0) {
               // lastHb=0 can mean "engine just started, no heartbeat yet"
               // OR "engine was running but Redis was down so heartbeats

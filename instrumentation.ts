@@ -4,15 +4,6 @@
 declare global { var totalStrategiesEvaluated: number }
 ;(globalThis as any).totalStrategiesEvaluated = 0
 
-// CRITICAL: Seed realActiveKeysForVP on globalThis before ANY module runs.
-// Stale instrumentation bundles compiled before the local `const` declaration
-// was added to evaluateRealSets() reference this name as a bare identifier.
-// JavaScript scope resolution falls through to globalThis when no local or
-// closure binding exists — so this global is a safe fallback for ALL compiled
-// versions of strategy-coordinator. getActiveConfigKeys() updates this value
-// after every Redis fetch so the global stays current across cycles.
-;(globalThis as any).realActiveKeysForVP = (globalThis as any).realActiveKeysForVP ?? new Set()
-
 // NOTE: Previously this module pre-emptively cleared `globalThis.__engine_timers`
 // on every import. That nuked the timer loops of any *live* engine that had
 // already armed itself in the same process — a frequent cause of the

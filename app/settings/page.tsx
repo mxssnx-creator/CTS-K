@@ -50,6 +50,7 @@ interface Settings {
   leveragePercentage: number
   prehistoricDataDays: number
   prehistoric_range_hours: number // 1-50h, step 1, default 8
+  prehistoric_progression_timeout_minutes?: number // 5-25 min, step 2.5, default 10
   marketTimeframe: number
   tradeIntervalSeconds: number
   realPositionsIntervalSeconds: number
@@ -89,7 +90,9 @@ interface Settings {
   realProfitFactor: number
   liveProfitFactor: number
   trailingStopLoss: boolean
-  maxDrawdownTimeHours: number
+  maxDrawdownTimeMainHours: number
+  maxDrawdownTimeRealHours: number
+  maxDrawdownTimeLiveHours: number
 
   // ── Stage minimum position-count evaluation thresholds ──────────────────
   // Per-stage thresholds for how many completed pseudo-positions a Base/Main/
@@ -382,6 +385,9 @@ const initialSettings: Settings = {
   leveragePercentage: 100, // 5-100 step 5, Default 100
   prehistoricDataDays: 5,
   prehistoric_range_hours: 8, // 1-50h, step 1, default 8
+  // New system setting: prehistoric_progression_timeout_minutes
+  // Range: 5-25 min, step 2.5, default 10
+  prehistoric_progression_timeout_minutes: 10,
   marketTimeframe: 1,
   tradeIntervalSeconds: 1,
   realPositionsIntervalSeconds: 0.3,
@@ -440,9 +446,11 @@ const initialSettings: Settings = {
 
   // Risk Management
   trailingStopLoss: false,
-  maxDrawdownTimeHours: 24,
+  maxDrawdownTimeMainHours: 4,
+  maxDrawdownTimeRealHours: 4,
+  maxDrawdownTimeLiveHours: 4,
 
-  // ── Stage minimum position-count thresholds ────────────────────────────
+  // ── Stage minimum position-count thresholds ───────────────────��────────
   stageMinPosCountBase: 0,   // 0 = coordinator default (15)
   stageMinPosCountMain: 0,   // 0 = coordinator default (15)
   stageMinPosCountReal: 0,   // 0 = coordinator default (10)

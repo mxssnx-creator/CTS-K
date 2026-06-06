@@ -87,7 +87,12 @@ export const initialSettings: Settings = {
 
   // Risk Management
   trailingStopLoss: false,
-  maxDrawdownTimeHours: 24,
+  // Per-stage Max Drawdown-Time ceilings (hours). Per-position hold is
+  // up to ~2h, so the DDT gate defaults to 4h per stage. Engine reads via
+  // loadAppPFThresholds() (h→min). Base stays open.
+  maxDrawdownTimeMainHours: 4,
+  maxDrawdownTimeRealHours: 4,
+  maxDrawdownTimeLiveHours: 4,
 
   // Trade Engine Intervals (milliseconds)
   mainEngineIntervalMs: 100, // 50-1000ms, step 50, default 200ms

@@ -23,6 +23,8 @@ export async function POST() {
       await client.hset(`connection:${connectionId}`, {
         api_key: apiKey,
         api_secret: apiSecret,
+        // Enable testnet by default for base predefined BingX credential
+        is_testnet: connectionId === 'bingx-x01' ? "1" : (existing?.is_testnet as string) || "0",
         is_active_inserted: (existing?.is_active_inserted as string) || "0",
         is_enabled: (existing?.is_enabled as string) || "1",
         is_enabled_dashboard: (existing?.is_enabled_dashboard as string) || "0",

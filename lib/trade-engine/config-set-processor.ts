@@ -728,6 +728,36 @@ export class ConfigSetProcessor {
       return results
     }
 
+    // ── Adaptive signal threshold ───────────────────────────────────────
+    // Previously the gate was a hard-coded `adjustedMagnitude > 0.005`
+    // (0.5%). That works on live exchange data (real volatility) but in the
+    // sandbox the exchange fetch fails and we fall back to SYNTHETIC candles
+    // that step only ~±0.0167%/bar. The windowed-average delta on that data
+    // is ~0.01–0.05% — always below 0.5% — so prehistoric produced ZERO
+    // indications (verified: candles=99 → indications=0) even though the
+    // identical candles yielded strategies. That left every prehistoric Set
+    // with no indication context.
+    //
+    // Fix: scale the threshold to the series' own volatility. We measure the
+    // mean absolute bar-to-bar relative move and require the windowed delta
+    // to exceed a fraction of it, clamped to a sane band. On live data this
+    // resolves close to the original 0.5%; on flat synthetic data it drops
+    // proportionally so meaningful relative moves still register.
+    let volSum = 0
+    let volN = 0
+    for (let k = 1; k < prices.length; k++) {
+      const prev = prices[k - 1]
+      if (prev > 0) {
+        volSum += Math.abs(prices[k] - prev) / prev
+        volN++
+      }
+    }
+    const avgBarVol = volN > 0 ? volSum / volN : 0
+    // Threshold = 1.5× the typical bar move, clamped to [0.0002, 0.005].
+    // Upper clamp preserves the legacy 0.5% ceiling for high-volatility data;
+    // lower clamp keeps a noise floor so a dead-flat series still gates out.
+    const signalThreshold = Math.min(0.005, Math.max(0.0002, avgBarVol * 1.5))
+
     for (let i = 0; i < Math.min(prices.length - steps, 50); i++) {
       const windowPrices = prices.slice(i, i + steps)
       const firstHalf = windowPrices.slice(0, Math.floor(steps / 2))
@@ -746,7 +776,7 @@ export class ConfigSetProcessor {
       let signal: "buy" | "sell" | "neutral" = "neutral"
       let value = 0
 
-      if (adjustedMagnitude > 0.005) {
+      if (adjustedMagnitude > signalThreshold) {
         if (direction > 0) {
           signal = "buy"
           value = adjustedMagnitude * 100
@@ -834,19 +864,37 @@ export class ConfigSetProcessor {
                 const direction = p.direction === "short" ? "short" : "long"
                 const indicationType = p.indication_type || config.type || "unknown"
                 const resultPct = Number(p.result) || 0
-                // recordPosClosed expects pnl in quote currency. The
-                // prehistoric position result is a percentage; we
-                // scale to a unit-equivalent so the pf_num_x1000 /
-                // pf_den_x1000 ratios in pos_history remain meaningful
-                // (they're always read as ratios downstream). Sign
-                // is preserved, magnitude in percentage points.
+                // Per-position drawdown TIME = how long the trade was held
+                // (entry → exit), in minutes. Both fields are either epoch-ms
+                // numbers or ISO strings (see the prices[].time origin), so we
+                // normalise to ms before differencing. Previously this was
+                // hardcoded to 0, which made the downstream DDT gate a dead
+                // no-op (Set.avgDrawdownTime was always 0). The realised
+                // duration is the correct signal: a Set that sits in trades
+                // for hours has materially worse drawdown-time risk than one
+                // that resolves in minutes, and the Main/Real gate is meant
+                // to reject the former.
+                const toMs = (t: unknown): number => {
+                  if (typeof t === "number") return t
+                  if (typeof t === "string") {
+                    const n = Number(t)
+                    if (Number.isFinite(n) && n > 0) return n
+                    const parsed = Date.parse(t)
+                    return Number.isFinite(parsed) ? parsed : 0
+                  }
+                  return 0
+                }
+                const entryMs = toMs(p.entry_time)
+                const exitMs = toMs(p.exit_time)
+                const drawdownMinutes =
+                  entryMs > 0 && exitMs > entryMs ? (exitMs - entryMs) / 60000 : 0
                 recordPosClosed({
                   connectionId: this.connectionId,
                   symbol: p.symbol || symbol,
                   indicationType,
                   direction,
                   pnl: resultPct,
-                  drawdownMinutes: 0,
+                  drawdownMinutes,
                   pipeline,
                 })
               }

@@ -65,6 +65,7 @@ export class PositionFlowCoordinator {
     try {
       await initRedis()
       const client = getRedisClient()
+      await this.reconcileActiveRealPseudo()
 
       // Get main pseudo positions for this connection+symbol
       const positionIds = await client.smembers(`pseudo_positions:${this.connectionId}:main`)
@@ -153,6 +154,7 @@ export class PositionFlowCoordinator {
     try {
       await initRedis()
       const client = getRedisClient()
+      await this.reconcileActiveRealPseudo()
 
       const realPosIds = await client.smembers(`real_pseudo_positions:${this.connectionId}`)
 
@@ -176,6 +178,7 @@ export class PositionFlowCoordinator {
           mirrored_at: new Date().toISOString(),
         })
 
+        await this.closeOrInvalidateRealPseudo(realId, "mirrored_to_live_exchange")
         console.log(`[v0] Mirrored REAL PSEUDO ${realId} to EXCHANGE (PF: ${lastXProfitFactor.toFixed(2)})`)
       }
     } catch (error) {
@@ -371,6 +374,47 @@ export class PositionFlowCoordinator {
 
       positions.sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
       return this.calculateProfitFactorFromPositions(positions.slice(0, count))
+    } catch {
+      return 0
+    }
+  }
+
+  async closeOrInvalidateRealPseudo(realId: string, reason: string = "processed_or_invalid"): Promise<void> {
+    try {
+      const client = getRedisClient()
+      await client.srem(`real_pseudo:${this.connectionId}`, realId)
+      await client.srem(`real_pseudo_positions:${this.connectionId}`, realId)
+      const pos = await getSettings(`real_pseudo:${realId}`)
+      if (pos) {
+        pos.status = "closed"
+        pos.closed_at = new Date().toISOString()
+        pos.close_reason = reason
+        await setSettings(`real_pseudo:${realId}`, pos)
+      }
+      await logProgressionEvent(this.connectionId, "real_pseudo_closed", "info", `Real pseudo closed: ${reason}`, { realId, reason })
+    } catch (e) {
+      console.error("[v0] closeOrInvalidateRealPseudo error", e)
+    }
+  }
+
+  async reconcileActiveRealPseudo(): Promise<number> {
+    try {
+      const client = getRedisClient()
+      const ids = await client.smembers(`real_pseudo:${this.connectionId}`)
+      let removed = 0
+      for (const id of ids) {
+        const p = await getSettings(`real_pseudo:${id}`)
+        const invalid = !p || p.status !== "validated" || (p.status === "closed")
+        if (invalid) {
+          await client.srem(`real_pseudo:${this.connectionId}`, id)
+          await client.srem(`real_pseudo_positions:${this.connectionId}`, id)
+          removed++
+        }
+      }
+      if (removed > 0) {
+        await logProgressionEvent(this.connectionId, "real_pseudo_reconciled", "info", `Reconciled removed ${removed} stale real pseudo positions`)
+      }
+      return removed
     } catch {
       return 0
     }

@@ -352,20 +352,29 @@ export function QuickstartSection() {
   })
 
   const [starting, setStarting] = useState(false)
-  const [isRunning, setIsRunning] = useState(false)
-  const [expanded, setExpanded] = useState(false)
+  // Persisted across reloads (via localStorage) so QuickStart restores the
+  // exact running/expanded/situation state of the current session.
+  // IMPORTANT (hydration): initialise to the SAME values the server renders
+  // (defaults) — reading localStorage in the initialiser made the first client
+  // render diverge from SSR and broke hydration (the Start button text and the
+  // radix `useId` ids drifted). The persisted values are restored in a
+  // post-mount effect below instead.
+  const [isRunning, setIsRunning] = useState<boolean>(false)
+  const [expanded, setExpanded] = useState<boolean>(false)
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [stats, setStats] = useState<LiveStats>(EMPTY_STATS)
   const [loadingStats, setLoadingStats] = useState(false)
 
   // Quickstart controls — how many top-volatile symbols to process (1-10)
   // and whether live exchange trading is currently enabled for the connection.
+  // SSR-safe default (10); restored from localStorage in the mount effect below.
   const [symbolCount, setSymbolCount] = useState<number>(10)
   const [liveTradeActive, setLiveTradeActive] = useState<boolean>(false)
   const [liveTradeLoading, setLiveTradeLoading] = useState<boolean>(false)
   // Connection the quickstart actually bound to on last start (or the
   // component default) — used as the target for the Live toggle.
-  const [activeConnectionId, setActiveConnectionId] = useState<string>(connectionId ?? "")
+  // SSR-safe default (""); restored from localStorage in the mount effect below.
+  const [activeConnectionId, setActiveConnectionId] = useState<string>("")
 
   // ── Indication configuration Set-count snapshot (static enumeration) ─
   // Pulled from /api/indications/config-counts. Refreshed every 60s since it
@@ -628,7 +637,7 @@ export function QuickstartSection() {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
 
-  // ── poll stats always (fast when expanded/running, slow otherwise) ────────
+  // ── poll stats always (fast when expanded/running, slow otherwise) ──��─────
   useEffect(() => {
     clearInterval(pollRef.current)
     fetchStats()
@@ -875,6 +884,54 @@ export function QuickstartSection() {
     window.addEventListener("quickstart:refresh", handler)
     return () => window.removeEventListener("quickstart:refresh", handler)
   }, [loadSymbol, fetchStats, refreshLiveTradeStatus])
+
+  // Restore persisted QuickStart session flags AFTER mount so the first client
+  // render matches SSR (defaults) and React hydrates cleanly. Doing this in an
+  // effect — rather than in the useState initialisers — is what prevents the
+  // hydration mismatch on the Start button and the cascading radix id drift.
+  useEffect(() => {
+    try {
+      if (localStorage.getItem("qs:isRunning") === "1") setIsRunning(true)
+      if (localStorage.getItem("qs:expanded") === "1") setExpanded(true)
+      const sc = localStorage.getItem("qs:symbolCount")
+      if (sc) {
+        const n = parseInt(sc, 10)
+        if (Number.isFinite(n)) setSymbolCount(Math.max(1, Math.min(10, n || 10)))
+      }
+      const ac = localStorage.getItem("qs:activeConnectionId")
+      if (ac) setActiveConnectionId(ac)
+    } catch { /* localStorage may be unavailable */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Persist QuickStart UI session flags so page reloads restore the live
+  // "situation" (running/expanded/symbol count/target connection) instead of
+  // resetting the section. Each effect skips its initial mount run so the
+  // SSR-default state cannot overwrite the persisted value before the
+  // hydration effect above restores it.
+  const qsExpandedReady = useRef(false)
+  const qsSymbolCountReady = useRef(false)
+  const qsIsRunningReady = useRef(false)
+  const qsActiveConnReady = useRef(false)
+  useEffect(() => {
+    if (!qsExpandedReady.current) { qsExpandedReady.current = true; return }
+    try { localStorage.setItem("qs:expanded", expanded ? "1" : "0") } catch {}
+  }, [expanded])
+  useEffect(() => {
+    if (!qsSymbolCountReady.current) { qsSymbolCountReady.current = true; return }
+    try { localStorage.setItem("qs:symbolCount", String(symbolCount)) } catch {}
+  }, [symbolCount])
+  useEffect(() => {
+    if (!qsIsRunningReady.current) { qsIsRunningReady.current = true; return }
+    try { localStorage.setItem("qs:isRunning", isRunning ? "1" : "0") } catch {}
+  }, [isRunning])
+  useEffect(() => {
+    if (!qsActiveConnReady.current) { qsActiveConnReady.current = true; return }
+    try {
+      if (activeConnectionId) localStorage.setItem("qs:activeConnectionId", activeConnectionId)
+      else localStorage.removeItem("qs:activeConnectionId")
+    } catch {}
+  }, [activeConnectionId])
 
   const logColor = (type: string) => {
     switch (type) {
@@ -1410,7 +1467,7 @@ export function QuickstartSection() {
                   <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
                 )}
                 {/* ── Spec-mandated Historic overview tiles ──────────────
-                      • ExecPos — cumulative live exchange positions created.
+                      • ExecPos �� cumulative live exchange positions created.
                       • Base PF — overall Profit Factor across all closed
                         Base pseudo positions in the prehistoric run
                         (sum(+pct)/|sum(-pct)|). Sourced from

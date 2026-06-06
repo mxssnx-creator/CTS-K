@@ -5,6 +5,7 @@ import { useEffect, useRef } from "react"
 /**
  * EngineAutoInitializer — bootstraps the Global Trade Engine Coordinator
  * (starts workers / progression loops) on dashboard mount.
+ * Also seeds essential production data: settings, connections, market data.
  *
  * IMPORTANT STABILITY RULE:
  *   This component MUST NOT mutate connection assignment flags.
@@ -18,28 +19,44 @@ import { useEffect, useRef } from "react"
  */
 export function EngineAutoInitializer() {
   const initRef = useRef(false)
+  const seedingRef = useRef(false)
 
   useEffect(() => {
     // Only initialize once per mount
     if (initRef.current) return
     initRef.current = true
 
-    const startCoordinator = async () => {
+    const initializeProduction = async () => {
+      // Prevent multiple seeding attempts
+      if (seedingRef.current) return
+      seedingRef.current = true
+
       try {
-        // Start the global coordinator only. This endpoint does NOT touch
-        // per-connection assignment flags — it just ensures the background
-        // worker loops are running so already-enabled engines progress.
-        await fetch("/api/trade-engine/auto-start", {
-          method: "POST",
-          cache: "no-store",
-        }).catch(() => { /* non-critical */ })
-      } catch {
-        // non-critical — coordinator may already be running
+        console.log("[v0] [EngineAutoInitializer] Starting production initialization...")
+
+        // Trigger server-side initialization endpoint which performs the
+        // unique site instance guarantee, seeds production data, and starts
+        // the background coordinator. This avoids importing server-only
+        // modules into a client component, which breaks the client bundle.
+        try {
+          await fetch("/api/system/initialize", { method: "POST", cache: "no-store" })
+        } catch {
+          /* non-critical */
+        }
+
+        // Also call auto-start to ensure coordinator loops are running
+        await fetch("/api/trade-engine/auto-start", { method: "POST", cache: "no-store" }).catch(() => {})
+        console.log("[v0] [EngineAutoInitializer] ✅ Production initialization (server-side) requested")
+      } catch (error) {
+        console.error("[v0] [EngineAutoInitializer] ❌ Production initialization failed:", error)
+        // Don't throw - allow app to continue even if seeding fails
+      } finally {
+        seedingRef.current = false
       }
     }
 
     // Delay slightly to let Next.js finish hydration / layouts mount.
-    const timer = setTimeout(startCoordinator, 1000)
+    const timer = setTimeout(initializeProduction, 1000)
 
     return () => clearTimeout(timer)
   }, [])

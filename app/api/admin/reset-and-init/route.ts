@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
 import { initRedis, getRedisClient, flushAll } from "@/lib/redis-db"
-import { runMigrations } from "@/lib/redis-migrations"
+import { runMigrations, resetMigrationRunState } from "@/lib/redis-migrations"
 import { stopAllProgressionsBeforeReset } from "@/lib/db-reset-helper"
 
 export const runtime = "nodejs"
@@ -23,6 +23,11 @@ export async function POST() {
     
     console.log("[v0] === RUNNING FRESH MIGRATIONS ===")
     
+    // Reset the in-process migration guards: FLUSHALL wiped Redis but the
+    // cached migration promise + haveMigrationsRun flag persist in JS module
+    // state, so without this runMigrations() returns the stale resolved
+    // promise and never replays against the empty keyspace.
+    resetMigrationRunState()
     // Run migrations fresh
     await runMigrations()
     console.log("[v0] Migrations completed")

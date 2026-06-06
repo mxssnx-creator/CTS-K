@@ -58,7 +58,11 @@ export async function GET(req: Request) {
     // The engine-manager writes strategy_cycle_count to progression:{connId}
     // every single cycle. settings:trade_engine_state is only persisted every 100 cycles.
     let strategyCycleCount = parseInt(progHash.strategy_cycle_count || "0", 10)
-    let realtimeCycleCount = 0
+    // realtime_cycle_count is written to the progression hash every cycle by the
+    // live driver (cron/generate-indications). Read it here directly — the old
+    // code only read it from the settings:trade_engine_state fallback, which
+    // never runs once strategyCycleCount > 0, so the realtime tiles stayed 0.
+    let realtimeCycleCount = parseInt(progHash.realtime_cycle_count || "0", 10)
     let cycleSuccessRate = parseFloat(progHash.cycle_success_rate || "100")
 
     // Fallback: read from settings:trade_engine_state if progression hash is empty
@@ -66,7 +70,9 @@ export async function GET(req: Request) {
       try {
         const stateHash = await redis.hgetall(`settings:trade_engine_state:${connectionId}`) || {}
         strategyCycleCount = parseInt(stateHash.strategy_cycle_count || "0", 10)
-        realtimeCycleCount = parseInt(stateHash.realtime_cycle_count || "0", 10)
+        if (realtimeCycleCount === 0) {
+          realtimeCycleCount = parseInt(stateHash.realtime_cycle_count || "0", 10)
+        }
         if (!cycleSuccessRate) {
           cycleSuccessRate = parseFloat(stateHash.cycle_success_rate || "100")
         }
@@ -101,6 +107,33 @@ export async function GET(req: Request) {
       }
     } catch (e) {
       // non-critical
+    }
+
+    // ── 4b. Resolve the real configured symbol count ─────────────────────────────
+    // Previously this was hard-coded to 1, so the dashboard always showed "1"
+    // even when quickstart enabled 10 symbols. Read the connection's
+    // active_symbols (JSON string[]) and fall back to the progression hash's
+    // symbol list if present.
+    let symbolCount = 0
+    try {
+      const conn = (await redis.hgetall(`connection:${connectionId}`).catch(() => ({}))) as Record<string, any> || {}
+      const rawSymbols = conn.active_symbols
+      if (typeof rawSymbols === "string" && rawSymbols.length > 0) {
+        try {
+          const parsed = JSON.parse(rawSymbols)
+          if (Array.isArray(parsed)) symbolCount = parsed.filter((s) => typeof s === "string" && s.length > 0).length
+        } catch {
+          // active_symbols may be a bare comma-separated string in older data
+          symbolCount = rawSymbols.split(",").map((s) => s.trim()).filter(Boolean).length
+        }
+      }
+      // Fallback: progression hash may track the processed-symbol count.
+      if (symbolCount === 0) {
+        const ps = parseInt(progHash.symbols_total || progHash.symbol_count || "0", 10)
+        if (Number.isFinite(ps) && ps > 0) symbolCount = ps
+      }
+    } catch {
+      // non-critical — leave at 0 if unavailable
     }
 
     // ── 5. Build response ────────────────────────────────────────────────────────
@@ -147,7 +180,7 @@ export async function GET(req: Request) {
         cycleCount: realtimeCycleCount,
       },
       metadata: {
-        symbolCount: 1,
+        symbolCount,
       },
     })
   } catch (error) {

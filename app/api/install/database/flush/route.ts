@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { flushAll, getRedisClient, initRedis } from "@/lib/redis-db"
-import { runMigrations } from "@/lib/redis-migrations"
+import { runMigrations, resetMigrationRunState } from "@/lib/redis-migrations"
 import { SystemLogger } from "@/lib/system-logger"
 import { stopAllProgressionsBeforeReset } from "@/lib/db-reset-helper"
 
@@ -71,6 +71,12 @@ export async function POST(request: NextRequest) {
 
     // Step 3: Re-run migrations
     try {
+      // CRITICAL: FLUSHALL above wiped `_schema_version` / `_migrations_run`
+      // from Redis, but the in-process migration guards (cached promise +
+      // haveMigrationsRun) still think migrations ran. Reset them so
+      // runMigrations() performs a full, clean replay against the now-empty
+      // keyspace instead of returning the stale resolved promise.
+      resetMigrationRunState()
       await runMigrations()
       logs.push("✓ Migrations re-applied after flush")
       console.log("[v0] Migrations re-applied")

@@ -84,6 +84,8 @@ function getDefaultSettings(): Record<string, any> {
     // causing a brief off-by-one between what the UI shows and what the
     // engine actually applies until the user hits Save.
     prehistoric_range_hours: 8,
+    // Prehistoric progression timeout minutes (5-25, default 10)
+    prehistoric_progression_timeout_minutes: 10,
     // P0-4 spec cap — hard cap on concurrent pseudo positions per direction
     // (Long / Short). Kept in the defaults so fresh installs boot with the
     // spec-mandated value instead of an undefined sentinel.

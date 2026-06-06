@@ -1,53 +1,8 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
-import { updateConnection, initRedis, getConnection, setAppSettings, bumpSettingsVersion } from "@/lib/redis-db"
+import { updateConnection, initRedis, getConnection, getRedisClient } from "@/lib/redis-db"
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
-
-/**
- * Map of settings payload keys → flat app_settings keys consumed by
- * StrategyCoordinator and EngineManager. These keys bypass the 5s TTL
- * because bumpSettingsVersion() is called after every PATCH that touches them.
- *
- * The coordinator reads these via getAppSettings() with a 5s in-process TTL.
- * bumpSettingsVersion() increments the version counter so
- * getSettingsVersionCachedSync() detects the change and forces a cache refresh
- * on the next cycle without waiting for the TTL to expire naturally.
- */
-const PROGRESSION_FLAT_KEYS: Record<string, string> = {
-  // PF thresholds
-  baseProfitFactor:  "baseProfitFactor",
-  mainProfitFactor:  "mainProfitFactor",
-  realProfitFactor:  "realProfitFactor",
-  liveProfitFactor:  "liveProfitFactor",
-  // Stage min-pos eval thresholds
-  mainEvalPosCount:  "mainEvalPosCount",
-  realEvalPosCount:  "realEvalPosCount",
-  stageMinPosCountBase: "stageMinPosCountBase",
-  stageMinPosCountMain: "stageMinPosCountMain",
-  stageMinPosCountReal: "stageMinPosCountReal",
-  // Block variant
-  blockVolumeRatio:  "blockVolumeRatio",
-  blockMaxStack:     "blockMaxStack",
-  // Axis toggles
-  axisPrevEnabled:   "axisPrevEnabled",
-  axisPrevMaxWindow: "axisPrevMaxWindow",
-  axisLastEnabled:   "axisLastEnabled",
-  axisLastMaxWindow: "axisLastMaxWindow",
-  axisContEnabled:   "axisContEnabled",
-  axisContMaxWindow: "axisContMaxWindow",
-  axisPauseEnabled:  "axisPauseEnabled",
-  axisPauseMaxWindow:"axisPauseMaxWindow",
-  // Variant toggles
-  variantTrailingEnabled: "variantTrailingEnabled",
-  variantBlockEnabled:    "variantBlockEnabled",
-  variantDcaEnabled:      "variantDcaEnabled",
-  variantPauseEnabled:    "variantPauseEnabled",
-  // Hedge / accumulation
-  hedgeEnabled:         "hedgeEnabled",
-  neutralizeEnabled:    "neutralizeEnabled",
-  realAccumulationEnabled: "realAccumulationEnabled",
-}
 
 export async function GET(
   request: NextRequest,
@@ -122,25 +77,6 @@ export async function PUT(
 
     await updateConnection(id, updated)
 
-    // ── Write flat app_settings keys for all progression-relevant fields ──
-    // Same rationale as the PATCH handler — coordinator reads flat keys from
-    // getAppSettings(); bumpSettingsVersion() invalidates the 5s cache.
-    if (body.settings && typeof body.settings === "object") {
-      const flatUpdate: Record<string, any> = {}
-      for (const [payloadKey, appKey] of Object.entries(PROGRESSION_FLAT_KEYS)) {
-        const val = body.settings[payloadKey]
-        if (val !== undefined) flatUpdate[appKey] = val
-      }
-      if (Object.keys(flatUpdate).length > 0) {
-        try {
-          await setAppSettings(flatUpdate)
-          await bumpSettingsVersion()
-        } catch (settingsErr) {
-          console.warn("[v0] [Settings PUT] flat app_settings write failed:", settingsErr)
-        }
-      }
-    }
-
     // Full propagation: notify + fast-path apply + recoordinate
     // (start/stop/hot-reload as the new state dictates). See
     // lib/connection-recoordinator.ts for the design rationale.
@@ -190,23 +126,33 @@ export async function PATCH(
 
     await updateConnection(id, updated)
 
-    // ── Write flat app_settings keys for all progression-relevant fields ──
-    // StrategyCoordinator reads these directly via getAppSettings() with a 5s
-    // in-process TTL. bumpSettingsVersion() invalidates that cache immediately
-    // so the next engine cycle picks up the new values without delay.
-    const flatAppSettingsUpdate: Record<string, any> = {}
-    for (const [payloadKey, appKey] of Object.entries(PROGRESSION_FLAT_KEYS)) {
-      // Check both the incoming partial payload AND the merged settings blob
-      const val = settings[payloadKey] ?? merged[payloadKey]
-      if (val !== undefined) flatAppSettingsUpdate[appKey] = val
-    }
-    if (Object.keys(flatAppSettingsUpdate).length > 0) {
-      try {
-        await setAppSettings(flatAppSettingsUpdate)
-        await bumpSettingsVersion()
-      } catch (settingsErr) {
-        console.warn("[v0] [Settings PATCH] flat app_settings write failed:", settingsErr)
+    // ── Flat eval-knob hash mirror (CRITICAL) ───────────────────────────
+    // The strategy coordinator and detailed-tracking read the per-eval
+    // knobs straight off the `connection_settings:{id}` Redis HASH via
+    // hgetall — NOT from the connection object's nested JSON. updateConnection
+    // only persists the connection hash (`connection:{id}`), so without this
+    // mirror the engine never sees operator changes and silently runs the
+    // built-in defaults (prevPosMinCount=5, prevPosWindow=25, etc.). Mirror
+    // every flat scalar the merged payload carries so the coordinator's
+    // 30s-cached hgetall picks them up on the next refresh window. Values
+    // are stringified because the emulator hash stores strings.
+    try {
+      const flatKnobs: Record<string, string> = {}
+      const knobKeys = [
+        "prevPosMinCount",
+        "prevPosWindow",
+        "mainEvalPosCount",
+        "realEvalPosCount",
+      ] as const
+      for (const k of knobKeys) {
+        const v = (merged as Record<string, unknown>)[k]
+        if (typeof v === "number" && Number.isFinite(v)) flatKnobs[k] = String(v)
       }
+      if (Object.keys(flatKnobs).length > 0) {
+        await getRedisClient().hset(`connection_settings:${id}`, flatKnobs)
+      }
+    } catch (mirrorErr) {
+      console.error("[v0] [Settings] eval-knob hash mirror failed:", mirrorErr)
     }
 
     // Full propagation. PATCH only ships a partial settings payload, so

@@ -39,7 +39,7 @@ export async function GET(request: Request) {
       .keys(`live:position:live:${connectionId}:*`)
       .catch(() => [] as string[])
     const altPositions: any[] = []
-    const seenIds = new Set<string>([...open.map(p => p.id), ...closed.map(p => p.id)])
+    const seenIds = new Set<string>([...open.map(p => p.id!).filter(Boolean), ...closed.map(p => p.id!).filter(Boolean)])
     for (const key of altKeys) {
       try {
         const raw = await client.get(key)

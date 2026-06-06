@@ -80,6 +80,18 @@ export interface CoordinationSettings {
   prevPosMinCount: number // 1..50, default 5
 
   /**
+   * ── Base PF rolling-window size ─────────────────────────────────────
+   * The eval gates average historic Profit Factor over the LAST N closed
+   * positions of each (indication × direction) bucket — not the lifetime
+   * mean. This is N. A tighter window reacts faster to a strategy that has
+   * started degrading; a wider one is steadier but stickier. Must be ≥
+   * prevPosMinCount to be meaningful (the blend only activates once a
+   * bucket has prevPosMinCount samples). Range 5..200 step 5, default 25.
+   * Backed by `connection_settings:{conn}.prevPosWindow`.
+   */
+  prevPosWindow: number
+
+  /**
    * ── Main-stage validation min position-count ───────────────────────
    * Operator spec: At Main, only Base Sets whose `entryCount >=
    * mainEvalPosCount` are run through PF + DDT validation. Sets with
@@ -115,6 +127,7 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
   blockVolumeRatio: 1.0,
   blockMaxStack:    3,
   prevPosMinCount:   5,
+  prevPosWindow:    25,
   mainEvalPosCount: 15,
   realEvalPosCount: 10,
 }
@@ -664,6 +677,42 @@ export function StrategyCoordinationSection({
               Pipeline dashboard tile.
             </p>
           </div>
+
+          {/* Cumulative last-N window — feeds BOTH windowed PF and DDT */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <Label className="text-sm font-semibold">
+                PF / DDT window (last N positions)
+              </Label>
+              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                default 25
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.prevPosWindow]}
+                min={5}
+                max={200}
+                step={5}
+                onValueChange={(v) =>
+                  onChange({ ...value, prevPosWindow: v[0] })
+                }
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-10 text-right">
+                {value.prevPosWindow}
+              </span>
+            </div>
+            <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
+              One cumulative window over the{" "}
+              <strong>last N completed positions</strong> of each (indication ×
+              direction) bucket. Both the historic Profit Factor and the
+              average Drawdown-Time are computed over this same sample — not the
+              lifetime mean. A tighter window reacts faster when a strategy
+              starts degrading; a wider window is steadier but slower to demote
+              a fading Set. Should be ≥ the min-blend threshold above.
+            </p>
+          </div>
         </CardContent>
       </Card>
       {/* ── Stage Validation Position-Count card ─────────────────────
@@ -766,6 +815,7 @@ export function StrategyCoordinationSection({
               </span>
             </div>
           </div>
+
         </CardContent>
       </Card>
     </div>

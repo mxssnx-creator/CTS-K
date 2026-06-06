@@ -433,10 +433,14 @@ async function testMarketOrderPlacement(
     }
 
     const testCases = [
-      { symbol: "DOGE/USDT", qty: 1 },        // ≈ $0.10 notional
-      { symbol: "SHIB/USDT", qty: 100000 },   // ≈ $1 notional
-      { symbol: "PEPE/USDT", qty: 100000 },   // ≈ $1 notional
-      { symbol: "BTC/USDT", qty: 0.0001 },    // ≈ $10 notional (last resort)
+      // 3 Symbols minimal volume test (ultra cheap tokens → minimal notional orders on bingx-x01)
+      { symbol: "PLAYSOUT/USDT", qty: 100 },
+      { symbol: "XAN/USDT", qty: 100 },
+      { symbol: "BSB/USDT", qty: 100 },
+      { symbol: "DOGE/USDT", qty: 1 },
+      { symbol: "SHIB/USDT", qty: 100000 },
+      { symbol: "PEPE/USDT", qty: 100000 },
+      { symbol: "BTC/USDT", qty: 0.0001 },
     ]
 
     let result = null

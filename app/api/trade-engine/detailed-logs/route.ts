@@ -239,7 +239,7 @@ export async function GET(request: Request) {
             getStrategyEvaluationCounters(client, conn.id),
             client.scard(`base_pseudo:${conn.id}`).catch(() => 0),
             client.scard(`main_pseudo:${conn.id}`).catch(() => 0),
-            client.scard(`real_pseudo:${conn.id}`).catch(() => 0),
+            client.scard(`real_pseudo:${conn.id}`).catch(() => 0), // active/open validated Real stage only (reconciled)
             client.scard(`base_pseudo:${conn.id}:direction`).catch(() => 0),
             client.scard(`base_pseudo:${conn.id}:move`).catch(() => 0),
             client.scard(`base_pseudo:${conn.id}:active`).catch(() => 0),

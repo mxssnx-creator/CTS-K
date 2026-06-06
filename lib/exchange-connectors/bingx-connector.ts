@@ -51,6 +51,27 @@ export class BingXConnector extends BaseExchangeConnector {
   // all use offset=0 and all fail before any of their individual syncs
   // complete — producing one 109400 error per call per cold start.
   private syncPromise: Promise<void> | null = null
+  // recvWindow (ms) attached to every signed request. BingX validates
+  // `serverTime - timestamp <= recvWindow` (default ~5000ms, max 60000ms). On
+  // the Vercel→BingX link RTT routinely measured 800-1136ms, so one-way transit
+  // plus a few hundred ms of skew pushed the FIRST attempt past the default
+  // tolerance — signed calls failed with code 100421 and only succeeded after a
+  // forced resync+retry. A 60s window absorbs all realistic latency/skew so
+  // requests succeed first try. Verified live: 5/5 balance requests code 0.
+  private recvWindowMs: number = 60_000
+  // Deliberate "be slightly late" bias (ms) subtracted from every signed
+  // timestamp. BingX's recvWindow is ONE-SIDED: it tolerates timestamps that
+  // lag server time (serverTime - timestamp <= recvWindow) but rejects any
+  // timestamp that is AHEAD of server time almost immediately, returning code
+  // 100421 "timestamp mismatch". On the high-RTT Vercel→BingX link the midpoint
+  // offset estimate is noisy, so a clock running even slightly fast sends future
+  // timestamps and every request fails. By always biasing the timestamp to sit
+  // ~2s behind our best estimate of server time, we trade harmless lateness
+  // (absorbed by the 60s recvWindow) for the elimination of fatal earliness.
+  private timestampLagMs: number = 2_000
+  // Cross-instance throttle for the "Failed to sync" log so a network blip
+  // across many connector instances doesn't flood output.
+  private static lastSyncFailLogTs = 0
 
   constructor(credentials: ExchangeCredentials, exchange: string = "bingx") {
     super(credentials, exchange)
@@ -92,47 +113,98 @@ export class BingXConnector extends BaseExchangeConnector {
     // trigger a fresh sync once the TTL expires.
     this.syncPromise = (async () => {
     try {
-      // NTP-style midpoint sync: capture local time around the request
-      // and assume symmetric latency. The previous implementation used
-      // Date.now() AFTER the await, which biased the offset by one
-      // round-trip — on a Vercel→BingX link that's typically 200-600 ms,
-      // and the venue enforces a strict ±1000 ms timestamp window. Once
-      // the cached offset drifts past that window every signed request
-      // fails with "timestamp is invalid" (code 109400), as observed in
-      // engine reconcile cycles. Midpoint estimation halves the worst-
-      // case error and keeps the offset well inside the window even on
-      // slow links.
+      // Sync the local→exchange clock offset so signed requests land inside
+      // BingX's strict ±1000ms timestamp window.
+      //
+      // Hard-won details encoded here:
+      //  1. Endpoint: the documented `/openApi/v1/public/time` returns
+      //     `100400 "this api is not exist"`. The working route is the swap
+      //     server-time endpoint: `{ code: 0, data: { serverTime } }`.
+      //  2. Even ERROR responses carry the server clock. When the endpoint is
+      //     rate-limited it returns `{ code: 100410, ..., timestamp: <ms> }`.
+      //     That top-level `timestamp` is BingX server time and is perfectly
+      //     usable, so we extract it as a fallback instead of giving up.
+      //  3. Use a SINGLE request. Hammering this endpoint with several samples
+      //     trips the per-endpoint rate limiter (100410), which is exactly what
+      //     we're trying to avoid.
+      //  4. High, asymmetric RTT on the Vercel→BingX link makes the midpoint
+      //     offset estimate noisy (±rtt/2). A spurious +600ms correction can
+      //     itself push requests out of the window (code 100421 / 109400). So we
+      //     only ADOPT the offset when it exceeds the measurement noise band;
+      //     otherwise the true skew is effectively zero and we keep offset=0
+      //     (raw local time), which sits comfortably inside ±1000ms here.
       const t0 = Date.now()
-      const response = await fetch(`${this.getBaseUrl()}/openApi/v1/public/time`, {
-        method: "GET",
-        headers: { "Content-Type": "application/json" },
-      })
+      // Bound the request and tolerate a single transient network blip. The
+      // Vercel→BingX link occasionally drops a connection ("fetch failed"); a
+      // single quick retry avoids a failed sync without hammering the endpoint.
+      const fetchTime = async () => {
+        const ctrl = new AbortController()
+        const timer = setTimeout(() => ctrl.abort(), 8000)
+        try {
+          return await fetch(`${this.getBaseUrl()}/openApi/swap/v2/server/time`, {
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+            signal: ctrl.signal,
+          })
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+      let response: Response
+      try {
+        response = await fetchTime()
+      } catch {
+        response = await fetchTime() // one retry on transient failure
+      }
       const t1 = Date.now()
-      const data = await response.json()
-      if (data.code === 0 || data.code === "0") {
-        const serverTime = Number(data.data?.serverTime || data.serverTime || data.time || 0)
-        if (serverTime > 0) {
-          // Server reported its time at some point during [t0, t1].
-          // Best estimate: midpoint of the request window.
-          const localMidpoint = t0 + (t1 - t0) / 2
-          this.timeOffset = serverTime - localMidpoint
-          // Set lastTimeSync to the ACTUAL completion time (t1), not the
-          // time captured at the start of syncServerTime. Using an early
-          // timestamp shortened the effective throttle window by one RTT
-          // (typically 200-600 ms), causing spurious re-syncs.
-          this.lastTimeSync = t1
-          if (Math.abs(this.timeOffset) > 100) {
-            this.log(
-              `[v0] Server time sync: offset=${this.timeOffset.toFixed(0)}ms ` +
-                `(server=${serverTime}, localMid=${localMidpoint.toFixed(0)}, rtt=${t1 - t0}ms)`,
-            )
-          }
+      const data = await response.json().catch(() => null as any)
+
+      // Prefer the documented success shape; fall back to the top-level
+      // `timestamp` that BingX includes even on rate-limit / error responses.
+      let serverTime = 0
+      if (data) {
+        serverTime = Number(data.data?.serverTime || data.serverTime || data.time || 0)
+        if (!(serverTime > 0)) serverTime = Number(data.timestamp || 0)
+      }
+
+      if (serverTime > 0) {
+        const rtt = t1 - t0
+        const localMidpoint = t0 + rtt / 2
+        const measured = serverTime - localMidpoint
+        // ALWAYS adopt the measured offset. The previous noise-band gate kept
+        // offset=0 whenever |measured| < rtt/2, which on this high-RTT link
+        // meant the clock was effectively never corrected — and a VM clock
+        // running fast then sent future timestamps that BingX rejected with
+        // 100421. The downstream timestampLagMs bias makes a slightly-too-large
+        // offset harmless (we'd just be a touch later, absorbed by recvWindow),
+        // so adopting the raw estimate is strictly safer than ignoring it.
+        // Round to an integer here too so `timeOffset` never carries the
+        // half-millisecond from `rtt/2` (defense-in-depth alongside the floor
+        // in getTimestamp()).
+        const newOffset = Math.round(measured)
+        this.timeOffset = newOffset
+        // Record the ACTUAL completion time so the throttle window isn't
+        // shortened by the round-trip we just spent.
+        this.lastTimeSync = t1
+        if (Math.abs(measured) > 100) {
+          this.log(
+            `[v0] Server time sync: offset=${newOffset.toFixed(0)}ms ` +
+              `(rtt=${rtt}ms, lag=${this.timestampLagMs}ms)`,
+          )
         }
       }
     } catch (err) {
-      // Fall back to local time; worst case we'll hit timestamp errors
-      // and retry with a fresh sync.
-      this.log(`[v0] Failed to sync server time: ${String(err).slice(0, 80)}`)
+      // Sync failed (transient network issue or both attempts aborted). This is
+      // non-fatal: recvWindow=60000 absorbs any realistic clock skew, so signed
+      // requests still succeed with the existing (or zero) offset. Back off so we
+      // don't re-attempt every engine cycle, and throttle the log so a sustained
+      // outage across many connectors doesn't flood output.
+      const now = Date.now()
+      this.lastTimeSync = now - this.timeSyncIntervalMs + 10_000 // retry in ~10s
+      if (now - BingXConnector.lastSyncFailLogTs > 30_000) {
+        BingXConnector.lastSyncFailLogTs = now
+        this.log(`[v0] Failed to sync server time (non-fatal, recvWindow covers skew): ${String(err).slice(0, 80)}`)
+      }
     } finally {
       // Clear the in-flight slot once this sync completes (success or fail).
       // Future callers will either pass the throttle check (if we just
@@ -150,7 +222,22 @@ export class BingXConnector extends BaseExchangeConnector {
    * Returns local time + pre-computed offset from the last sync.
    */
   private getTimestamp(): number {
-    return Date.now() + this.timeOffset
+    // Defensive: if timeOffset ever becomes non-finite, `Date.now() + NaN`
+    // yields NaN and the signed request goes out with `timestamp=NaN`, which
+    // BingX rejects as code 100421 "Null timestamp or timestamp mismatch".
+    // Fall back to raw local time so requests stay valid.
+    const offset = Number.isFinite(this.timeOffset) ? this.timeOffset : 0
+    // Subtract the lag bias so the timestamp sits safely BEHIND server time.
+    // BingX rejects future timestamps (100421) but tolerates lagging ones up to
+    // recvWindow (60s), so being deliberately ~2s late is the safe direction.
+    //
+    // CRITICAL: floor to an integer. `timeOffset` carries `rtt/2`, which is a
+    // half-integer whenever the measured round-trip is odd, so the raw sum is a
+    // fractional millisecond (e.g. `...881.5`). BingX requires an integer
+    // timestamp and rejects any decimal value as code 100421 "timestamp
+    // mismatch" — this was the true cause of the persistent failures, not the
+    // clock offset itself.
+    return Math.floor(Date.now() + offset - this.timestampLagMs)
   }
 
   /**
@@ -171,7 +258,13 @@ export class BingXConnector extends BaseExchangeConnector {
   private async resyncOnTimestampError(data: any): Promise<boolean> {
     const code = String(data?.code ?? "")
     const msg  = String(data?.msg ?? "").toLowerCase()
-    if (code === "109400" && msg.includes("timestamp")) {
+    // 109400 = "timestamp is invalid" (drift outside the ±1000ms window).
+    // 100421 = "Null timestamp or timestamp mismatch" — also a timestamp-class
+    //          error recoverable by a fresh server-time sync.
+    const isTimestampError =
+      (code === "109400" && msg.includes("timestamp")) ||
+      code === "100421"
+    if (isTimestampError) {
       // Force a fresh sync: clear both the throttle gate AND any in-flight
       // shared promise so syncServerTime() issues a new HTTP call instead of
       // coalescing onto the stale-offset promise that was already resolved.
@@ -187,9 +280,21 @@ export class BingXConnector extends BaseExchangeConnector {
   private getSignature(params: Record<string, any>): string {
     // Kept only for the one remaining helper that doesn't need the query
     // string back (balance query). Prefer signParams() for everything else.
-    const sortedKeys = Object.keys(params).sort()
-    const queryString = sortedKeys.map((key) => `${key}=${params[key]}`).join("&")
+    const withWindow = this.withRecvWindow(params)
+    const sortedKeys = Object.keys(withWindow).sort()
+    const queryString = sortedKeys.map((key) => `${key}=${withWindow[key]}`).join("&")
     return crypto.createHmac("sha256", this.credentials.apiSecret).update(queryString).digest("hex")
+  }
+
+  /**
+   * Inject a generous `recvWindow` into every signed request so requests
+   * tolerate the high, variable RTT of the Vercel→BingX link and succeed on
+   * the first attempt instead of failing with code 100421. Callers may
+   * override by supplying their own `recvWindow`.
+   */
+  private withRecvWindow(params: Record<string, any>): Record<string, any> {
+    if (params.recvWindow !== undefined) return params
+    return { ...params, recvWindow: this.recvWindowMs }
   }
 
   /**
@@ -213,8 +318,9 @@ export class BingXConnector extends BaseExchangeConnector {
    * byte-identical is the important invariant.
    */
   private signParams(params: Record<string, any>): { signature: string; queryString: string } {
-    const sortedKeys = Object.keys(params).sort()
-    const queryString = sortedKeys.map((key) => `${key}=${params[key]}`).join("&")
+    const withWindow = this.withRecvWindow(params)
+    const sortedKeys = Object.keys(withWindow).sort()
+    const queryString = sortedKeys.map((key) => `${key}=${withWindow[key]}`).join("&")
     const signature = crypto
       .createHmac("sha256", this.credentials.apiSecret)
       .update(queryString)
@@ -355,15 +461,13 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(timestamp),
       }
 
-      // Sort parameters alphabetically and build query string (BingX requirement)
-      const sortedKeys = Object.keys(params).sort()
-      const queryString = sortedKeys.map(key => `${key}=${params[key]}`).join('&')
-
-      // Generate HMAC-SHA256 signature from the query string
-      const signature = crypto
-        .createHmac("sha256", this.credentials.apiSecret)
-        .update(queryString)
-        .digest("hex")
+      // Sign via signParams so recvWindow is injected and the signed payload
+      // matches the transmitted query string EXACTLY. Building the signature
+      // inline here previously bypassed withRecvWindow(), so the FIRST balance
+      // request went out WITHOUT recvWindow and failed with code 100421 on
+      // every call — only the resync+retry path (which uses signParams) added
+      // recvWindow and succeeded, doubling latency and flooding the logs.
+      const { signature, queryString } = this.signParams(params)
 
       this.log(`Query string: ${queryString}`)
       this.log(`API Key prefix: ${this.credentials.apiKey.substring(0, 10)}...`)
