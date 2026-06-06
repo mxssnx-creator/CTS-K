@@ -3496,12 +3496,9 @@ export class TradeEngineManager {
   private async setRunningFlag(isRunning: boolean): Promise<void> {
     try {
       const flagKey = `engine_is_running:${this.connectionId}`
-      if (isRunning) {
-        await setSettings(flagKey, "true")
-      } else {
-        await setSettings(flagKey, "false")
-      }
-      console.log(`[v0] [Engine Flag] ${flagKey}: ${isRunning ? "true" : "false"}`)
+      const client = getRedisClient()
+      await client.set(flagKey, isRunning ? "1" : "0")
+      console.log(`[v0] [Engine Flag] ${flagKey}=${isRunning ? "1" : "0"}`)
     } catch (error) {
       console.error("[v0] Failed to set running flag:", error)
     }
