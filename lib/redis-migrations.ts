@@ -23,8 +23,34 @@ import { getRedisClient, ensureCoreRedis, setMigrationsRun, haveMigrationsRun } 
  *   indexes). Calling this before re-running migrations forces a full,
  *   clean replay against the now-empty keyspace.
  */
+/**
+ * Cross-module-scope coalescing guard.
+ *
+ * In Next.js dev each route bundle can load its own copy of this module, so a
+ * plain module-level `let migrationRunPromise` is NOT shared between routes.
+ * During a startup burst dozens of routes each saw their own `null` promise
+ * and launched a FULL v0→v22 migration concurrently (observed: 54 parallel
+ * runs), starving the event loop and tripping realtime-cycle deadlines.
+ *
+ * Hoisting the in-flight promise onto globalThis makes every module scope
+ * coalesce onto a single execution — the true single-flight the comment in
+ * runMigrations() always intended.
+ */
+const globalMigrationGuard = globalThis as unknown as {
+  __migration_run_promise?: Promise<{ success: boolean; message: string; version: number }> | null
+}
+
+function getMigrationRunPromise() {
+  return globalMigrationGuard.__migration_run_promise ?? null
+}
+function setMigrationRunPromise(
+  p: Promise<{ success: boolean; message: string; version: number }> | null,
+) {
+  globalMigrationGuard.__migration_run_promise = p
+}
+
 export function resetMigrationRunState(): void {
-  migrationRunPromise = null
+  setMigrationRunPromise(null)
   // Clear the one-shot diagnostic set so post-reset boot logs are emitted
   // again (e.g. "already at latest", operator_stopped honoured).
   ensureBootstrapDiag.clear()
@@ -43,7 +69,8 @@ interface Migration {
   down: (client: any) => Promise<void>
 }
 
-let migrationRunPromise: Promise<{ success: boolean; message: string; version: number }> | null = null
+// NOTE: the in-flight coalescing promise now lives on globalThis (see
+// globalMigrationGuard above) so it is shared across all dev module scopes.
 
 const migrations: Migration[] = [
   {
@@ -1616,12 +1643,14 @@ export async function runMigrations(): Promise<{ success: boolean; message: stri
   // runMigrationsInternal(). The promise is intentionally kept after resolution —
   // clearing it in `finally` caused a race where a second caller that had just
   // started awaiting would see null and immediately start a second migration run.
-  if (migrationRunPromise) {
-    return migrationRunPromise
+  const existing = getMigrationRunPromise()
+  if (existing) {
+    return existing
   }
 
-  migrationRunPromise = runMigrationsInternal()
-  return migrationRunPromise
+  const promise = runMigrationsInternal()
+  setMigrationRunPromise(promise)
+  return promise
 }
 
 async function runMigrationsInternal(): Promise<{ success: boolean; message: string; version: number }> {

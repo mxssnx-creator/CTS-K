@@ -58,7 +58,11 @@ export async function GET(req: Request) {
     // The engine-manager writes strategy_cycle_count to progression:{connId}
     // every single cycle. settings:trade_engine_state is only persisted every 100 cycles.
     let strategyCycleCount = parseInt(progHash.strategy_cycle_count || "0", 10)
-    let realtimeCycleCount = 0
+    // realtime_cycle_count is written to the progression hash every cycle by the
+    // live driver (cron/generate-indications). Read it here directly — the old
+    // code only read it from the settings:trade_engine_state fallback, which
+    // never runs once strategyCycleCount > 0, so the realtime tiles stayed 0.
+    let realtimeCycleCount = parseInt(progHash.realtime_cycle_count || "0", 10)
     let cycleSuccessRate = parseFloat(progHash.cycle_success_rate || "100")
 
     // Fallback: read from settings:trade_engine_state if progression hash is empty
@@ -66,7 +70,9 @@ export async function GET(req: Request) {
       try {
         const stateHash = await redis.hgetall(`settings:trade_engine_state:${connectionId}`) || {}
         strategyCycleCount = parseInt(stateHash.strategy_cycle_count || "0", 10)
-        realtimeCycleCount = parseInt(stateHash.realtime_cycle_count || "0", 10)
+        if (realtimeCycleCount === 0) {
+          realtimeCycleCount = parseInt(stateHash.realtime_cycle_count || "0", 10)
+        }
         if (!cycleSuccessRate) {
           cycleSuccessRate = parseFloat(stateHash.cycle_success_rate || "100")
         }
