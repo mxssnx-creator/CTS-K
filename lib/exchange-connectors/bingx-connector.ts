@@ -178,7 +178,10 @@ export class BingXConnector extends BaseExchangeConnector {
         // 100421. The downstream timestampLagMs bias makes a slightly-too-large
         // offset harmless (we'd just be a touch later, absorbed by recvWindow),
         // so adopting the raw estimate is strictly safer than ignoring it.
-        const newOffset = measured
+        // Round to an integer here too so `timeOffset` never carries the
+        // half-millisecond from `rtt/2` (defense-in-depth alongside the floor
+        // in getTimestamp()).
+        const newOffset = Math.round(measured)
         this.timeOffset = newOffset
         // Record the ACTUAL completion time so the throttle window isn't
         // shortened by the round-trip we just spent.
@@ -227,7 +230,14 @@ export class BingXConnector extends BaseExchangeConnector {
     // Subtract the lag bias so the timestamp sits safely BEHIND server time.
     // BingX rejects future timestamps (100421) but tolerates lagging ones up to
     // recvWindow (60s), so being deliberately ~2s late is the safe direction.
-    return Date.now() + offset - this.timestampLagMs
+    //
+    // CRITICAL: floor to an integer. `timeOffset` carries `rtt/2`, which is a
+    // half-integer whenever the measured round-trip is odd, so the raw sum is a
+    // fractional millisecond (e.g. `...881.5`). BingX requires an integer
+    // timestamp and rejects any decimal value as code 100421 "timestamp
+    // mismatch" — this was the true cause of the persistent failures, not the
+    // clock offset itself.
+    return Math.floor(Date.now() + offset - this.timestampLagMs)
   }
 
   /**
