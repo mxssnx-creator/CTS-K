@@ -303,6 +303,23 @@ export async function getStrategyTracking(
   const settings = (settingsHash || {}) as Record<string, string>
   const activeStrats = (activeHash || {}) as Record<string, string>
 
+  // Canonical per-stage Max-Drawdown-Time ceilings (the SAME source the
+  // engine DDT gate reads in `strategy-coordinator.loadAppPFThresholds`):
+  // app-level `maxDrawdownTime{Main,Real,Live}Hours`, stored in hours,
+  // displayed here in minutes to match `avgDrawdownTime`. Default 4h. This
+  // keeps the dashboard threshold identical to what the engine enforces
+  // (the old connection-hash `maxDrawdownTimeMain/Real` keys were never
+  // written, so they showed stale defaults that didn't match the gate).
+  const { getAppSettings } = await import("@/lib/redis-db")
+  const appSettings = (await getAppSettings().catch(() => ({}))) || {}
+  const ddtHoursToMin = (raw: unknown, fallbackHours: number): number => {
+    const n = Number(raw)
+    const h = !Number.isFinite(n) || n <= 0 ? fallbackHours : Math.max(1, Math.min(72, n))
+    return h * 60
+  }
+  const mainDdtCeilingMin = ddtHoursToMin((appSettings as any).maxDrawdownTimeMainHours, 4)
+  const realDdtCeilingMin = ddtHoursToMin((appSettings as any).maxDrawdownTimeRealHours, 4)
+
   // Variant breakdowns
   const mainVariants = await readVariantBreakdown(client, connectionId, "main")
   const realVariants = await readVariantBreakdown(client, connectionId, "real")
@@ -389,7 +406,7 @@ export async function getStrategyTracking(
       avgProfitFactor: Number(main.avg_profit_factor || "0"),
       avgDrawdownTime: Number(main.avg_drawdown_time || "0"),
       minProfitFactor: Number(settings.minProfitFactorMain || "1.2"),
-      maxDrawdownTime: Number(settings.maxDrawdownTimeMain || "240"),
+      maxDrawdownTime: mainDdtCeilingMin,
       variants: mainVariants,
     },
     real: {
@@ -403,7 +420,7 @@ export async function getStrategyTracking(
       avgDrawdownTime: Number(real.avg_drawdown_time || "0"),
       avgPosPerSet: Number(real.avg_pos_per_set || "0"),
       minProfitFactor: Number(settings.minProfitFactorReal || "1.4"),
-      maxDrawdownTime: Number(settings.maxDrawdownTimeReal || "960"),
+      maxDrawdownTime: realDdtCeilingMin,
       axisAccumulation,
       variantsAccumulated: realVariants,
       fourPerspective: {

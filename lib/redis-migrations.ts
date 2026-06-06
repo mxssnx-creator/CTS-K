@@ -1098,10 +1098,9 @@ const migrations: Migration[] = [
       // is emulated with hgetall + conditional hset.
       const SPEC_DEFAULTS: Record<string, string> = {
         prevPosMinCount: "5",   // min closed positions before historic blend activates
-        prevPosWindow:   "25",  // PF rolling-window size (last-N positions)
+        prevPosWindow:   "25",  // single cumulative last-N window feeding BOTH windowed PF and DDT
         mainEvalPosCount: "15", // Main-stage validation min position count
         realEvalPosCount: "10", // Real-stage validation min position count
-        ddtCapPositions: "550", // DDT averaging cap — "available but max 550 pos"
       }
 
       // Union of every connection id source so we don't miss disabled /
@@ -1154,6 +1153,82 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "22")
+    },
+  },
+  {
+    name: "024-ddt-window-unify-and-stage-thresholds",
+    version: 24,
+    up: async (client: any) => {
+      await client.set("_schema_version", "24")
+
+      // ── Part A: remove the orphaned `ddtCapPositions` hash field ────────
+      // PF and DDT now share ONE cumulative last-N window (`prevPosWindow`).
+      // The separate `ddtCapPositions` knob was a misunderstanding (DDT is a
+      // *time* ceiling, not a position count) and has been removed from the
+      // UI, dialog, PATCH route, coordinator, and the v23 seed. Strip the
+      // now-dead field from every connection_settings hash so stale values
+      // can't confuse future readers. Idempotent: hdel on an absent field is
+      // a harmless no-op.
+      const idSet = new Set<string>()
+      try {
+        const connKeys = (await client.keys("connection:*")) || []
+        for (const k of connKeys) {
+          if (typeof k !== "string") continue
+          if (k.startsWith("connection_settings:")) continue
+          const id = k.slice("connection:".length)
+          if (id) idSet.add(id)
+        }
+      } catch { /* keys() unavailable — fall through */ }
+      for (const setName of ["connections", "connections:main:enabled"]) {
+        try {
+          const ids = (await client.smembers(setName)) || []
+          for (const id of ids) if (typeof id === "string" && id) idSet.add(id)
+        } catch { /* missing set */ }
+      }
+      let stripped = 0
+      for (const connId of idSet) {
+        try {
+          const removed = await client.hdel(`connection_settings:${connId}`, "ddtCapPositions")
+          if (Number(removed) > 0) stripped++
+        } catch { /* hdel unsupported / absent — ignore */ }
+      }
+
+      // ── Part B: seed per-stage Max Drawdown-Time ceilings (hours) ───────
+      // The DDT gate threshold is now operator-tunable per stage and was
+      // previously never loaded from settings (the engine ran a hardcoded
+      // 5h). Per-position hold is up to ~2h, so the default ceiling is 4h
+      // per stage. Seed the canonical `app_settings` hash if absent, so the
+      // gate has explicit, non-stale values from first boot. Idempotent via
+      // hgetall + conditional hset (no hsetnx in the emulator).
+      const APP_DDT_DEFAULTS: Record<string, string> = {
+        maxDrawdownTimeMainHours: "4",
+        maxDrawdownTimeRealHours: "4",
+        maxDrawdownTimeLiveHours: "4",
+      }
+      let appSeeded = 0
+      try {
+        const existing = (await client.hgetall("app_settings").catch(() => ({}))) as
+          | Record<string, string>
+          | null
+        const have = existing || {}
+        const toWrite: Record<string, string> = {}
+        for (const [field, value] of Object.entries(APP_DDT_DEFAULTS)) {
+          if (have[field] === undefined || have[field] === null || have[field] === "") {
+            toWrite[field] = value
+          }
+        }
+        if (Object.keys(toWrite).length > 0) {
+          await client.hset("app_settings", toWrite)
+          appSeeded = Object.keys(toWrite).length
+        }
+      } catch { /* app_settings unavailable — engine falls back to 4h default */ }
+
+      console.log(
+        `[v0] Migration 024: unified PF/DDT window — stripped ddtCapPositions from ${stripped} connections, seeded ${appSeeded} app-level DDT-threshold defaults`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "23")
     },
   },
 ]
