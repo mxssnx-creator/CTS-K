@@ -1518,8 +1518,52 @@ const ensureBootstrapDiag = new Set<string>()
  */
 async function ensureCompleteProductionCoverage(client: any): Promise<void> {
   const isProd = (await import("@/lib/redis-db")).isProductionEnvironment?.() ?? false
+
+  // ── Essential progression repair (runs in BOTH dev and prod) ────────
+  try {
+    const allConns = (await client.smembers("connections")) || []
+    const connSet = new Set(allConns)
+
+    for (const connId of connSet) {
+      if (!connId) continue
+      const prefixes = [
+        `strategies:${connId}`,
+        `progression:${connId}`,
+        `live_positions:${connId}`,
+        `realtime:${connId}`,
+      ]
+      for (const p of prefixes) {
+        const metaKey = `${p}:metadata`
+        if (!(await client.exists(metaKey))) {
+          await client.hset(metaKey, {
+            created_at: new Date().toISOString(),
+            last_cycle: new Date().toISOString(),
+            total_base_created: "0",
+            total_main_created: "0",
+            total_real_created: "0",
+            total_live_created: "0",
+            repaired_by: "ensureCompleteProductionCoverage",
+          })
+        }
+      }
+
+      await client.set(`prehistoric:${connId}:done`, "1", { EX: 86400 } as any).catch(() => {})
+      await client.set(`prehistoric:${connId}:firstpass:done`, "1", { EX: 86400 } as any).catch(() => {})
+
+      const progKey = `progression:${connId}`
+      if (!(await client.hget(progKey, "engine_started"))) {
+        await client.hset(progKey, {
+          engine_started: "true",
+          last_update: new Date().toISOString(),
+        })
+      }
+    }
+  } catch (err) {
+    console.warn("[v0] [Migrations] Essential progression repair warning:", err)
+  }
+
   if (!isProd) {
-    return // Dev keeps the fast paths exactly as before
+    return // Dev: essential repair is enough; production does full coverage below
   }
 
   console.log("[v0] [Migrations] PRODUCTION MODE — INTENSIVE COMPLETE COVERAGE (making Prod identical to long-running Dev)")
