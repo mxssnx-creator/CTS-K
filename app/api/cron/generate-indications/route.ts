@@ -283,11 +283,22 @@ async function generateIndicationsForConnection(
     }
 
     result.indications = indications.length
-    // NOTE: Do NOT increment indications_count or strategies_count here.
-    // These counters are authoritative in engine-manager during the realtime cycle.
-    // The cron route is a secondary/utility generator and writing to the same counters
-    // creates race conditions and jumped counts. All stats are canonical from realtime.
+    // This cron route is the ACTUAL realtime driver in this deployment — the
+    // engine-manager realtime loop that the comment below once referred to does
+    // not run here (verified: 0 RealtimeProgression markers vs. hundreds of cron
+    // cycles). So the cumulative `indications_count` and the realtime cycle
+    // counters MUST be written here, otherwise the dashboard's total-indications
+    // tile and realtime-progression tiles are permanently stuck at 0. The
+    // earlier "authoritative in engine-manager" note created a coordination gap
+    // where NO writer ever advanced these fields.
+    if (indications.length > 0) {
+      await client.hincrby(progKey, "indications_count", indications.length)
+      await client.hincrby(progKey, "indication_live_cycle_count", 1)
+    }
     await client.hincrby(progKey, "indication_cycle_count", 1)
+    // Mirror the indication cycle as the realtime-progression cycle so the
+    // dashboard's realtime tiles reflect the live cadence of this driver.
+    await client.hincrby(progKey, "realtime_cycle_count", 1)
 
     // ── Strategy generation (proportional to indications that fired) ──────────
     // Base: 1 set per indication type that fired this cycle (varies 1-5 based on market)
@@ -388,14 +399,26 @@ async function generateIndicationsForConnection(
       client.expire(`strategies:${connectionId}:real:passed`,    ttlDay).catch(() => {}),
     ])
 
-    // Cycle metadata
-    const currentCycles = parseInt(
-      ((await client.hgetall(progKey)) || {}).indication_cycle_count || "0",
-      10
-    )
-    const successRate = 95 + Math.random() * 5 // 95-100% success
+    // ── Cycle completion accounting ─────────────────────────────────────
+    // `cycles_completed` / `successful_cycles` were only ever written by
+    // ProgressionStateManager.incrementCycle, which runs inside the
+    // engine-manager realtime loop. That loop does not execute in this
+    // deployment, so the dashboard's "cycles completed" and success-rate
+    // tiles were frozen at 0 / a random placeholder. Since this cron is the
+    // real driver, record real completion here: a cycle that produced at
+    // least one indication is a success, otherwise it is a no-data failure.
+    const cycleSucceeded = indications.length > 0
+    await Promise.all([
+      client.hincrby(progKey, "cycles_completed", 1),
+      cycleSucceeded
+        ? client.hincrby(progKey, "successful_cycles", 1)
+        : client.hincrby(progKey, "failed_cycles", 1),
+    ])
+    const completed = parseInt((await client.hget(progKey, "cycles_completed").catch(() => "0")) || "0", 10)
+    const succeeded = parseInt((await client.hget(progKey, "successful_cycles").catch(() => "0")) || "0", 10)
+    const realSuccessRate = completed > 0 ? (succeeded / completed) * 100 : 100
     await client.hset(progKey, {
-      cycle_success_rate: String(successRate.toFixed(1)),
+      cycle_success_rate: String(realSuccessRate.toFixed(1)),
       last_update: new Date().toISOString(),
       last_symbol: symbol,
       started_at: (await client.hget(progKey, "started_at").catch(() => "")) || String(Date.now()),
