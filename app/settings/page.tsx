@@ -90,7 +90,9 @@ interface Settings {
   realProfitFactor: number
   liveProfitFactor: number
   trailingStopLoss: boolean
-  maxDrawdownTimeHours: number
+  maxDrawdownTimeMainHours: number
+  maxDrawdownTimeRealHours: number
+  maxDrawdownTimeLiveHours: number
 
   // ── Stage minimum position-count evaluation thresholds ──────────────────
   // Per-stage thresholds for how many completed pseudo-positions a Base/Main/
@@ -444,9 +446,11 @@ const initialSettings: Settings = {
 
   // Risk Management
   trailingStopLoss: false,
-  maxDrawdownTimeHours: 24,
+  maxDrawdownTimeMainHours: 4,
+  maxDrawdownTimeRealHours: 4,
+  maxDrawdownTimeLiveHours: 4,
 
-  // ── Stage minimum position-count thresholds ────────────────────────────
+  // ── Stage minimum position-count thresholds ───────────────────��────────
   stageMinPosCountBase: 0,   // 0 = coordinator default (15)
   stageMinPosCountMain: 0,   // 0 = coordinator default (15)
   stageMinPosCountReal: 0,   // 0 = coordinator default (10)

@@ -373,35 +373,32 @@ export async function getPosHistoryBatch(
 /**
  * Average a list of "pnl|ddt" ring records into PosWindowStats.
  *
- * `pfWindow` bounds how many of the most-recent records feed the PF /
- * success-rate / count figures. `ddtWindow` independently bounds how many
- * feed the avgDDT figure — the operator spec wants DDT averaged over its
- * own (larger, ≤550) sample while PF uses a tighter recency window. When
- * `ddtWindow` is omitted it falls back to `pfWindow` (single-window mode).
+ * `window` is the single cumulative "last N positions" sample that feeds
+ * BOTH the PF / success-rate / count figures AND the avgDDT figure. The
+ * operator spec is one rolling window over the most-recent N closed
+ * positions — PF and DDT are two statistics computed over the SAME sample,
+ * not two independently-sized windows. (An earlier revision sized DDT on
+ * its own wider cap; that was a misunderstanding — a position's hold time
+ * is up to ~2h and the DDT *threshold* is a per-stage time ceiling, not a
+ * position count.)
  */
-function deriveWindow(
-  records: string[],
-  pfWindow: number,
-  ddtWindow?: number,
-): PosWindowStats {
+function deriveWindow(records: string[], window: number): PosWindowStats {
   if (!records || records.length === 0) return EMPTY_WINDOW
   // records arrive newest-first (lpush head).
-  const pfN = Math.max(1, pfWindow)
-  const ddtN = Math.max(1, ddtWindow ?? pfWindow)
+  const winN = Math.max(1, window)
   let wins = 0
   let num = 0
   let den = 0
   let n = 0
   let ddtSum = 0
   let ddtCount = 0
-  for (let i = 0; i < records.length; i++) {
+  for (let i = 0; i < records.length && i < winN; i++) {
     const rec = records[i]
     const sep = rec.indexOf("|")
     if (sep < 0) continue
     const pnl = Number(rec.slice(0, sep))
     const ddt = Number(rec.slice(sep + 1))
-    // PF / count window
-    if (i < pfN && Number.isFinite(pnl)) {
+    if (Number.isFinite(pnl)) {
       n++
       if (pnl > 0) {
         wins++
@@ -409,11 +406,11 @@ function deriveWindow(
       } else {
         den += -pnl
       }
-    }
-    // DDT window (independent size)
-    if (i < ddtN && Number.isFinite(ddt) && ddt > 0) {
-      ddtSum += ddt
-      ddtCount++
+      // DDT averaged over the SAME window sample as PF.
+      if (Number.isFinite(ddt) && ddt > 0) {
+        ddtSum += ddt
+        ddtCount++
+      }
     }
   }
   if (n === 0) return EMPTY_WINDOW
@@ -423,14 +420,15 @@ function deriveWindow(
     successRate: wins / n,
     profitFactor,
     avgDDT: ddtCount > 0 ? ddtSum / ddtCount : 0,
-    hasSignal: n >= pfN,
+    hasSignal: n >= winN,
   }
 }
 
 /**
  * Windowed PF/DDT over the last `window` closed positions of a bucket.
- * `window` (and optional `ddtWindow`) are clamped to RING_CAP. This is the
- * spec-correct "average of the last N positions" used by the eval gates.
+ * `window` is clamped to RING_CAP. This is the spec-correct "average of the
+ * last N positions" used by the eval gates — PF and DDT are both computed
+ * over this single cumulative sample.
  */
 export async function getPosWindow(
   connectionId: string,
@@ -438,19 +436,16 @@ export async function getPosWindow(
   indicationType: string,
   direction: "long" | "short",
   window = 25,
-  ddtWindow?: number,
 ): Promise<PosWindowStats> {
   try {
-    const pfN = Math.min(RING_CAP, Math.max(1, Math.floor(window)))
-    const ddtN = Math.min(RING_CAP, Math.max(1, Math.floor(ddtWindow ?? window)))
-    const fetchN = Math.max(pfN, ddtN)
+    const winN = Math.min(RING_CAP, Math.max(1, Math.floor(window)))
     const client = getRedisClient()
     const records = (await client.lrange(
       listKey(connectionId, symbol, indicationType, direction),
       0,
-      fetchN - 1,
+      winN - 1,
     )) as string[]
-    return deriveWindow(records, pfN, ddtN)
+    return deriveWindow(records, winN)
   } catch {
     return EMPTY_WINDOW
   }
@@ -460,19 +455,16 @@ export async function getPosWindow(
 export async function getPosWindowOverall(
   connectionId: string,
   window = 25,
-  ddtWindow?: number,
 ): Promise<PosWindowStats> {
   try {
-    const pfN = Math.min(RING_CAP, Math.max(1, Math.floor(window)))
-    const ddtN = Math.min(RING_CAP, Math.max(1, Math.floor(ddtWindow ?? window)))
-    const fetchN = Math.max(pfN, ddtN)
+    const winN = Math.min(RING_CAP, Math.max(1, Math.floor(window)))
     const client = getRedisClient()
     const records = (await client.lrange(
       listKey(connectionId, OVERALL_BUCKET, OVERALL_BUCKET, OVERALL_BUCKET),
       0,
-      fetchN - 1,
+      winN - 1,
     )) as string[]
-    return deriveWindow(records, pfN, ddtN)
+    return deriveWindow(records, winN)
   } catch {
     return EMPTY_WINDOW
   }
@@ -488,24 +480,21 @@ export async function getPosWindowBatch(
   symbol: string,
   pairs: Array<{ indicationType: string; direction: "long" | "short" }>,
   window = 25,
-  ddtWindow?: number,
 ): Promise<Map<string, PosWindowStats>> {
   const out = new Map<string, PosWindowStats>()
   if (pairs.length === 0) return out
   try {
-    const pfN = Math.min(RING_CAP, Math.max(1, Math.floor(window)))
-    const ddtN = Math.min(RING_CAP, Math.max(1, Math.floor(ddtWindow ?? window)))
-    const fetchN = Math.max(pfN, ddtN)
+    const winN = Math.min(RING_CAP, Math.max(1, Math.floor(window)))
     const client = getRedisClient()
     const pipeline = client.multi()
     for (const p of pairs) {
-      pipeline.lrange(listKey(connectionId, symbol, p.indicationType, p.direction), 0, fetchN - 1)
+      pipeline.lrange(listKey(connectionId, symbol, p.indicationType, p.direction), 0, winN - 1)
     }
     const results = (await (pipeline as any).exec()) as any[]
     pairs.forEach((p, i) => {
       const raw = results?.[i]
       const records = (Array.isArray(raw) ? raw[1] : raw) as string[] | null | undefined
-      out.set(`${p.indicationType}|${p.direction}`, deriveWindow(records || [], pfN, ddtN))
+      out.set(`${p.indicationType}|${p.direction}`, deriveWindow(records || [], winN))
     })
   } catch {
     /* partial results ok; callers default missing to EMPTY_WINDOW */

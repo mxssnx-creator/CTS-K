@@ -85,7 +85,11 @@ export interface Settings {
 
   // Risk Management
   trailingStopLoss: boolean
-  maxDrawdownTimeHours: number
+  // Per-stage Max Drawdown-Time ceilings (hours), wired into the engine
+  // DDT gate by `lib/strategy-coordinator.ts:loadAppPFThresholds()`.
+  maxDrawdownTimeMainHours: number
+  maxDrawdownTimeRealHours: number
+  maxDrawdownTimeLiveHours: number
 
   // Trade Engine Intervals (milliseconds)
   mainEngineIntervalMs: number

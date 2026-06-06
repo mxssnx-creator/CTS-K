@@ -108,19 +108,6 @@ export interface CoordinationSettings {
    * Real promotion). Range 5..50 step 5, default 10.
    */
   realEvalPosCount: number
-
-  /**
-   * ── DDT averaging cap (Main section) ────────────────────────────────
-   * Drawdown-Time (how long a position is held, in minutes) is averaged
-   * over the most-recent positions of a bucket to give each Set its
-   * avgDrawdownTime, which the Main/Real DDT gate tests against
-   * maxDrawdownTime. Operator spec: "Calculate DDT by available but max
-   * 550 pos." This caps that sample. DDT uses a wider window than PF
-   * because drawdown-duration risk is a slower-moving structural property.
-   * Range 50..600 step 50, default 550.
-   * Backed by `connection_settings:{conn}.ddtCapPositions`.
-   */
-  ddtCapPositions: number
 }
 
 /** Spec-aligned defaults — match the constants in strategy-coordinator.ts. */
@@ -143,7 +130,6 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
   prevPosWindow:    25,
   mainEvalPosCount: 15,
   realEvalPosCount: 10,
-  ddtCapPositions: 550,
 }
 
 interface StrategyCoordinationSectionProps {
@@ -692,11 +678,11 @@ export function StrategyCoordinationSection({
             </p>
           </div>
 
-          {/* PF rolling-window size */}
+          {/* Cumulative last-N window — feeds BOTH windowed PF and DDT */}
           <div className="rounded-lg border border-border/60 p-3 space-y-2">
             <div className="flex items-center justify-between gap-3">
               <Label className="text-sm font-semibold">
-                PF rolling-window (last N positions)
+                PF / DDT window (last N positions)
               </Label>
               <Badge variant="secondary" className="text-[10px] tabular-nums">
                 default 25
@@ -718,12 +704,13 @@ export function StrategyCoordinationSection({
               </span>
             </div>
             <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
-              Historic Profit Factor is the average over the{" "}
-              <strong>last N completed positions</strong> of each (indication
-              × direction) bucket — not the lifetime mean. A tighter window
-              reacts faster when a strategy starts degrading; a wider window
-              is steadier but slower to demote a fading Set. Should be ≥ the
-              min-blend threshold above.
+              One cumulative window over the{" "}
+              <strong>last N completed positions</strong> of each (indication ×
+              direction) bucket. Both the historic Profit Factor and the
+              average Drawdown-Time are computed over this same sample — not the
+              lifetime mean. A tighter window reacts faster when a strategy
+              starts degrading; a wider window is steadier but slower to demote
+              a fading Set. Should be ≥ the min-blend threshold above.
             </p>
           </div>
         </CardContent>
@@ -829,39 +816,6 @@ export function StrategyCoordinationSection({
             </div>
           </div>
 
-          {/* DDT averaging cap — "Calculate DDT by available but max 550 pos" */}
-          <div className="rounded-lg border border-border/60 p-3 space-y-2">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <Label className="text-sm font-semibold">
-                  DDT averaging cap (max positions)
-                </Label>
-                <p className="text-xs text-muted-foreground leading-relaxed">
-                  Drawdown-time per Set = mean hold-duration over the most
-                  recent positions, up to this many. DDT uses a wider sample
-                  than PF because drawdown-duration risk is slower-moving.
-                </p>
-              </div>
-              <Badge variant="secondary" className="text-[10px] tabular-nums">
-                default 550
-              </Badge>
-            </div>
-            <div className="flex items-center gap-3 pt-1">
-              <Slider
-                value={[value.ddtCapPositions]}
-                min={50}
-                max={600}
-                step={50}
-                onValueChange={(v) =>
-                  onChange({ ...value, ddtCapPositions: v[0] })
-                }
-                className="flex-1"
-              />
-              <span className="text-xs font-semibold tabular-nums w-10 text-right">
-                {value.ddtCapPositions}
-              </span>
-            </div>
-          </div>
         </CardContent>
       </Card>
     </div>

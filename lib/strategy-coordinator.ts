@@ -598,18 +598,6 @@ export class StrategyCoordinator {
   private _prevPosWindowAt = 0
   private readonly _prevPosWindowTtlMs = 30_000
 
-  /**
-   * 30-second per-instance cache for `connection_settings.ddtCapPositions` —
-   * the maximum number of recent positions averaged into a Set's drawdown
-   * time (DDT). Operator spec: "Calculate DDT by available but max 550
-   * pos." DDT uses a wider sample than PF because drawdown-duration risk is
-   * a slower-moving structural property of a strategy, whereas PF recency
-   * matters more for promotion. Default 550, clamped to RING_CAP (600).
-   */
-  private _ddtCapValue = -1
-  private _ddtCapAt = 0
-  private readonly _ddtCapTtlMs = 30_000
-
   // ── Profit factor thresholds per stage (system-wide defaults) ──────
   //
   // Spec: "Change at Main Trade PF for Base, Main, Real, Live to
@@ -691,22 +679,22 @@ export class StrategyCoordinator {
       description: "One Set per (indication_type × direction) — all qualifying",
     },
     main: {
-      maxDrawdownTime: 300,   // 5 hours — operator spec, validation ceiling at Main
+      maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
       minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.5,        // advisory only
-      description: "Sets promoted from BASE with profitFactor >= main-threshold + DDT <= 5h, gated by minPositions",
+      description: "Sets promoted from BASE with profitFactor >= main-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
     real: {
-      maxDrawdownTime: 300,   // 5 hours — operator spec, validation ceiling at Real
+      maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
       minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.65,       // advisory only
-      description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= 5h, gated by minPositions",
+      description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
     live: {
-      maxDrawdownTime: 300,   // 5 hours — aligned with Main + Real
+      maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
       minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.65,       // advisory only
-      description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= 5h) ready for live trading",
+      description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= maxDrawdownTime) ready for live trading",
     },
   }
 
@@ -767,6 +755,27 @@ export class StrategyCoordinator {
       this.stageMinPosCountBase = snapStage((s as any).stageMinPosCountBase, 0)
       this.stageMinPosCountMain = snapStage((s as any).stageMinPosCountMain, 0)
       this.stageMinPosCountReal = snapStage((s as any).stageMinPosCountReal, 0)
+
+      // ── Per-stage Max Drawdown-Time thresholds (DDT gate) ───────────────
+      // Operator spec: per-position hold time is up to ~2h, so the DDT gate
+      // ceiling defaults to 4h (240 min) per stage. Operator tunes these in
+      // hours via Settings → Strategy → Base ("Max Drawdown-Time"). Stored
+      // in app settings as hours; the engine gate compares against
+      // `Set.avgDrawdownTime` (minutes), so we convert h→min. Base stays
+      // open (999999) by design — the gate only rejects at Main/Real/Live.
+      // Missing / NaN / non-positive → 4h default. Clamp [1h, 72h] to match
+      // the slider range.
+      const ddtHours = (raw: unknown, fallback: number): number => {
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n <= 0) return fallback
+        return Math.max(1, Math.min(72, n))
+      }
+      const mainDdtMin = ddtHours((s as any).maxDrawdownTimeMainHours, 4) * 60
+      const realDdtMin = ddtHours((s as any).maxDrawdownTimeRealHours, 4) * 60
+      const liveDdtMin = ddtHours((s as any).maxDrawdownTimeLiveHours, 4) * 60
+      this.METRICS.main.maxDrawdownTime = mainDdtMin
+      this.METRICS.real.maxDrawdownTime = realDdtMin
+      this.METRICS.live.maxDrawdownTime = liveDdtMin
     } catch (err) {
       // Don't fail the whole flow on a settings read miss — the
       // already-loaded values (either the defaults or the last
@@ -1070,7 +1079,6 @@ export class StrategyCoordinator {
     let posMap: Map<string, import("@/lib/pos-history").PosWindowStats> = new Map()
     let prevPosMinCount = 5
     let prevPosWindow = 25
-    let ddtCapPositions = 550
     try {
       const { getPosWindowBatch } = await import("@/lib/pos-history")
       const pairs = Array.from(setMap.values()).map((g) => ({
@@ -1092,18 +1100,14 @@ export class StrategyCoordinator {
       try {
         const cachedAge = Date.now() - this._prevPosMinCountAt
         const winAge = Date.now() - this._prevPosWindowAt
-        const ddtAge = Date.now() - this._ddtCapAt
         if (
           this._prevPosMinCountValue >= 0 &&
           cachedAge < this._prevPosMinCountTtlMs &&
           this._prevPosWindowValue >= 0 &&
-          winAge < this._prevPosWindowTtlMs &&
-          this._ddtCapValue >= 0 &&
-          ddtAge < this._ddtCapTtlMs
+          winAge < this._prevPosWindowTtlMs
         ) {
           prevPosMinCount = this._prevPosMinCountValue
           prevPosWindow = this._prevPosWindowValue
-          ddtCapPositions = this._ddtCapValue
         } else {
           const client = getRedisClient()
           const cs = (await client.hgetall(
@@ -1113,32 +1117,25 @@ export class StrategyCoordinator {
           if (Number.isFinite(v) && v >= 1) prevPosMinCount = Math.min(50, Math.floor(v))
           this._prevPosMinCountValue = prevPosMinCount
           this._prevPosMinCountAt = Date.now()
-          // prevPosWindow: the PF rolling window size. Clamp [1, 600] to match
-          // the pos-history RING_CAP. Default 25.
+          // prevPosWindow: the single cumulative "last N positions" window
+          // feeding BOTH the windowed PF and the windowed DDT. Clamp
+          // [1, 600] to match the pos-history RING_CAP. Default 25.
           const w = Number(cs?.prevPosWindow || "")
           if (Number.isFinite(w) && w >= 1) prevPosWindow = Math.min(600, Math.floor(w))
           this._prevPosWindowValue = prevPosWindow
           this._prevPosWindowAt = Date.now()
-          // ddtCapPositions: the DDT averaging window (Settings → Strategies →
-          // Main). "Calculate DDT by available but max 550 pos." Clamp
-          // [1, 600] to RING_CAP. Default 550.
-          const d = Number(cs?.ddtCapPositions || "")
-          if (Number.isFinite(d) && d >= 1) ddtCapPositions = Math.min(600, Math.floor(d))
-          this._ddtCapValue = ddtCapPositions
-          this._ddtCapAt = Date.now()
         }
       } catch { /* default stays */ }
       // Windowed (last-N) stats — the spec-correct "average of the last N
-      // positions" rather than a lifetime mean. PF uses prevPosWindow; DDT
-      // uses its own (wider) ddtCapPositions window. The blend still only
-      // activates once the bucket has at least prevPosMinCount samples
-      // (checked below via .count).
+      // positions" rather than a lifetime mean. PF and DDT are BOTH averaged
+      // over the SAME `prevPosWindow` sample (single cumulative window). The
+      // blend still only activates once the bucket has at least
+      // prevPosMinCount samples (checked below via .count).
       posMap = await getPosWindowBatch(
         this.connectionId,
         symbol,
         pairs,
         prevPosWindow,
-        ddtCapPositions,
       )
     } catch (posErr) {
       console.warn(`[v0] [StrategyFlow] ${symbol} prev-pos prefetch failed:`, posErr)

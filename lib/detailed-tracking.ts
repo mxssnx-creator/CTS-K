@@ -389,7 +389,7 @@ export async function getStrategyTracking(
       avgProfitFactor: Number(main.avg_profit_factor || "0"),
       avgDrawdownTime: Number(main.avg_drawdown_time || "0"),
       minProfitFactor: Number(settings.minProfitFactorMain || "1.2"),
-      maxDrawdownTime: Number(settings.maxDrawdownTimeMain || "1440"),
+      maxDrawdownTime: Number(settings.maxDrawdownTimeMain || "240"),
       variants: mainVariants,
     },
     real: {

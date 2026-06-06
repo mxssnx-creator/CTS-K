@@ -158,22 +158,85 @@ export function StrategyTab({ settings, handleSettingChange }: StrategyTabProps)
 
                   <Separator />
 
-                  <div className="grid md:grid-cols-2 gap-4">
+                  {/*
+                   * ── Per-stage Max Drawdown-Time thresholds (DDT gate) ──
+                   *
+                   * A position's hold time is up to ~2h, so the DDT gate
+                   * ceiling defaults to 4h per stage. Each slider sets the
+                   * maximum acceptable average drawdown-time (in hours) for
+                   * Sets promoted INTO that stage. Base stays open by design.
+                   * Values flow into the engine via
+                   * `lib/strategy-coordinator.ts:loadAppPFThresholds()`,
+                   * which converts hours→minutes and writes
+                   * `METRICS.{main,real,live}.maxDrawdownTime` (5s TTL).
+                   */}
+                  <div className="space-y-2">
+                    <h3 className="text-lg font-semibold">Max Drawdown-Time Thresholds</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Maximum average position hold-time for Sets promoted into
+                      each stage. Positions hold up to ~2h, so defaults are 4h.
+                      Base is unrestricted; the gate rejects at Main, Real, and Live.
+                    </p>
+                  </div>
+                  <div className="grid md:grid-cols-3 gap-4">
                     <div className="space-y-2">
-                      <Label>Maximum Drawdown Time (hours)</Label>
+                      <Label>Main DDT Ceiling (hours)</Label>
                       <div className="flex items-center gap-4">
                         <Slider
                           min={1}
                           max={72}
                           step={1}
-                          value={[settings.maxDrawdownTimeHours || 24]}
-                          onValueChange={([value]) => handleSettingChange("maxDrawdownTimeHours", value)}
+                          value={[settings.maxDrawdownTimeMainHours ?? 4]}
+                          onValueChange={([value]) => handleSettingChange("maxDrawdownTimeMainHours", value)}
                           className="flex-1"
                         />
                         <span className="text-sm font-medium w-16 text-right">
-                          {settings.maxDrawdownTimeHours || 24}h
+                          {settings.maxDrawdownTimeMainHours ?? 4}h
                         </span>
                       </div>
+                      <p className="text-xs text-muted-foreground">
+                        Max avg DDT to promote Base Sets into Main.
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>Real DDT Ceiling (hours)</Label>
+                      <div className="flex items-center gap-4">
+                        <Slider
+                          min={1}
+                          max={72}
+                          step={1}
+                          value={[settings.maxDrawdownTimeRealHours ?? 4]}
+                          onValueChange={([value]) => handleSettingChange("maxDrawdownTimeRealHours", value)}
+                          className="flex-1"
+                        />
+                        <span className="text-sm font-medium w-16 text-right">
+                          {settings.maxDrawdownTimeRealHours ?? 4}h
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Max avg DDT to promote Main Sets into Real.
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>Live DDT Ceiling (hours)</Label>
+                      <div className="flex items-center gap-4">
+                        <Slider
+                          min={1}
+                          max={72}
+                          step={1}
+                          value={[settings.maxDrawdownTimeLiveHours ?? 4]}
+                          onValueChange={([value]) => handleSettingChange("maxDrawdownTimeLiveHours", value)}
+                          className="flex-1"
+                        />
+                        <span className="text-sm font-medium w-16 text-right">
+                          {settings.maxDrawdownTimeLiveHours ?? 4}h
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Max avg DDT to promote Real Sets into Live.
+                      </p>
                     </div>
                   </div>
 
