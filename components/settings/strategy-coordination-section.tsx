@@ -80,6 +80,18 @@ export interface CoordinationSettings {
   prevPosMinCount: number // 1..50, default 5
 
   /**
+   * ── Base PF rolling-window size ─────────────────────────────────────
+   * The eval gates average historic Profit Factor over the LAST N closed
+   * positions of each (indication × direction) bucket — not the lifetime
+   * mean. This is N. A tighter window reacts faster to a strategy that has
+   * started degrading; a wider one is steadier but stickier. Must be ≥
+   * prevPosMinCount to be meaningful (the blend only activates once a
+   * bucket has prevPosMinCount samples). Range 5..200 step 5, default 25.
+   * Backed by `connection_settings:{conn}.prevPosWindow`.
+   */
+  prevPosWindow: number
+
+  /**
    * ── Main-stage validation min position-count ───────────────────────
    * Operator spec: At Main, only Base Sets whose `entryCount >=
    * mainEvalPosCount` are run through PF + DDT validation. Sets with
@@ -96,6 +108,19 @@ export interface CoordinationSettings {
    * Real promotion). Range 5..50 step 5, default 10.
    */
   realEvalPosCount: number
+
+  /**
+   * ── DDT averaging cap (Main section) ────────────────────────────────
+   * Drawdown-Time (how long a position is held, in minutes) is averaged
+   * over the most-recent positions of a bucket to give each Set its
+   * avgDrawdownTime, which the Main/Real DDT gate tests against
+   * maxDrawdownTime. Operator spec: "Calculate DDT by available but max
+   * 550 pos." This caps that sample. DDT uses a wider window than PF
+   * because drawdown-duration risk is a slower-moving structural property.
+   * Range 50..600 step 50, default 550.
+   * Backed by `connection_settings:{conn}.ddtCapPositions`.
+   */
+  ddtCapPositions: number
 }
 
 /** Spec-aligned defaults — match the constants in strategy-coordinator.ts. */
@@ -115,8 +140,10 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
   blockVolumeRatio: 1.0,
   blockMaxStack:    3,
   prevPosMinCount:   5,
+  prevPosWindow:    25,
   mainEvalPosCount: 15,
   realEvalPosCount: 10,
+  ddtCapPositions: 550,
 }
 
 interface StrategyCoordinationSectionProps {
@@ -664,6 +691,41 @@ export function StrategyCoordinationSection({
               Pipeline dashboard tile.
             </p>
           </div>
+
+          {/* PF rolling-window size */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <Label className="text-sm font-semibold">
+                PF rolling-window (last N positions)
+              </Label>
+              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                default 25
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.prevPosWindow]}
+                min={5}
+                max={200}
+                step={5}
+                onValueChange={(v) =>
+                  onChange({ ...value, prevPosWindow: v[0] })
+                }
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-10 text-right">
+                {value.prevPosWindow}
+              </span>
+            </div>
+            <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
+              Historic Profit Factor is the average over the{" "}
+              <strong>last N completed positions</strong> of each (indication
+              × direction) bucket — not the lifetime mean. A tighter window
+              reacts faster when a strategy starts degrading; a wider window
+              is steadier but slower to demote a fading Set. Should be ≥ the
+              min-blend threshold above.
+            </p>
+          </div>
         </CardContent>
       </Card>
       {/* ── Stage Validation Position-Count card ─────────────────────
@@ -763,6 +825,40 @@ export function StrategyCoordinationSection({
               />
               <span className="text-xs font-semibold tabular-nums w-8 text-right">
                 {value.realEvalPosCount}
+              </span>
+            </div>
+          </div>
+
+          {/* DDT averaging cap — "Calculate DDT by available but max 550 pos" */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <Label className="text-sm font-semibold">
+                  DDT averaging cap (max positions)
+                </Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Drawdown-time per Set = mean hold-duration over the most
+                  recent positions, up to this many. DDT uses a wider sample
+                  than PF because drawdown-duration risk is slower-moving.
+                </p>
+              </div>
+              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                default 550
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.ddtCapPositions]}
+                min={50}
+                max={600}
+                step={50}
+                onValueChange={(v) =>
+                  onChange({ ...value, ddtCapPositions: v[0] })
+                }
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-10 text-right">
+                {value.ddtCapPositions}
               </span>
             </div>
           </div>
