@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { initRedis, verifyRedisHealth, getAllConnections, getRedisClient } from "@/lib/redis-db"
+import { initRedis, verifyRedisHealth, getAllConnections, getRedisClient, getSettings } from "@/lib/redis-db"
 import { healthCheckService } from "@/lib/health-check"
 
 export const dynamic = "force-dynamic"
@@ -37,9 +37,9 @@ export async function GET() {
 
     for (const connection of connections) {
       try {
-        const stateKey = `trade_engine_state:${connection.id}`
-        const state = await client.hgetall(stateKey)
-        if (state?.is_running === "1") {
+        const state = await getSettings(`trade_engine_state:${connection.id}`)
+        const isRunning = state?.is_running === "1" || state?.is_running === true
+        if (isRunning) {
           runningEngines++
         }
 
