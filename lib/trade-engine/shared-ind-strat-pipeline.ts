@@ -152,45 +152,84 @@ async function executeReadyStrategiesAsLiveOrders(
     let failedCount = 0
     let totalEntries = 0
 
-    // Convert each Real Set entry to an independent live order
-    for (const realSet of realSets) {
+    // ── CRITICAL: cap dispatch to 1 highest-PF Set per direction ─────────
+    // The exchange holds exactly ONE position per symbol+direction (the
+    // dedup lock `live:lock:{conn}:{sym}:{dir}` enforces this). Phase 3
+    // (`StrategyCoordinator.createLiveSets`) ALREADY dispatches the live
+    // position for the best Set per direction with that same cap. This
+    // Phase 4 pass previously looped over EVERY Real Set × EVERY entry and
+    // called the heavyweight `executeLivePosition` for each — on a symbol
+    // with ~2400 axis Real Sets that is thousands of price-fetch → volume →
+    // order → SL/TP → sync round-trips per realtime cycle. The result was
+    // event-loop starvation that made the whole server unresponsive
+    // (verified: 2000+ "Live pipeline start" floods → dev server crash).
+    //
+    // Fix: mirror the createLiveSets contract here. Pick the single
+    // highest-PF Set per direction; every duplicate would only hit the
+    // dedup lock and be deferred anyway, so dispatching it is pure waste.
+    // Sets are sorted by avgProfitFactor desc, then the first per direction
+    // is kept. The per-direction dedup lock inside executeLivePosition
+    // still guards against any residual concurrency.
+    const sortedSets = [...realSets]
+      .filter((s: any) => Array.isArray(s.entries) && s.entries.length > 0)
+      .sort((a: any, b: any) => (b.avgProfitFactor || 0) - (a.avgProfitFactor || 0))
+    const dispatchSets: any[] = []
+    {
+      let sawLong = false
+      let sawShort = false
+      for (const s of sortedSets) {
+        const dir = s.direction === "short" ? "short" : "long"
+        if (dir === "long" && !sawLong) { dispatchSets.push(s); sawLong = true }
+        if (dir === "short" && !sawShort) { dispatchSets.push(s); sawShort = true }
+        if (sawLong && sawShort) break
+      }
+    }
+
+    // One live order per dispatched Set, sized from its single best entry
+    // (highest PF). Accumulation onto an already-open position is handled
+    // inside executeLivePosition's dedup/accumulate branch.
+    for (const realSet of dispatchSets) {
       const entries = realSet.entries || []
       totalEntries += entries.length
       if (!entries || entries.length === 0) continue
 
-      for (const entry of entries) {
-        try {
-          const realPosition = {
-            id: `real:${connectionId}:${symbol}:${realSet.setKey}:${entry.id}:${Date.now()}`,
-            connectionId,
-            symbol,
-            direction: realSet.direction || "long",
-            quantity: Math.max(0.1, entry.sizeMultiplier || 1.0),
-            entryPrice: 0,
-            leverage: Math.max(1, Math.min(20, entry.leverage || 1)),
-            stopLoss: realSet.stopLoss,
-            takeProfit: realSet.takeProfit,
-            trailingStop: realSet.trailingStop,
-            trailingStepSize: realSet.trailingStepSize,
-            maxHoldTime: realSet.maxHoldTime,
-            setKey: realSet.setKey,
-            parentSetKey: realSet.parentSetKey,
-            setVariant: realSet.variant,
-            axisWindows: realSet.axisWindows,
-            entryConfidence: entry.confidence,
-            entryProfitFactor: entry.profitFactor,
-          }
+      const bestEntry = entries.reduce(
+        (best: any, e: any) => ((e.profitFactor || 0) > (best?.profitFactor || 0) ? e : best),
+        entries[0],
+      )
+      if (!bestEntry) continue
 
-          const livePos = await executeLivePosition(connectionId, realPosition, exchangeConnector)
-          if (livePos?.status === "filled" || livePos?.status === "placed") {
-            createdCount++
-          } else {
-            failedCount++
-          }
-        } catch (err) {
-          failedCount++
-          console.error(`[v0] [Phase4] ${symbol}: error=${err instanceof Error ? err.message : String(err)}`)
+      try {
+        const realPosition = {
+          id: `real:${connectionId}:${symbol}:${realSet.setKey}:${bestEntry.id}:${Date.now()}`,
+          connectionId,
+          symbol,
+          direction: realSet.direction || "long",
+          quantity: Math.max(0.1, bestEntry.sizeMultiplier || 1.0),
+          entryPrice: 0,
+          leverage: Math.max(1, Math.min(20, bestEntry.leverage || 1)),
+          stopLoss: realSet.stopLoss,
+          takeProfit: realSet.takeProfit,
+          trailingStop: realSet.trailingStop,
+          trailingStepSize: realSet.trailingStepSize,
+          maxHoldTime: realSet.maxHoldTime,
+          setKey: realSet.setKey,
+          parentSetKey: realSet.parentSetKey,
+          setVariant: realSet.variant,
+          axisWindows: realSet.axisWindows,
+          entryConfidence: bestEntry.confidence,
+          entryProfitFactor: bestEntry.profitFactor,
         }
+
+        const livePos = await executeLivePosition(connectionId, realPosition, exchangeConnector)
+        if (livePos?.status === "filled" || livePos?.status === "placed") {
+          createdCount++
+        } else {
+          failedCount++
+        }
+      } catch (err) {
+        failedCount++
+        console.error(`[v0] [Phase4] ${symbol}: error=${err instanceof Error ? err.message : String(err)}`)
       }
     }
 
