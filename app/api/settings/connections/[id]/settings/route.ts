@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
-import { updateConnection, initRedis, getConnection } from "@/lib/redis-db"
+import { updateConnection, initRedis, getConnection, getRedisClient } from "@/lib/redis-db"
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 
@@ -125,6 +125,36 @@ export async function PATCH(
     }
 
     await updateConnection(id, updated)
+
+    // ── Flat eval-knob hash mirror (CRITICAL) ───────────────────────────
+    // The strategy coordinator and detailed-tracking read the per-eval
+    // knobs straight off the `connection_settings:{id}` Redis HASH via
+    // hgetall — NOT from the connection object's nested JSON. updateConnection
+    // only persists the connection hash (`connection:{id}`), so without this
+    // mirror the engine never sees operator changes and silently runs the
+    // built-in defaults (prevPosMinCount=5, prevPosWindow=25, etc.). Mirror
+    // every flat scalar the merged payload carries so the coordinator's
+    // 30s-cached hgetall picks them up on the next refresh window. Values
+    // are stringified because the emulator hash stores strings.
+    try {
+      const flatKnobs: Record<string, string> = {}
+      const knobKeys = [
+        "prevPosMinCount",
+        "prevPosWindow",
+        "mainEvalPosCount",
+        "realEvalPosCount",
+        "ddtCapPositions",
+      ] as const
+      for (const k of knobKeys) {
+        const v = (merged as Record<string, unknown>)[k]
+        if (typeof v === "number" && Number.isFinite(v)) flatKnobs[k] = String(v)
+      }
+      if (Object.keys(flatKnobs).length > 0) {
+        await getRedisClient().hset(`connection_settings:${id}`, flatKnobs)
+      }
+    } catch (mirrorErr) {
+      console.error("[v0] [Settings] eval-knob hash mirror failed:", mirrorErr)
+    }
 
     // Full propagation. PATCH only ships a partial settings payload, so
     // `detectChangedFields` (which compares top-level connection fields)

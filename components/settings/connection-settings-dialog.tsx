@@ -174,7 +174,7 @@ export function ConnectionSettingsDialog({
 
   // ─────────────────────────────────────────────────────────────────
   // LOAD
-  // ─────────────────────────────────────────────────────────────────
+  // ──────────────────────────────────────���──────────────────────────
 
   const loadAll = useCallback(async () => {
     setLoading(true)
@@ -272,6 +272,30 @@ export function ConnectionSettingsDialog({
               if (Number.isFinite(nested) && nested >= 1) return snap(nested)
               return DEFAULT_COORDINATION_SETTINGS.realEvalPosCount
             })(),
+            // ── PF rolling-window hydrate (5-200 step 5) ────────────
+            // Same dual-path (flat top-level preferred for engine reads,
+            // nested fallback). Snap to the 5-step grid the slider uses.
+            prevPosWindow: (() => {
+              const snap = (n: number) =>
+                Math.min(200, Math.max(5, Math.round(n / 5) * 5))
+              const flat = Number((settings as Record<string, unknown>).prevPosWindow)
+              if (Number.isFinite(flat) && flat >= 1) return snap(flat)
+              const nested = Number((coord as Record<string, unknown>).prevPosWindow)
+              if (Number.isFinite(nested) && nested >= 1) return snap(nested)
+              return DEFAULT_COORDINATION_SETTINGS.prevPosWindow
+            })(),
+            // ── DDT averaging cap hydrate (50-600 step 50) ──────────
+            // "Calculate DDT by available but max 550 pos." Snap to the
+            // 50-step grid; clamp to the pos-history RING_CAP (600).
+            ddtCapPositions: (() => {
+              const snap = (n: number) =>
+                Math.min(600, Math.max(50, Math.round(n / 50) * 50))
+              const flat = Number((settings as Record<string, unknown>).ddtCapPositions)
+              if (Number.isFinite(flat) && flat >= 1) return snap(flat)
+              const nested = Number((coord as Record<string, unknown>).ddtCapPositions)
+              if (Number.isFinite(nested) && nested >= 1) return snap(nested)
+              return DEFAULT_COORDINATION_SETTINGS.ddtCapPositions
+            })(),
           })
         }
       }
@@ -368,6 +392,12 @@ export function ConnectionSettingsDialog({
           // without parsing the nested coordination JSON every cycle.
           mainEvalPosCount: coordination.mainEvalPosCount,
           realEvalPosCount: coordination.realEvalPosCount,
+          // Flat mirrors for the windowed-eval knobs: prevPosWindow is the
+          // PF rolling-window size (Base), ddtCapPositions the DDT averaging
+          // cap (Main). The coordinator reads both straight off the
+          // `connection_settings:{conn}` hash each refresh window.
+          prevPosWindow:    coordination.prevPosWindow,
+          ddtCapPositions:  coordination.ddtCapPositions,
       }
 
       const [settingsRes, indRes] = await Promise.all([

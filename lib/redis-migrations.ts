@@ -1076,6 +1076,71 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "21")
     },
   },
+  {
+    name: "023-eval-knob-hash-defaults",
+    version: 23,
+    up: async (client: any) => {
+      await client.set("_schema_version", "23")
+
+      // Backfill the windowed-eval knobs into the `connection_settings:{id}`
+      // HASH that the strategy coordinator + detailed-tracking read via
+      // hgetall. Before this migration that hash was never populated (the
+      // settings PATCH route only wrote the connection JSON object), so the
+      // engine silently ran the built-in defaults and operator changes to
+      // these values never took effect. Seeding spec defaults here gives
+      // dev + prod identical, non-empty starting state from first boot;
+      // the PATCH route now keeps the hash in sync on every save.
+      //
+      // Idempotent: we read the hash first and only write fields that are
+      // absent, so an operator who already tuned a value (via the now-wired
+      // PATCH path) is never clobbered, and re-running the migration is a
+      // no-op. The InlineLocalRedis emulator has no hsetnx, so set-if-absent
+      // is emulated with hgetall + conditional hset.
+      const SPEC_DEFAULTS: Record<string, string> = {
+        prevPosMinCount: "5",   // min closed positions before historic blend activates
+        prevPosWindow:   "25",  // PF rolling-window size (last-N positions)
+        mainEvalPosCount: "15", // Main-stage validation min position count
+        realEvalPosCount: "10", // Real-stage validation min position count
+        ddtCapPositions: "550", // DDT averaging cap — "available but max 550 pos"
+      }
+
+      // Union of every connection id source so we don't miss disabled /
+      // template connections (they still get evaluated when toggled on).
+      const idSet = new Set<string>()
+      for (const setName of ["connections", "connections:main:enabled"]) {
+        try {
+          const ids = (await client.smembers(setName)) || []
+          for (const id of ids) if (typeof id === "string" && id) idSet.add(id)
+        } catch { /* missing set = nothing to add */ }
+      }
+
+      let seeded = 0
+      for (const connId of idSet) {
+        const key = `connection_settings:${connId}`
+        const existing = (await client.hgetall(key).catch(() => ({}))) as
+          | Record<string, string>
+          | null
+        const have = existing || {}
+        const toWrite: Record<string, string> = {}
+        for (const [field, value] of Object.entries(SPEC_DEFAULTS)) {
+          if (have[field] === undefined || have[field] === null || have[field] === "") {
+            toWrite[field] = value
+          }
+        }
+        if (Object.keys(toWrite).length > 0) {
+          await client.hset(key, toWrite)
+          seeded += Object.keys(toWrite).length
+        }
+      }
+
+      console.log(
+        `[v0] Migration 023: Seeded eval-knob defaults for ${idSet.size} connections (${seeded} fields written)`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "22")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
