@@ -37,8 +37,9 @@ export async function GET() {
 
     for (const connection of connections) {
       try {
-        const state = await getSettings(`trade_engine_state:${connection.id}`)
-        const isRunning = state?.is_running === "1" || state?.is_running === true
+        const { getSettings } = await import("@/lib/redis-db")
+        const flag = await getSettings(`engine_is_running:${connection.id}`)
+        const isRunning = flag === "true" || flag === true || flag === "1"
         if (isRunning) {
           runningEngines++
         }
