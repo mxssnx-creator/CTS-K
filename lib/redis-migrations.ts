@@ -4,6 +4,36 @@
  */
 
 import { getRedisClient, ensureCoreRedis, setMigrationsRun, haveMigrationsRun } from "./redis-db"
+
+/**
+ * Reset the in-process migration guards.
+ *
+ * MUST be called by any code path that wipes the Redis keyspace
+ * (FLUSHALL / flushDb), e.g. the Reset-DB and Flush-DB install routes.
+ *
+ * Why this is required:
+ *   `runMigrations()` short-circuits on two process-level guards —
+ *   the cached `migrationRunPromise` (returns the FIRST run's resolved
+ *   promise to every later caller) and `haveMigrationsRun()`. A DB wipe
+ *   deletes `_schema_version` / `_migrations_run` from Redis but cannot
+ *   touch these JS-module guards. Without resetting them, the
+ *   post-flush `runMigrations()` call returns the stale resolved promise
+ *   and the migrations (001–022) NEVER replay, leaving the database
+ *   half-initialised (no schema version, no metadata hashes, no seeded
+ *   indexes). Calling this before re-running migrations forces a full,
+ *   clean replay against the now-empty keyspace.
+ */
+export function resetMigrationRunState(): void {
+  migrationRunPromise = null
+  // Clear the one-shot diagnostic set so post-reset boot logs are emitted
+  // again (e.g. "already at latest", operator_stopped honoured).
+  ensureBootstrapDiag.clear()
+  try {
+    setMigrationsRun(false)
+  } catch {
+    // setMigrationsRun is a pure setter; failure here is non-fatal.
+  }
+}
 import { getBaseConnectionCredentials, type BaseConnectionId } from "./base-connection-credentials"
 
 interface Migration {

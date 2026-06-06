@@ -8,7 +8,7 @@ export async function POST() {
 
     const { initRedis } = await import("@/lib/redis-db")
     const { getRedisClient } = await import("@/lib/redis-db")
-    const { runMigrations } = await import("@/lib/redis-migrations")
+    const { runMigrations, resetMigrationRunState } = await import("@/lib/redis-migrations")
 
     const startTime = Date.now()
 
@@ -21,8 +21,13 @@ export async function POST() {
     console.log("[v0] Re-initializing Redis...")
     await initRedis()
 
-    // Run all migrations fresh
+    // Run all migrations fresh. The FLUSHALL above deleted `_schema_version`
+    // and `_migrations_run` from Redis, but the cached migration promise +
+    // haveMigrationsRun guard live in JS module state and survive the wipe.
+    // Reset them so runMigrations() performs a real, full replay instead of
+    // returning the stale resolved promise (which would leave the DB empty).
     console.log("[v0] Running migrations...")
+    resetMigrationRunState()
     await runMigrations()
 
     const duration = Date.now() - startTime

@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { flushAll, initRedis } from "@/lib/redis-db"
+import { runMigrations, resetMigrationRunState } from "@/lib/redis-migrations"
 import { stopAllProgressionsBeforeReset } from "@/lib/db-reset-helper"
 
 export const runtime = "nodejs"
@@ -18,11 +19,27 @@ export async function POST(request: NextRequest) {
 
     await flushAll()
 
+    // CRITICAL: a bare FLUSHALL leaves the database completely empty —
+    // no `_schema_version`, no metadata hashes, no seeded base connections
+    // or indexes. Reset the in-process migration guards (the FLUSHALL can't
+    // touch JS module state) and replay all migrations so the store comes
+    // back up in a fully-initialised, consistent state. Then reseed via
+    // runPreStartup (settings, connections, market data in dev).
+    resetMigrationRunState()
+    await runMigrations()
+    try {
+      const { runPreStartup } = await import("@/lib/pre-startup")
+      await runPreStartup()
+    } catch (seedErr) {
+      console.warn("[v0] Reseed after reset warning (non-fatal):", seedErr)
+    }
+
     console.log("[v0] Redis database reset successfully")
 
     return NextResponse.json({
       success: true,
       message: "Database reset successfully",
+      migrations_reapplied: true,
       stopped: stopResult,
     })
   } catch (error) {

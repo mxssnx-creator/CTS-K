@@ -234,7 +234,9 @@ export async function getStartupStatus() {
       redis_reachable: redisReachable === "PONG",
       schema_version: schemaVersion,
       connections_count: connections.length,
-      migrations_run: migrationsRun === "1",
+      // runMigrations() persists the string "true" (not "1") for this flag —
+      // accept both so the diagnostic doesn't report a false negative.
+      migrations_run: migrationsRun === "true" || migrationsRun === "1",
       timestamp: new Date().toISOString(),
     }
   } catch (error) {
