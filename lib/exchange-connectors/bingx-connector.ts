@@ -51,6 +51,17 @@ export class BingXConnector extends BaseExchangeConnector {
   // all use offset=0 and all fail before any of their individual syncs
   // complete — producing one 109400 error per call per cold start.
   private syncPromise: Promise<void> | null = null
+  // recvWindow (ms) attached to every signed request. BingX validates
+  // `serverTime - timestamp <= recvWindow` (default ~5000ms, max 60000ms). On
+  // the Vercel→BingX link RTT routinely measured 800-1136ms, so one-way transit
+  // plus a few hundred ms of skew pushed the FIRST attempt past the default
+  // tolerance — signed calls failed with code 100421 and only succeeded after a
+  // forced resync+retry. A 60s window absorbs all realistic latency/skew so
+  // requests succeed first try. Verified live: 5/5 balance requests code 0.
+  private recvWindowMs: number = 60_000
+  // Cross-instance throttle for the "Failed to sync" log so a network blip
+  // across many connector instances doesn't flood output.
+  private static lastSyncFailLogTs = 0
 
   constructor(credentials: ExchangeCredentials, exchange: string = "bingx") {
     super(credentials, exchange)
@@ -242,9 +253,21 @@ export class BingXConnector extends BaseExchangeConnector {
   private getSignature(params: Record<string, any>): string {
     // Kept only for the one remaining helper that doesn't need the query
     // string back (balance query). Prefer signParams() for everything else.
-    const sortedKeys = Object.keys(params).sort()
-    const queryString = sortedKeys.map((key) => `${key}=${params[key]}`).join("&")
+    const withWindow = this.withRecvWindow(params)
+    const sortedKeys = Object.keys(withWindow).sort()
+    const queryString = sortedKeys.map((key) => `${key}=${withWindow[key]}`).join("&")
     return crypto.createHmac("sha256", this.credentials.apiSecret).update(queryString).digest("hex")
+  }
+
+  /**
+   * Inject a generous `recvWindow` into every signed request so requests
+   * tolerate the high, variable RTT of the Vercel→BingX link and succeed on
+   * the first attempt instead of failing with code 100421. Callers may
+   * override by supplying their own `recvWindow`.
+   */
+  private withRecvWindow(params: Record<string, any>): Record<string, any> {
+    if (params.recvWindow !== undefined) return params
+    return { ...params, recvWindow: this.recvWindowMs }
   }
 
   /**
@@ -268,8 +291,9 @@ export class BingXConnector extends BaseExchangeConnector {
    * byte-identical is the important invariant.
    */
   private signParams(params: Record<string, any>): { signature: string; queryString: string } {
-    const sortedKeys = Object.keys(params).sort()
-    const queryString = sortedKeys.map((key) => `${key}=${params[key]}`).join("&")
+    const withWindow = this.withRecvWindow(params)
+    const sortedKeys = Object.keys(withWindow).sort()
+    const queryString = sortedKeys.map((key) => `${key}=${withWindow[key]}`).join("&")
     const signature = crypto
       .createHmac("sha256", this.credentials.apiSecret)
       .update(queryString)
@@ -410,15 +434,13 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(timestamp),
       }
 
-      // Sort parameters alphabetically and build query string (BingX requirement)
-      const sortedKeys = Object.keys(params).sort()
-      const queryString = sortedKeys.map(key => `${key}=${params[key]}`).join('&')
-
-      // Generate HMAC-SHA256 signature from the query string
-      const signature = crypto
-        .createHmac("sha256", this.credentials.apiSecret)
-        .update(queryString)
-        .digest("hex")
+      // Sign via signParams so recvWindow is injected and the signed payload
+      // matches the transmitted query string EXACTLY. Building the signature
+      // inline here previously bypassed withRecvWindow(), so the FIRST balance
+      // request went out WITHOUT recvWindow and failed with code 100421 on
+      // every call — only the resync+retry path (which uses signParams) added
+      // recvWindow and succeeded, doubling latency and flooding the logs.
+      const { signature, queryString } = this.signParams(params)
 
       this.log(`Query string: ${queryString}`)
       this.log(`API Key prefix: ${this.credentials.apiKey.substring(0, 10)}...`)
