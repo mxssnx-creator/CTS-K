@@ -24,6 +24,7 @@ build/
 
 # Dependencies (regenerated during install)
 node_modules/
+.kilo/node_modules/
 pnpm-lock.yaml
 yarn.lock
 package-lock.json

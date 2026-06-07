@@ -281,13 +281,6 @@ export async function forceReseedProductionData(): Promise<void> {
   }
 }
 
-/**
- * Auto-seed on module load if in production mode
- */
-if (process.env.NODE_ENV === "production") {
-  seedProductionData().catch(console.error)
-}
-
 export default {
   seedProductionData,
   seedDefaultSettings,
@@ -296,3 +289,9 @@ export default {
   seedProgressionState,
   forceReseedProductionData
 }
+
+// NOTE: Auto-seed on module load intentionally disabled.
+// In serverless/Vercel/Kilo environments, module imports happen before
+// environment variables (Redis credentials) are guaranteed to be set,
+// which causes immediate startup failures. The seeder is invoked explicitly
+// via /api/system/initialize or instrumentation.ts instead.
