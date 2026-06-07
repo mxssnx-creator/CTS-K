@@ -167,12 +167,13 @@ export class GlobalTradeEngineCoordinator {
 
     // Step 2: Check if already running (check in-memory manager first, then Redis hint)
     try {
-      const { getSettings } = await import("@/lib/redis-db")
-      const runningFlag = await getSettings(`engine_is_running:${connectionId}`)
+      const { getRedisClient } = await import("@/lib/redis-db")
+      const client = getRedisClient()
+      const runningFlag = await client.get(`engine_is_running:${connectionId}`)
       const manager = this.engineManagers.get(connectionId)
       const managerRunning = !!manager?.isEngineRunning
 
-      if (runningFlag === "true" || runningFlag === true || runningFlag === "1") {
+      if (runningFlag === "true" || runningFlag === "1") {
         if (managerRunning) {
           console.log(`[v0] [STARTUP LOCK] Engine already running for ${connectionId}, skipping...`)
           return

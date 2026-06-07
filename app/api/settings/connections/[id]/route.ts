@@ -58,10 +58,11 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     }
 
     // Clear engine-running hint so reconciliation does not re-start it.
-    // setSettings expects an object (it flattens for HMSET), not a raw string.
+    // Must use client.set (string "0") to match setRunningFlag in engine-manager.
     try {
-      const { setSettings } = await import("@/lib/redis-db")
-      await setSettings(`engine_is_running:${id}`, { running: false, cleared_at: new Date().toISOString() })
+      const { getRedisClient } = await import("@/lib/redis-db")
+      const client = getRedisClient()
+      await client.set(`engine_is_running:${id}`, "0")
     } catch {
       /* non-critical */
     }

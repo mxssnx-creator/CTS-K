@@ -13,7 +13,6 @@ import {
   initRedis,
   getAllConnections,
   getRedisClient,
-  getSettings,
   setSettings,
 } from "@/lib/redis-db"
 import { validateDatabase } from "@/lib/database-validator"
@@ -109,15 +108,16 @@ export async function cleanupOrphanedProgress() {
     let cleanedUp = 0
 
     for (const conn of allConnections) {
-      const runningFlag = await getSettings(`engine_is_running:${conn.id}`)
+      // Use client.get to match setRunningFlag which writes string values ("1"/"0")
+      const runningFlag = await client.get(`engine_is_running:${conn.id}`)
 
       // If marked as running but coordinator doesn't have it, clean up
       if (runningFlag === "true" || runningFlag === "1") {
         if (!coordinator.isEngineRunning(conn.id)) {
           console.log(`[v0] [Startup] Cleaning orphaned running flag for ${conn.id}`)
 
-          // Clear orphaned flags
-          await setSettings(`engine_is_running:${conn.id}`, "false")
+          // Clear orphaned flags using client.set to match setRunningFlag
+          await client.set(`engine_is_running:${conn.id}`, "0")
           await setSettings(`engine_progression:${conn.id}`, {
             phase: "idle",
             progress: 0,

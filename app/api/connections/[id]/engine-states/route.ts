@@ -17,7 +17,7 @@
  * }
  */
 import { type NextRequest, NextResponse } from "next/server"
-import { initRedis, getConnection, getSettings } from "@/lib/redis-db"
+import { initRedis, getConnection, getRedisClient, getSettings } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { SystemLogger } from "@/lib/system-logger"
 
@@ -53,14 +53,15 @@ export async function GET(
     const engineRunning =
       !!coordinator && coordinator.isEngineRunning(connectionId)
 
-    // Redis hint key for stale-flag detection — written by the delete route
-    // (and future reconciliation code) as a hash like { running, cleared_at }.
+    // Redis hint key for stale-flag detection — written as string "0"/"1" by setRunningFlag and DELETE route
+    // (and future reconciliation code) as a string value (setRunningFlag uses client.set).
     // Used as a tiebreaker when the in-memory manager is missing.
     let runningHint = false
     try {
-      const hint = await getSettings(`engine_is_running:${connectionId}`)
-      const raw = hint && typeof hint === "object" ? (hint as any).running : hint
-      runningHint = raw === true || raw === "true" || raw === 1 || raw === "1"
+      const client = getRedisClient()
+      const hint = await client.get(`engine_is_running:${connectionId}`)
+      const raw = typeof hint === "string" ? hint : ""
+      runningHint = raw === "true" || raw === "1"
     } catch {
       /* non-critical */
     }

@@ -78,8 +78,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
        }
      } catch (e) {
        console.warn(`[v0] [ProgressionAPI] ${connectionId}: Failed to check coordinator state, falling back to Redis flag`)
-       const runningFlag = await getSettings(`engine_is_running:${connectionId}`).catch(() => null)
-       isEngineRunning = runningFlag === "true" || runningFlag === true
+       const runningFlag = await client?.get(`engine_is_running:${connectionId}`).catch(() => null)
+       isEngineRunning = runningFlag === "true" || runningFlag === "1"
      }
     
     // Check if this connection is currently active/dashboard enabled
