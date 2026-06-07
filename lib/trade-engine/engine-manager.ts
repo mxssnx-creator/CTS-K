@@ -1907,7 +1907,7 @@ export class TradeEngineManager {
 
         const totalIndications = indicationResults.reduce((sum: number, arr: any[]) => sum + (arr?.length || 0), 0)
         // producedIndications = totalIndications > 0
-        const producedIndications = totalIndications > 0
+        producedIndications = totalIndications > 0
 
         // Increment cycle count BEFORE writing to Redis so the stored value is accurate
         cycleCount++
