@@ -710,8 +710,12 @@ export class TradeEngineManager {
           ])
           const symbolsForCheck = await this.getSymbols()
           const hasSymbols = symbolsForCheck.length > 0
+          // PRODUCTION FIX: production fast-path sets done/firstpass flags without historic PF data.
+          // Skip pfSample check in production mode to avoid defeating the fast-path.
+          const { isProductionEnvironment } = await import("@/lib/redis-db")
+          const isProd = isProductionEnvironment()
           const dataLooksComplete =
-            doneFlag === "1" && firstPass === "1" && isComplete === "1" && (pfSample != null || !hasSymbols)
+            doneFlag === "1" && firstPass === "1" && isComplete === "1" && (isProd || pfSample != null || !hasSymbols)
           if (!dataLooksComplete) {
             console.warn(
               `[v0] [Engine ${this.connectionId}] Stale prehistoric cache marker (done/firstpass/complete/PF missing or empty) — FORCING full prehistoric reload. This fixes production "stuck prehistoric / low keys / no activity" after deploys/migrations.`,
