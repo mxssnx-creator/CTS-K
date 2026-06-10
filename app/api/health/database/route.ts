@@ -1,17 +1,18 @@
 import { NextResponse } from "next/server"
-import { getRedisClient } from "@/lib/redis-db"
+import { initRedis, getRedisClient } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
 
 export async function GET() {
   try {
+    await initRedis()
     const client = getRedisClient()
     
     // Test Redis connectivity
     const startTime = Date.now()
     const ping = await client.ping()
     const responseTime = Date.now() - startTime
-
+    
     // Get Redis info
     const info = await client.info()
     
@@ -19,7 +20,7 @@ export async function GET() {
     const dbSize = await client.dbSize()
     
     const isHealthy = ping === "PONG"
-
+    
     return NextResponse.json({
       status: isHealthy ? "healthy" : "degraded",
       database: {

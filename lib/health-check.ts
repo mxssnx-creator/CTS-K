@@ -5,7 +5,7 @@
  * Monitors key dependencies: Redis, database, external APIs
  */
 
-import { getRedisClient } from './redis-db'
+import { initRedis, getRedisClient } from './redis-db'
 
 export enum HealthStatus {
   HEALTHY = 'healthy',
@@ -86,6 +86,7 @@ export class HealthCheckService {
     const startTime = Date.now()
 
     try {
+      await initRedis()
       const client = await getRedisClient()
       if (!client) {
         return {
@@ -130,6 +131,7 @@ export class HealthCheckService {
     const startTime = Date.now()
 
     try {
+      await initRedis()
       const client = await getRedisClient()
       if (!client) {
         return {
