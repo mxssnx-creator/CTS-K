@@ -109,10 +109,10 @@ export const initialSettings: Settings = {
   positionCooldownMs: 100, // 50-3000ms, default 100ms
   maxPositionsPerConfigDirection: 2, // default 2
   maxConcurrentOperations: 100, // 10-250, default 100
-  // P0-4: Spec-mandated per-direction cap on active pseudo positions.
-  // Default 5 (Long/Short each capped at 5 concurrent pseudo positions
-  // across ALL Sets). Operator-tunable in Settings → Strategy → Base.
-  maxActiveBasePseudoPositionsPerDirection: 5,
+  // Per-direction cap on active pseudo positions (set config + direction).
+  // Default 1 — Long/Short each capped at 1 concurrent pseudo position.
+  // Operator-tunable in Settings → Strategy → Base.
+  maxActiveBasePseudoPositionsPerDirection: 1,
 
   // Hard ceiling on REAL-stage Sets that pass through to Live each cycle.
   // 12000 is the operational default — high enough that the cap rarely
