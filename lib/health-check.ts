@@ -87,7 +87,7 @@ export class HealthCheckService {
 
     try {
       await initRedis()
-      const client = await getRedisClient()
+      const client = getRedisClient()
       if (!client) {
         return {
           status: HealthStatus.UNHEALTHY,
@@ -132,7 +132,7 @@ export class HealthCheckService {
 
     try {
       await initRedis()
-      const client = await getRedisClient()
+      const client = getRedisClient()
       if (!client) {
         return {
           status: HealthStatus.UNHEALTHY,

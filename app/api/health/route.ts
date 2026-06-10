@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { initRedis, verifyRedisHealth, getAllConnections, getRedisClient, getSettings } from "@/lib/redis-db"
+import { initRedis, getAllConnections, getRedisClient, verifyRedisHealth } from "@/lib/redis-db"
 import { healthCheckService } from "@/lib/health-check"
 
 export const dynamic = "force-dynamic"
@@ -8,11 +8,15 @@ export async function GET() {
   try {
     console.log("[HEALTH] Full health check initiated...")
 
+    // Ensure Redis is initialized before health checks
+    await initRedis()
+
     // Use new health check service
     const report = await healthCheckService.getHealthReport()
 
     // Also get legacy metrics for backward compatibility
-    const redisHealthy = await verifyRedisHealth()
+    const redisHealthyRaw = await verifyRedisHealth()
+    const redisHealthy = redisHealthyRaw.healthy
     if (!redisHealthy) {
       console.error("[HEALTH] Redis health check failed")
       return NextResponse.json({
