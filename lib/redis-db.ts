@@ -2458,6 +2458,7 @@ function getConfigurationSet(type: string, value: any): string {
 export async function verifyRedisHealth(): Promise<{ healthy: boolean; latency: number; error?: string }> {
   const start = Date.now()
   try {
+    await initRedis()
     const client = getRedisClient()
     // Simple ping test
     await client.set("health:check", Date.now().toString())
