@@ -1,4 +1,4 @@
-FROM node:18-alpine
+FROM node:20-alpine
 
 # Install dependencies for native modules
 RUN apk add --no-cache curl libc6-compat python3 make g++
@@ -8,14 +8,17 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production && npm cache clean --force
+# Install all dependencies for the production build
+RUN npm ci --legacy-peer-deps --no-audit --no-fund
 
 # Copy application code
 COPY . .
 
 # Build the application
 RUN npm run build
+
+# Remove dev dependencies after the build artifact exists
+RUN npm prune --omit=dev --no-audit --no-fund
 
 # Create non-root user
 RUN addgroup --system --gid 1001 nodejs
@@ -36,8 +39,8 @@ ENV PORT=3001
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 
 # Health check (includes engine coordination status)
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:3001/api/health && curl -f http://localhost:3001/api/trade-engine/status || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD sh -c "curl -fsS http://localhost:${PORT:-3001}/api/health/readiness || exit 1"
 
 # Start the application
 CMD ["npm", "start"]

@@ -161,11 +161,18 @@ async function fetchRealMarketData(
 // doubling exchange API calls and Redis writes.
 let __loadFlight: Promise<number> | null = null
 
+export interface LoadMarketDataOptions {
+  skipRealFetch?: boolean
+}
+
 /**
  * Load market data for all symbols into Redis
  * Fetches REAL data from exchanges, falls back to synthetic only on failure
  */
-export async function loadMarketDataForEngine(symbols: string[] = []): Promise<number> {
+export async function loadMarketDataForEngine(
+  symbols: string[] = [],
+  options: LoadMarketDataOptions = {},
+): Promise<number> {
   // Coalesce concurrent calls — the second caller joins the first
   // promise and receives the same result, avoiding duplicate work.
   if (__loadFlight) return __loadFlight
@@ -235,8 +242,20 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
     let nextIdx = 0
     const loadOne = async (symbol: string): Promise<void> => {
       try {
-        // Try to fetch real 1s data first.
-        const realData = await fetchRealMarketData(symbol, "1s", ONE_DAY_SECONDS)
+        if (options.skipRealFetch) {
+          const existingRaw = await client.get(`market_data:${symbol}:1s`)
+          if (existingRaw) {
+            JSON.parse(existingRaw)
+            loaded++
+            return
+          }
+        }
+
+        let realData: { candles: MarketDataCandle[]; source: string } | null = null
+
+        if (!options.skipRealFetch) {
+          realData = await fetchRealMarketData(symbol, "1s", ONE_DAY_SECONDS)
+        }
 
         let candles: MarketDataCandle[]
         let source: string
@@ -246,15 +265,15 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
           source = realData.source
           realDataCount++
         } else {
-          // Fall back to synthetic 1s data — same shape so downstream
-          // doesn't care. We don't generate 86k synthetic buckets; a
-          // 250-bucket sample is enough for cold-boot decoration
-          // before real data arrives via the engine's own loader.
           const basePrice = basePrices[symbol] || 100
           candles = generateSyntheticCandles(symbol, basePrice, 250)
           source = "synthetic"
           syntheticCount++
-          console.log(`[v0] [MarketData] ⚠ Using synthetic data for ${symbol} (exchange 1s fetch failed)`)
+          if (options.skipRealFetch) {
+            console.log(`[v0] [MarketData] Using synthetic/cached fallback for ${symbol} (production fast-path)`)
+          } else {
+            console.log(`[v0] [MarketData] ⚠ Using synthetic data for ${symbol} (exchange 1s fetch failed)`)
+          }
         }
 
         const marketData: MarketData = {

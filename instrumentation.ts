@@ -67,16 +67,20 @@ export async function register() {
 
   try {
     const { completeStartup } = await import("@/lib/startup-coordinator")
-    await completeStartup()
+    void completeStartup()
+      .catch((error) => {
+        console.error("[Instrumentation] completeStartup failed:", error)
+      })
+      .finally(async () => {
+        try {
+          const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
+          await initializeTradeEngineAutoStart()
+        } catch (error) {
+          console.error("[Instrumentation] auto-start init failed:", error)
+        }
+      })
   } catch (error) {
-    console.error("[Instrumentation] completeStartup failed:", error)
-  }
-
-  try {
-    const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
-    await initializeTradeEngineAutoStart()
-  } catch (error) {
-    console.error("[Instrumentation] auto-start init failed:", error)
+    console.error("[Instrumentation] startup scheduling failed:", error)
   }
 
   return

@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.gitignore
+.env.local
+.env*.local
+*.log
+*.pid
+.v0-data
+redis-snapshot.json
+redis-snapshot.json.*
+coverage
+npm-debug.log*

@@ -901,7 +901,6 @@ export function QuickstartSection() {
       const ac = localStorage.getItem("qs:activeConnectionId")
       if (ac) setActiveConnectionId(ac)
     } catch { /* localStorage may be unavailable */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Persist QuickStart UI session flags so page reloads restore the live

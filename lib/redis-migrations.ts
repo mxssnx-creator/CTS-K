@@ -1568,11 +1568,29 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
 
   console.log("[v0] [Migrations] PRODUCTION MODE — INTENSIVE COMPLETE COVERAGE (making Prod identical to long-running Dev)")
 
-  // Ensure the entire Site/Project has ONE unique instance (independent of connections)
+  // Ensure the entire Site/Project has ONE unique instance (independent of connections).
+  // Do this directly on the migration client; calling ensureUniqueSiteInstance() here
+  // would re-enter initRedis() while runMigrations() is already in flight.
   try {
-    const { ensureUniqueSiteInstance } = await import("@/lib/redis-db")
-    await ensureUniqueSiteInstance()
-  } catch {}
+    const existingSite = (await client.hgetall("site:unique_instance").catch(() => null)) as Record<string, string> | null
+    if (!existingSite?.site_session_id) {
+      const newId = "site_" + Date.now() + "_" + Math.random().toString(36).slice(2, 12)
+      const nowIso = new Date().toISOString()
+      await client.hset("site:unique_instance", {
+        site_session_id: newId,
+        created_at: nowIso,
+        last_activity: nowIso,
+        version: "1",
+      }).catch(() => {})
+      await client.hset("trade_engine:global", {
+        site_session_id: newId,
+        site_instance_created: nowIso,
+      }).catch(() => {})
+      console.log(`[v0] [Migrations] [PROD-COVERAGE] Bootstrapped unique site instance ${newId}`)
+    }
+  } catch (err) {
+    console.warn("[v0] [Migrations] [PROD-COVERAGE] Unique site bootstrap warning:", err)
+  }
 
   try {
     // 1. Re-assert global engine status (same logic as ensureBaseConnections but unconditional in prod)
